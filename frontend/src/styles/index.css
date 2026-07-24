@@ -12,34 +12,6 @@ button, input, textarea, select { font: inherit; color: inherit; }
 button, a, select { -webkit-tap-highlight-color: transparent; }
 button { border: 0; background: transparent; cursor: pointer; }
 
-html.cw-style-wechat {
-  --cw-shell-bg: #eef0f2; --cw-panel-bg: #f7f8f9; --cw-panel-2: #fff; --cw-header-bg: #f7f8f9;
-  --cw-border: #d7dde3; --cw-border-strong: #b9c3cc; --cw-text: #1f2933; --cw-muted: #66717d;
-  --cw-control-bg: #fff; --cw-control-hover: #edf1f4; --cw-input-bg: #fff; --cw-accent: #1aad19;
-  --cw-accent-text: #06130d; --cw-composer-bg: #f2f3f5; --cw-radius: 8px;
-  --cw-wechat-user-bg: #95ec69; --cw-wechat-user-text: #07180d; --cw-wechat-peer-bg: #fff;
-}
-html.cw-style-wechat.dark {
-  --cw-shell-bg: #111; --cw-panel-bg: #1f1f1f; --cw-panel-2: #333; --cw-header-bg: #111;
-  --cw-border: #2a2a2a; --cw-border-strong: #4d4d4d; --cw-text: #ededed; --cw-muted: #888;
-  --cw-control-bg: #2a2a2a; --cw-control-hover: #333; --cw-input-bg: #111; --cw-accent: #1aad19;
-  --cw-composer-bg: #111; --cw-wechat-user-bg: #2abc67; --cw-wechat-user-text: #07180d; --cw-wechat-peer-bg: #2f2f2f;
-}
-html.cw-style-claude-code {
-  --cw-shell-bg: #fafafa; --cw-panel-bg: #fff; --cw-panel-2: #f2f2f2; --cw-header-bg: #fafafa;
-  --cw-border: #e3e3e3; --cw-border-strong: #c4c4c4; --cw-text: #1f1f1f; --cw-muted: #6b6b6b;
-  --cw-control-bg: #f0f0f0; --cw-control-hover: #e6e6e6; --cw-input-bg: #fff; --cw-accent: #c15f3c;
-  --cw-accent-text: #fff; --cw-composer-bg: #fafafa; --cw-user-bg: #f7f7f7; --cw-user-border: #dcdcdc;
-  --cw-assistant-accent: #c15f3c; --cw-tool-accent: #9a9a9a; --cw-preview-accent: #8a6fcb; --cw-radius: 6px;
-}
-html.cw-style-claude-code.dark {
-  --cw-shell-bg: #1a1a1a; --cw-panel-bg: #1f1f1f; --cw-panel-2: #272727; --cw-header-bg: #1f1f1f;
-  --cw-border: #333; --cw-border-strong: #4d4d4d; --cw-text: #e6e6e6; --cw-muted: #9a9a9a;
-  --cw-control-bg: #2a2a2a; --cw-control-hover: #333; --cw-input-bg: #242424; --cw-accent: #d97757;
-  --cw-accent-text: #1a0f0a; --cw-composer-bg: #1f1f1f; --cw-user-bg: #242424; --cw-user-border: #3a3a3a;
-  --cw-assistant-accent: #d97757; --cw-tool-accent: #8a8a8a; --cw-preview-accent: #b49cff;
-}
-
 .cw-app { position: fixed; inset: 0; width: auto; height: auto; min-width: 0; min-height: 0; overflow: hidden; display: grid; grid-template-columns: minmax(280px, 340px) minmax(0, 1fr); color: var(--cw-text); background: var(--cw-shell-bg); }
 .cw-sidebar { min-width: 0; min-height: 0; height: 100%; overflow: hidden; display: flex; flex-direction: column; background: var(--cw-panel-bg); border-right: 1px solid var(--cw-border); }
 .cw-sidebar-header, .cw-main-header { min-height: 58px; display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--cw-header-bg); border-bottom: 1px solid var(--cw-border); }
@@ -120,9 +92,35 @@ html.cw-style-claude-code.dark {
 @keyframes cw-task-completed { 0%, 45% { color: #16833b; border-color: #24a148; background: color-mix(in srgb, #24a148 18%, var(--cw-control-bg)); } 100% { color: inherit; border-color: var(--cw-border); background: transparent; } }
 .cw-spin { animation: cw-spin .9s linear infinite; } @keyframes cw-spin { to { transform: rotate(360deg); } }
 .cw-todo-pill { position: absolute; right: 12px; top: 64px; z-index: 31; background: var(--cw-panel-bg); }
-.cw-transcript-frame { grid-row: 2; min-width: 0; min-height: 0; position: relative; overflow: hidden; }
-.cw-transcript-scroll { width: 100%; height: 100%; overflow-x: hidden; overflow-y: auto; overscroll-behavior-y: contain; touch-action: pan-y; -webkit-overflow-scrolling: touch; scrollbar-gutter: stable; padding-top: 12px; }
+.cw-transcript-frame { grid-row: 2; min-width: 0; min-height: 0; position: relative; overflow: hidden; display: grid; grid-template-rows: minmax(0, 1fr) auto; }
+.cw-transcript-scroll { width: 100%; height: 100%; min-height: 0; overflow-x: hidden; overflow-y: auto; overscroll-behavior-y: contain; touch-action: pan-y; -webkit-overflow-scrolling: touch; scrollbar-gutter: stable; padding-top: 12px; }
 .cw-transcript-spacer { height: 24px; }
+.cw-context-notice {
+  min-width: 0;
+  min-height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 4px 12px;
+  border-top: 1px solid var(--cw-border);
+  background: var(--cw-shell-bg);
+  color: var(--cw-muted);
+  font-size: 11px;
+}
+.cw-context-notice > span { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.cw-context-notice button {
+  flex: none;
+  padding: 2px 6px;
+  border: 1px solid var(--cw-border);
+  border-radius: 4px;
+  background: var(--cw-control-bg);
+  color: var(--cw-text);
+}
+.cw-context-notice.is-over-limit { color: var(--cw-danger); }
+@media (hover: hover) {
+  .cw-context-notice button:hover { background: var(--cw-control-hover); }
+}
 .cw-prompt-nav { position: absolute; right: 12px; top: 50%; z-index: 40; display: flex; flex-direction: column; gap: 6px; transform: translateY(-50%); }
 .cw-floating-nav-button { width: 36px; height: 36px; display: grid; place-items: center; border: 1px solid var(--cw-border); border-radius: 8px; }
 .cw-scroll-bottom-button { position: absolute; right: 12px; bottom: 12px; z-index: 40; }
@@ -139,7 +137,67 @@ html.cw-style-claude-code.dark {
 .cw-markdown pre, .cw-tool-body pre { max-width: 100%; overflow: auto; padding: 9px; border-radius: 4px; background: rgba(127,127,127,.12); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .cw-markdown code:not(pre code) { padding: 1px 3px; border-radius: 3px; background: rgba(127,127,127,.15); }
 .cw-system-block { width: fit-content; max-width: calc(100% - 32px); margin: 8px auto 12px; padding: 3px 8px; border-radius: 3px; color: var(--cw-muted); background: var(--cw-panel-2); font-size: 11px; text-align: center; }
-.cw-system-error, .cw-error-label { color: #e0574f; }
+.cw-system-error, .cw-error-label { color: var(--cw-danger); }
+.cw-local-command,
+.cw-away-summary {
+  width: min(640px, calc(100% - 32px));
+  margin: 4px 16px 10px;
+  color: var(--cw-muted);
+}
+.cw-local-command {
+  padding: 4px 9px;
+  border-left: 2px solid color-mix(in srgb, var(--cw-border-strong) 72%, transparent);
+  background: transparent;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  opacity: .72;
+}
+.cw-local-command-summary {
+  display: block;
+  width: 100%;
+  overflow: hidden;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+button.cw-local-command-summary { cursor: pointer; }
+.cw-local-command-output {
+  max-height: min(42dvh, 360px);
+  margin: 5px 0 0;
+  overflow: auto;
+  color: var(--cw-text);
+  font: inherit;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.cw-away-summary {
+  padding: 8px 12px;
+  border: 1px solid var(--cw-border);
+  border-radius: var(--cw-radius);
+  background: color-mix(in srgb, var(--cw-panel-2) 68%, transparent);
+}
+.cw-away-summary > strong {
+  display: block;
+  margin-bottom: 5px;
+  color: var(--cw-muted);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+.cw-away-summary .prose {
+  color: var(--cw-text);
+  font-size: 13px;
+  line-height: 1.5;
+}
+@media (hover: hover) {
+  button.cw-local-command-summary:hover { color: var(--cw-text); }
+}
 .cw-tool-head { width: 100%; display: flex; align-items: center; gap: 5px; padding: 7px 9px; text-align: left; color: var(--cw-muted); border: 1px solid var(--cw-border); border-radius: 6px; background: var(--cw-panel-bg); }
 .cw-tool-head span:first-of-type { flex: 1; }.cw-rotate { transform: rotate(90deg); }
 .cw-tool-body { max-height: min(55vh, 560px); overflow: auto; padding: 8px; border: 1px solid var(--cw-border); border-top: 0; }
@@ -938,6 +996,17 @@ html.cw-style-claude-code .cw-modal-card {
   background: var(--cw-queue-optimistic-bg) !important;
   border-color: var(--cw-queue-optimistic-border) !important;
 }
+.cw-app-shell:not(.cw-shell-current) .cw-queue-chip-ok {
+  background: var(--cw-queue-ok-bg) !important;
+  border-color: var(--cw-queue-ok-border) !important;
+  color: var(--cw-queue-ok-text) !important;
+}
+.cw-app-shell:not(.cw-shell-current) .cw-queue-chip-failed {
+  background: var(--cw-queue-failed-bg) !important;
+  border-color: var(--cw-queue-failed-border) !important;
+  color: var(--cw-queue-failed-text) !important;
+  opacity: 1;
+}
 .cw-message-list:not(.cw-display-current) .cw-floating-nav-button {
   background: var(--cw-panel-bg) !important; color: var(--cw-text) !important;
   border-color: var(--cw-border) !important;
@@ -946,9 +1015,19 @@ html.cw-style-claude-code .cw-modal-card {
 @media (hover: hover) {
   .cw-message-list:not(.cw-display-current) .cw-floating-nav-button:hover { background: var(--cw-control-hover) !important; }
 }
-.md-table-wrap { max-width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.md-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  background:
+    linear-gradient(to right, rgba(255,255,255,0), rgba(0,0,0,0.06)) right center / 24px 100% no-repeat;
+  background-attachment: local;
+}
 .md-table-wrap > table { min-width: 100%; width: max-content; }
 .md-table-wrap > table th, .md-table-wrap > table td { white-space: normal; word-break: break-word; }
+.md-table-wrap > table th:first-child, .md-table-wrap > table td:first-child { padding-left: .6em; }
+.md-table-wrap > table th:last-child, .md-table-wrap > table td:last-child { padding-right: .6em; }
+.katex-display { max-width: 100%; overflow-x: auto; overflow-y: hidden; -webkit-overflow-scrolling: touch; }
 .cw-code-wrap { position: relative; }
 .cw-copy-btn {
   position: absolute; top: 6px; right: 6px; font-size: 11px; line-height: 1;
@@ -960,6 +1039,25 @@ html.cw-style-claude-code .cw-modal-card {
   .cw-code-wrap:hover > .cw-copy-btn, .cw-copy-btn:focus-visible { opacity: 1; }
 }
 @media (hover: none) { .cw-copy-btn { opacity: 0.6; } }
+.cw-copy-btn[data-state="ok"] {
+  background: color-mix(in srgb, var(--cw-success) 18%, var(--cw-panel-bg));
+  border-color: color-mix(in srgb, var(--cw-success) 55%, var(--cw-border));
+  color: var(--cw-success);
+  opacity: 1;
+}
+.cw-copy-btn[data-state="err"] {
+  background: color-mix(in srgb, var(--cw-danger) 18%, var(--cw-panel-bg));
+  border-color: color-mix(in srgb, var(--cw-danger) 55%, var(--cw-border));
+  color: var(--cw-danger);
+  opacity: 1;
+}
+html.dark .cw-copy-btn {
+  background: color-mix(in srgb, var(--cw-panel-2) 88%, transparent);
+  border-color: var(--cw-border);
+  color: var(--cw-text);
+}
+html.dark .cw-copy-btn[data-state="ok"] { color: var(--cw-success); }
+html.dark .cw-copy-btn[data-state="err"] { color: var(--cw-danger); }
 .thinking-dot {
   display: inline-block; width: 6px; height: 6px; border-radius: 9999px;
   animation: thinking-bounce 1.2s infinite ease-in-out;
@@ -1024,6 +1122,22 @@ html.cw-style-claude-code .cw-modal-card {
   background: transparent !important; box-shadow: none !important;
   --tw-ring-shadow: 0 0 #0000 !important; --tw-ring-offset-shadow: 0 0 #0000 !important;
   --tw-shadow: 0 0 #0000 !important;
+}
+.cw-agent-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  color: var(--cw-accent);
+  background: transparent !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  box-shadow: none !important;
+}
+.cw-agent-badge .cw-agent-logo {
+  display: block;
+  width: 100%;
+  height: 100%;
 }
 .cw-message-list.cw-display-wechat .cw-message-entry[data-block="UserPromptBlock"] > .cw-block,
 .cw-message-list.cw-display-wechat .cw-message-entry[data-block="AssistantBlock"] > .cw-block {
@@ -1399,8 +1513,6 @@ html.cw-style-wechat .cw-message-list.cw-display-wechat .cw-user-prompt .prose u
     border-radius: 0; box-shadow: none !important;
   }
 }
-.cw-app-shell.cw-shell-claude-code .cw-session-row .text-,
-.cw-app-shell.cw-shell-claude-code .cw-session-row .dark\:text- { color: var(--cw-accent) !important; }
 .cw-app-shell.cw-shell-claude-code .cw-prompt-input:has(.cw-cc-composer) {
   border: 0 !important; box-shadow: none !important; background: transparent !important;
   padding: 0 16px 14px !important; width: calc(100% - 24px);
@@ -1677,61 +1789,8 @@ html.dark.cw-style-wechat .cw-display-wechat .cw-preview-chip::before {
 .cw-display-wechat .cw-tool-run,
 .cw-display-wechat .cw-tool-run-header { line-height: 1.4; }
 
-/* -------------------------------------------------------------------------
-   Desktop reference pass
-
-   The desktop WeChat shell intentionally follows the compact, edge-to-edge
-   chat client shown in the visual reference.  Keep these overrides last:
-   the file still carries the legacy and semantic-DOM compatibility rules
-   above, while this layer supplies the final geometry and finish.
-   ------------------------------------------------------------------------- */
-
 :root {
   --cw-sidebar-width: 420px;
-  --cw-desktop-header-height: 65px;
-  --cw-desktop-composer-height: 168px;
-}
-
-html.dark.cw-style-wechat {
-  --cw-shell-bg: #0e0e0e;
-  --cw-panel-bg: #191919;
-  --cw-panel-2: #2c2c2c;
-  --cw-header-bg: #171717;
-  --cw-border: #2a2a2a;
-  --cw-border-strong: #454545;
-  --cw-text: #e9e9e9;
-  --cw-muted: #858585;
-  --cw-control-bg: #242424;
-  --cw-control-hover: #252525;
-  --cw-input-bg: #0e0e0e;
-  --cw-composer-bg: #0e0e0e;
-  --cw-wechat-user-bg: #29bd6b;
-  --cw-wechat-user-text: #062313;
-  --cw-wechat-peer-bg: #2c2c2c;
-  --cw-accent: #28bd6a;
-  --cw-accent-text: #061d10;
-}
-
-@media (prefers-color-scheme: dark) {
-  html:not(.light).cw-style-wechat {
-    --cw-shell-bg: #0e0e0e;
-    --cw-panel-bg: #191919;
-    --cw-panel-2: #2c2c2c;
-    --cw-header-bg: #171717;
-    --cw-border: #2a2a2a;
-    --cw-border-strong: #454545;
-    --cw-text: #e9e9e9;
-    --cw-muted: #858585;
-    --cw-control-bg: #242424;
-    --cw-control-hover: #252525;
-    --cw-input-bg: #0e0e0e;
-    --cw-composer-bg: #0e0e0e;
-    --cw-wechat-user-bg: #29bd6b;
-    --cw-wechat-user-text: #062313;
-    --cw-wechat-peer-bg: #2c2c2c;
-    --cw-accent: #28bd6a;
-    --cw-accent-text: #061d10;
-  }
 }
 
 @media (min-width: 768px) {
@@ -1739,670 +1798,32 @@ html.dark.cw-style-wechat {
     grid-template-columns: var(--cw-sidebar-width, 420px) minmax(0, 1fr);
   }
 
-  .cw-sidebar {
-    position: relative;
-    background: var(--cw-panel-bg) !important;
-    border-right: 1px solid #2b2b2b !important;
-  }
-
-  /* The functional resize grip may be emitted either beside or inside the
-     sidebar.  Its visible target is deliberately subtle, but its hit target
-     is eight pixels wide. */
-  .cw-sidebar-resize-handle,
   .cw-sidebar-resizer {
-    position: absolute;
-    z-index: 80;
+    position: fixed;
+    z-index: 70;
     top: 0;
     bottom: 0;
     left: calc(var(--cw-sidebar-width, 420px) - 4px);
     width: 8px;
-    padding: 0;
     cursor: col-resize;
     touch-action: none;
     background: transparent;
   }
-  .cw-sidebar > .cw-sidebar-resize-handle {
-    left: auto;
-    right: -4px;
-  }
-  .cw-sidebar-resize-handle::after,
+
   .cw-sidebar-resizer::after {
     content: "";
     position: absolute;
     top: 0;
     bottom: 0;
     left: 3px;
-    width: 1px;
+    width: 2px;
     background: transparent;
-    transition: background-color 120ms ease;
   }
-  .cw-sidebar-resize-handle:hover::after,
-  .cw-sidebar-resize-handle:focus-visible::after,
-  .cw-sidebar-resize-handle.is-dragging::after,
+
   .cw-sidebar-resizer:hover::after,
   .cw-sidebar-resizer:focus-visible::after,
   .cw-sidebar-is-resizing .cw-sidebar-resizer::after {
-    background: color-mix(in srgb, var(--cw-accent) 64%, #606060);
-  }
-
-  .cw-sidebar-header,
-  .cw-main-header {
-    min-height: var(--cw-desktop-header-height);
-    height: var(--cw-desktop-header-height);
-    padding: 0 16px;
-    gap: 6px;
-    background: var(--cw-header-bg) !important;
-    border-bottom: 1px solid #2b2b2b !important;
-  }
-
-  .cw-sidebar-header {
-    flex: 0 0 var(--cw-desktop-header-height);
-    padding-left: 17px;
-  }
-  .cw-sidebar-brand {
-    min-width: 0;
-    display: flex !important;
-    flex-direction: column;
-    gap: 1px !important;
-  }
-  .cw-sidebar-header > strong,
-  .cw-sidebar-brand > strong {
-    font-size: 17px;
-    line-height: 1.16;
-    font-weight: 700;
-    letter-spacing: -.015em;
-  }
-  .cw-sidebar-brand > small {
-    color: #777;
-    font-size: 10px;
-    line-height: 13px;
-  }
-  .cw-sidebar-header > div {
-    align-items: center;
-    gap: 8px;
-  }
-  .cw-sidebar-header-actions {
-    display: flex;
-    margin-left: auto;
-  }
-  .cw-sidebar-header button,
-  .cw-main-header button,
-  .cw-main-header a {
-    width: 36px;
-    height: 36px;
-    border-radius: 6px;
-    color: #aaa;
-  }
-  .cw-sidebar-header button:last-child {
-    color: #b7b7b7;
-  }
-
-  .cw-search.cw-sidebar-search-header {
-    position: absolute;
-    z-index: 6;
-    top: 14px;
-    right: 158px;
-    width: 36px;
-    height: 36px;
-    margin: 0;
-    padding: 0;
-    justify-content: center;
-    border: 0;
-    border-radius: 6px;
-    background: transparent !important;
-    color: #aaa;
-    overflow: hidden;
-    transition: width 140ms ease, background-color 140ms ease;
-  }
-  .cw-search.cw-sidebar-search-header:focus-within {
-    right: 14px;
-    width: calc(100% - 28px);
-    padding: 0 11px;
-    justify-content: flex-start;
-    background: #242424 !important;
-    box-shadow: 0 0 0 1px #383838;
-  }
-  .cw-search.cw-sidebar-search-header input {
-    width: 0;
-    opacity: 0;
-    pointer-events: none;
-    font-size: 13px;
-  }
-  .cw-search.cw-sidebar-search-header:focus-within input {
-    width: auto;
-    opacity: 1;
-    pointer-events: auto;
-  }
-  .cw-sidebar-list-menu {
-    position: absolute;
-    z-index: 90;
-    top: 56px;
-    right: 46px;
-    width: 190px;
-    overflow: hidden;
-    display: flex;
-    flex-direction: column;
-    padding: 5px;
-    border: 1px solid #363636;
-    border-radius: 7px;
-    color: #ddd;
-    background: #242424;
-    box-shadow: 0 16px 42px rgb(0 0 0 / .42);
-  }
-  .cw-sidebar-list-menu > button {
-    min-height: 34px;
-    display: flex;
-    align-items: center;
-    gap: 9px;
-    padding: 0 9px;
-    border-radius: 5px;
-    text-align: left;
-    color: #ccc;
-    font-size: 12px;
-  }
-  .cw-sidebar-list-menu > button:hover {
-    color: #fff;
-    background: #303030;
-  }
-  .cw-hidden-toggle {
-    display: none;
-  }
-
-  .cw-session-list {
-    background: var(--cw-panel-bg) !important;
-  }
-  .cw-section-label {
-    height: 24px;
-    padding: 7px 14px 3px;
-    color: #6f6f6f;
-    background: var(--cw-panel-bg);
-    font-size: 9px;
-    line-height: 14px;
-    letter-spacing: .08em;
-  }
-  .cw-group-label:has(> span:empty) {
-    display: none;
-  }
-  .cw-session-row-wrap {
-    border-bottom: 1px solid #242424;
-  }
-  .cw-session-row {
-    min-height: 82px;
-    padding: 11px 13px 10px 12px;
-    gap: 12px;
-    align-items: flex-start;
-    background: #191919 !important;
-    box-shadow: none !important;
-  }
-  .cw-session-row:hover {
-    background: #202020 !important;
-  }
-  .cw-session-row.selected,
-  .cw-session-row.cw-session-row-selected {
-    background: #1f1f1f !important;
-  }
-  .cw-session-selected-strip {
-    position: absolute;
-    z-index: 2;
-    inset: 0 auto 0 0;
-    width: 4px;
-    background: transparent !important;
-  }
-  .cw-session-row.selected .cw-session-selected-strip,
-  .cw-session-row.cw-session-row-selected .cw-session-selected-strip {
-    background: #20bb64 !important;
-  }
-  .cw-session-avatar {
-    position: relative;
-    flex: 0 0 46px;
-    width: 46px;
-    height: 46px;
-    border-radius: 6px;
-    color: #f5f5f5;
-    font-size: 13px;
-    font-weight: 750;
-    letter-spacing: -.02em;
-    background: #288e87;
-    box-shadow: none;
-  }
-  .cw-session-avatar-emoji {
-    font-size: 23px;
-    line-height: 1;
-    filter: saturate(.9);
-  }
-  .cw-session-agent-badge {
-    position: absolute;
-    right: -4px;
-    bottom: -4px;
-    width: 17px;
-    height: 17px;
-    display: grid;
-    place-items: center;
-    border: 2px solid #191919;
-    border-radius: 50%;
-    color: #f1f1f1;
-    background: #c95f3c;
-    font-size: 8px;
-    font-weight: 800;
-    line-height: 1;
-  }
-  .cw-session-agent-badge.is-codex {
-    background: #168a68;
-  }
-  .cw-session-row-wrap:nth-child(6n + 2) .cw-session-avatar { background: #4c9b68; }
-  .cw-session-row-wrap:nth-child(6n + 3) .cw-session-avatar { background: #8d7120; }
-  .cw-session-row-wrap:nth-child(6n + 4) .cw-session-avatar { background: #8054a4; }
-  .cw-session-row-wrap:nth-child(6n + 5) .cw-session-avatar { background: #a06427; }
-  .cw-session-row-wrap:nth-child(6n + 6) .cw-session-avatar { background: #3676a4; }
-  .cw-session-copy {
-    min-height: 52px;
-    gap: 3px;
-    padding-top: 0;
-  }
-  .cw-session-title {
-    min-height: 21px;
-    align-items: center;
-    gap: 12px;
-  }
-  .cw-session-title b {
-    font-size: 14px;
-    line-height: 20px;
-    font-weight: 650;
-    letter-spacing: -.012em;
-  }
-  .cw-session-title time {
-    padding-top: 1px;
-    color: #707070 !important;
-    font-size: 10px;
-    line-height: 18px;
-  }
-  .cw-session-preview,
-  .cw-session-cwd {
-    overflow: hidden;
-    white-space: nowrap;
-    text-overflow: ellipsis;
-    color: #858585 !important;
-    font-size: 12px;
-    line-height: 17px;
-  }
-  .cw-session-cwd {
-    color: #666 !important;
-    font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
-    font-size: 10px;
-  }
-  .cw-session-meta {
-    display: none;
-  }
-  .cw-session-state-slot {
-    top: 42px;
-    right: 13px;
-  }
-
-  .cw-main {
-    /* Header, transcript, optional interaction tray, compact controls and
-       composer. Context usage is deliberately absent unless the parser has a
-       trustworthy per-turn snapshot. */
-    grid-template-rows:
-      var(--cw-desktop-header-height)
-      minmax(0, 1fr)
-      auto
-      38px
-      auto;
-    background: var(--cw-shell-bg) !important;
-  }
-  .cw-main-header {
-    grid-row: 1;
-    padding-left: 17px;
-    padding-right: 14px;
-  }
-  .cw-header-title {
-    gap: 1px;
-  }
-  .cw-header-session-icon {
-    display: none;
-  }
-  .cw-header-title strong {
-    font-size: 15px;
-    line-height: 20px;
-    font-weight: 680;
-    letter-spacing: -.012em;
-  }
-  .cw-header-title small {
-    color: #777 !important;
-    font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
-    font-size: 10px;
-    line-height: 14px;
-  }
-  .cw-header-session-meta {
-    gap: 5px;
-  }
-  .cw-header-agent-mark {
-    width: 14px;
-    height: 14px;
-    display: inline-grid;
-    place-items: center;
-    border-radius: 50%;
-    color: #e9e9e9;
-    background: #c95f3c;
-    font-family: Inter, ui-sans-serif, system-ui, sans-serif;
-    font-size: 7px;
-    font-weight: 800;
-  }
-  .cw-header-agent-mark.is-codex {
-    background: #168a68;
-  }
-  .cw-header-cwd {
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .cw-header-actions {
-    flex: none;
-    display: flex;
-    align-items: center;
-    gap: 3px;
-  }
-  .cw-header-goal-indicator {
-    width: 6px;
-    height: 6px;
-    margin-right: -5px;
-    border-radius: 50%;
-    color: transparent;
-    background: var(--cw-accent);
-    box-shadow: 0 0 0 2px var(--cw-header-bg);
-  }
-  .cw-main-header select,
-  .cw-header-model {
-    height: 30px;
-    border-color: #343434;
-    background: #202020;
-    color: #aaa;
-  }
-  .cw-agent-pill {
-    border: 0;
-    color: #898989;
-    background: transparent;
-    text-transform: none;
-  }
-
-  .cw-transcript-frame {
-    grid-row: 2;
-    background: var(--cw-shell-bg);
-  }
-  .cw-transcript-scroll,
-  .cw-message-list:not(.cw-display-current) .cw-message-scroller {
-    padding-top: 16px;
-    padding-bottom: 18px;
-    scrollbar-gutter: stable;
-  }
-  .cw-transcript-spacer {
-    height: 14px;
-  }
-
-  .cw-display-wechat .cw-message-entry {
-    width: min(calc(100% - clamp(24px, 4vw, 96px)), clamp(1240px, 86vw, 1920px));
-    max-width: none;
-    margin: 0 auto 9px;
-    padding: 0;
-    gap: 8px;
-  }
-  .cw-display-wechat .cw-message-entry[data-block="UserPromptBlock"],
-  .cw-display-wechat .cw-message-entry[data-block="AssistantBlock"],
-  .cw-display-wechat .cw-message-entry[data-block="ToolRunBlock"] {
-    gap: 8px;
-  }
-  .cw-display-wechat .cw-message-avatar {
-    flex: 0 0 38px;
-    width: 38px;
-    height: 38px;
-    border-radius: 4px;
-  }
-  .cw-display-wechat .cw-message-avatar-user {
-    background: #167b88;
-  }
-  .cw-display-wechat .cw-message-avatar-assistant {
-    background: #343434;
-    color: #e6e6e6;
-  }
-  .cw-display-wechat .cw-message-avatar-fallback,
-  .cw-display-wechat .cw-agent-badge {
-    font-size: 11px;
-    font-weight: 750;
-  }
-  .cw-display-wechat .cw-session-message-emoji {
-    font-size: 21px;
-    line-height: 1;
-  }
-  .cw-display-wechat .cw-agent-badge {
-    font-size: 19px;
-    line-height: 1;
-  }
-  .cw-message-list.cw-display-wechat .cw-message-entry[data-block="UserPromptBlock"] > .cw-block,
-  .cw-message-list.cw-display-wechat .cw-message-entry[data-block="AssistantBlock"] > .cw-block {
-    max-width: calc(100% - 92px);
-  }
-  .cw-message-list.cw-display-wechat .cw-user-prompt-wrap {
-    width: auto;
-    max-width: calc(100% - 92px);
-  }
-  .cw-display-wechat .cw-user-prompt,
-  .cw-display-wechat .cw-assistant-block > div,
-  .cw-display-wechat .cw-tool-call,
-  .cw-display-wechat .cw-preview-chip {
-    border-radius: 6px !important;
-    font-size: 14px;
-  }
-  .cw-display-wechat .cw-user-prompt {
-    padding: 8px 16px !important;
-    border-radius: 6px 2px 6px 6px !important;
-    background: var(--cw-wechat-user-bg) !important;
-  }
-  .cw-display-wechat .cw-assistant-block > div {
-    padding: 8px 16px !important;
-    border-radius: 2px 6px 6px 6px !important;
-    background: var(--cw-wechat-peer-bg) !important;
-  }
-  .cw-display-wechat .cw-user-prompt::after {
-    top: 13px;
-    right: -5px;
-    width: 10px;
-    height: 10px;
-  }
-  .cw-display-wechat .cw-assistant-block > div::before,
-  .cw-display-wechat .cw-tool-call::before,
-  .cw-display-wechat .cw-preview-chip::before {
-    top: 13px;
-    left: -5px;
-    width: 10px;
-    height: 10px;
-  }
-  .cw-display-wechat .cw-user-prompt .prose,
-  .cw-display-wechat .cw-assistant-block .prose {
-    font-size: 14px;
-    line-height: 1.58;
-  }
-
-  /* Consecutive tool calls are represented by ToolRunBlock; keep its closed
-     state as one muted line, matching the “3 Bash calls …” reference row. */
-  .cw-display-wechat .cw-message-entry[data-block="ToolRunBlock"] {
-    min-height: 30px;
-    margin-top: -3px !important;
-    margin-bottom: 3px !important;
-  }
-  .cw-display-wechat .cw-tool-run {
-    width: 100%;
-    padding: 0;
-    color: #898989;
-    background: transparent !important;
-  }
-  .cw-display-wechat .cw-tool-run-header {
-    min-height: 30px;
-    padding: 4px 8px !important;
-    border: 0 !important;
-    border-radius: 4px !important;
-    color: #898989;
-    background: transparent !important;
-    font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
-    font-size: 11px;
-  }
-  .cw-display-wechat .cw-tool-run-header:hover {
-    color: #aaa;
-    background: #181818 !important;
-  }
-  .cw-display-wechat .cw-tool-run-caret {
-    color: #7d7d7d;
-    font-size: 9px;
-  }
-  .cw-display-wechat .cw-tool-run-items {
-    margin: 2px 0 7px;
-    padding-left: 0;
-  }
-  .cw-display-wechat .cw-tool-run .cw-tool-call {
-    margin: 2px 0;
-    padding: 5px 8px !important;
-    border: 0 !important;
-    border-radius: 4px !important;
-    background: #181818 !important;
-  }
-
-  .cw-prompt-nav {
-    right: 24px;
-    gap: 10px;
-  }
-  .cw-floating-nav-button,
-  .cw-message-list:not(.cw-display-current) .cw-floating-nav-button {
-    width: 44px;
-    height: 44px;
-    border: 0 !important;
-    border-radius: 50%;
-    color: #c3c3c3 !important;
-    background: #202020 !important;
-    box-shadow: none !important;
-    font-size: 17px;
-  }
-  .cw-floating-nav-button:hover,
-  .cw-message-list:not(.cw-display-current) .cw-floating-nav-button:hover {
-    background: #292929 !important;
-  }
-  .cw-scroll-bottom-button {
-    right: 24px;
-    bottom: 18px;
-  }
-
-  .cw-interaction-tray {
-    grid-row: 3;
-  }
-  .cw-session-toolbar {
-    grid-row: 4;
-    min-width: 0;
-    min-height: 38px;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 4px 14px;
-    color: #8c8c8c;
-    background: #151515;
-    border-top: 1px solid #2b2b2b;
-    border-bottom: 1px solid #222;
-  }
-  .cw-session-toolbar button,
-  .cw-session-toolbar a {
-    width: 30px;
-    height: 30px;
-    display: inline-grid;
-    place-items: center;
-    border-radius: 5px;
-  }
-  .cw-session-toolbar button:hover,
-  .cw-session-toolbar a:hover {
-    color: var(--cw-text);
-    background: #252525;
-  }
-  .cw-session-toolbar select,
-  .cw-session-toolbar input {
-    max-width: 150px;
-    height: 28px;
-    padding: 3px 7px;
-    border: 0;
-    border-radius: 4px;
-    outline: none;
-    color: #999;
-    background: transparent;
-    font-size: 11px;
-  }
-  .cw-session-toolbar-spacer {
-    flex: 1 1 auto;
-  }
-  .cw-session-toolbar select:hover,
-  .cw-session-toolbar input:hover,
-  .cw-session-toolbar select:focus,
-  .cw-session-toolbar input:focus {
-    color: #ddd;
-    background: #232323;
-  }
-
-  .cw-composer {
-    grid-row: 5;
-  }
-  .cw-app.cw-shell-wechat .cw-composer,
-  .cw-app-shell.cw-shell-wechat .cw-prompt-input {
-    width: 100%;
-    height: var(--cw-wechat-composer-height, var(--cw-desktop-composer-height));
-    min-height: 118px;
-    max-height: 72dvh;
-    margin: 0;
-    padding: 0 !important;
-    border: 0 !important;
-    border-radius: 0 !important;
-    background: #0e0e0e !important;
-    box-shadow: inset 0 1px #2a2a2a !important;
-  }
-  .cw-app.cw-shell-wechat .cw-composer-row,
-  .cw-app-shell.cw-shell-wechat .cw-composer-row {
-    width: 100%;
-    max-width: none;
-    padding: 16px 13px 12px 15px;
-    background: #0e0e0e;
-  }
-  .cw-app.cw-shell-wechat .cw-composer-textarea,
-  .cw-app-shell.cw-shell-wechat .cw-composer-textarea {
-    padding: 1px 0 0 !important;
-    color: #e6e6e6 !important;
-    background: transparent !important;
-    caret-color: #f1f1f1;
-    font-size: 15px;
-    line-height: 1.58;
-  }
-  .cw-app.cw-shell-wechat .cw-send-button,
-  .cw-app-shell.cw-shell-wechat .cw-send-button {
-    min-width: 76px;
-    height: 29px !important;
-    border-radius: 4px !important;
-    color: #f1fff6 !important;
-    background: #20b85f !important;
-    font-size: 13px !important;
-    font-weight: 550 !important;
-  }
-  .cw-app.cw-shell-wechat .cw-send-button:disabled,
-  .cw-app-shell.cw-shell-wechat .cw-send-button:disabled {
-    color: #6d6d6d !important;
-    background: #242424 !important;
-  }
-  .cw-app-shell.cw-shell-wechat .cw-wechat-resize-handle {
-    top: -4px;
-    height: 9px;
-  }
-
-  /* Claude Code keeps its own message language, but shares the reference
-     shell proportions so switching styles does not make the app jump. */
-  .cw-app.cw-shell-claude-code .cw-sidebar-header,
-  .cw-app.cw-shell-claude-code .cw-main-header {
-    min-height: var(--cw-desktop-header-height);
-    height: var(--cw-desktop-header-height);
-  }
-  .cw-app.cw-shell-claude-code .cw-composer {
-    grid-row: 5;
-    width: min(calc(100% - 80px), 1100px);
-    margin: 0 auto 18px;
+    background: color-mix(in srgb, var(--cw-accent) 58%, transparent);
   }
 }
 
@@ -2410,29 +1831,13 @@ html.dark.cw-style-wechat {
   :root {
     --cw-sidebar-width: 100%;
   }
+
   .cw-app {
     grid-template-columns: 100% 100%;
   }
-  .cw-sidebar-resize-handle,
+
   .cw-sidebar-resizer {
     display: none !important;
-  }
-  .cw-session-toolbar {
-    grid-row: 4;
-    min-height: 38px;
-    display: flex;
-    align-items: center;
-    gap: 5px;
-    overflow-x: auto;
-    padding: 4px 8px;
-    border-top: 1px solid var(--cw-border);
-    background: var(--cw-header-bg);
-  }
-  .cw-main {
-    grid-template-rows: auto minmax(0, 1fr) auto 38px auto;
-  }
-  .cw-composer {
-    grid-row: 5;
   }
 }
 
@@ -2442,7 +1847,7 @@ html.dark.cw-style-wechat {
   background: transparent !important;
 }
 .cw-app-shell .cw-session-row.cw-session-row-selected .cw-session-selected-strip {
-  background: #20bb64 !important;
+  background: var(--cw-accent) !important;
 }
 
 /* Global transcript search is a real row below the header. The previous
@@ -2505,88 +1910,55 @@ html.dark.cw-style-wechat {
   background: var(--cw-control-hover) !important;
 }
 
-/* Installed-agent controls mirror the compact Claude Code footer: explicit
-   values, tiny chevrons, and a square stop control immediately after them. */
-.cw-session-toolbar {
-  gap: 2px;
-  scrollbar-width: thin;
-}
-.cw-toolbar-select {
-  position: relative;
-  flex: 0 0 auto;
+/* Explicit model / effort / permission controls live inside the composer.
+   Menus are teleported to body so neither transcript nor composer clips them. */
+.cw-composer-controls {
+  min-width: 0;
   display: inline-flex;
   align-items: center;
-  min-width: 0;
-  height: 26px;
-  border-radius: 4px;
-  color: #8f8f8f;
-  background: transparent;
+  gap: 2px;
 }
-.cw-toolbar-select:hover,
-.cw-toolbar-select:focus-within {
-  color: #d4d4d4;
-  background: #232323;
-}
-.cw-toolbar-select > svg {
-  position: absolute;
-  right: 5px;
-  top: 50%;
-  z-index: 1;
+.cw-control-pill,
+.cw-control-stop {
   flex: 0 0 auto;
-  pointer-events: none;
-  transform: translateY(-50%);
-  opacity: .78;
-}
-.cw-session-toolbar .cw-toolbar-select select {
-  appearance: none;
-  -webkit-appearance: none;
-  field-sizing: content;
-  flex: 0 0 auto;
-  width: auto;
-  max-width: 100%;
   height: 26px;
-  padding: 2px 20px 2px 6px;
-  border: 1px solid transparent;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
   border-radius: 4px;
-  outline: none;
-  color: inherit;
   background: transparent;
+  color: var(--cw-muted);
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
   font-size: 11px;
   line-height: 1;
-  cursor: pointer;
 }
-.cw-session-toolbar .cw-toolbar-select select:hover,
-.cw-session-toolbar .cw-toolbar-select select:focus {
-  color: inherit;
-  background: transparent;
+.cw-control-pill {
+  min-width: 0;
+  max-width: 220px;
+  gap: 4px;
+  padding: 0 6px;
 }
-.cw-session-toolbar .cw-toolbar-select option {
+.cw-control-pill > span {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.cw-control-pill > svg { flex: 0 0 auto; opacity: .72; }
+.cw-control-stop { width: 24px; padding: 0; }
+@media (hover: hover) {
+  .cw-control-pill:hover,
+  .cw-control-stop:hover:not(:disabled) {
+    color: var(--cw-text);
+    background: var(--cw-control-hover);
+  }
+}
+.cw-control-pill[aria-expanded="true"] {
   color: var(--cw-text);
-  background: var(--cw-panel-bg);
+  background: var(--cw-control-hover);
 }
-.cw-toolbar-model { max-width: 220px; }
-.cw-toolbar-permission { max-width: 180px; }
-.cw-toolbar-sandbox { max-width: 180px; }
-.cw-session-toolbar .cw-toolbar-stop {
-  flex: 0 0 24px;
-  width: 24px;
-  height: 24px;
-  margin-left: 1px;
-  border-radius: 4px;
-  color: #a7a7a7;
-  background: transparent;
-}
-.cw-session-toolbar .cw-toolbar-stop:hover:not(:disabled) {
-  color: #ededed;
-  background: #292929;
-}
-.cw-session-toolbar .cw-toolbar-stop:disabled {
-  color: #696969;
-  background: transparent;
-  opacity: .56;
-  cursor: default;
-}
+.cw-control-stop:disabled { opacity: .42; cursor: default; }
 .cw-capabilities-loading {
   flex: 0 0 auto;
   display: inline-grid;
@@ -2595,13 +1967,13 @@ html.dark.cw-style-wechat {
 }
 .cw-yolo-badge,
 .cw-yolo-inline {
-  color: #f1b65b;
+  color: var(--cw-warning);
   font-weight: 700;
 }
 .cw-yolo-badge {
   flex: 0 0 auto;
   padding: 2px 5px;
-  border: 1px solid color-mix(in srgb, #f1b65b 45%, var(--cw-border));
+  border: 1px solid color-mix(in srgb, var(--cw-warning) 45%, var(--cw-border));
   border-radius: 4px;
   font-size: 9px;
   letter-spacing: .05em;
@@ -2622,7 +1994,72 @@ html.dark.cw-style-wechat {
   .cw-sidebar > .cw-search.cw-sidebar-search-header {
     margin: 6px 8px;
   }
-  .cw-toolbar-model { max-width: 180px; }
-  .cw-toolbar-permission,
-  .cw-toolbar-sandbox { max-width: 150px; }
+  .cw-control-pill { max-width: 132px; }
+}
+
+.cw-control-popover {
+  position: fixed;
+  z-index: 80;
+  width: 238px;
+  max-height: min(420px, calc(100dvh - 16px));
+  overflow-y: auto;
+  padding: 5px;
+  border: 1px solid var(--cw-popover-border, var(--cw-border));
+  border-radius: calc(var(--cw-radius) + 2px);
+  background: var(--cw-popover-bg, var(--cw-panel-bg));
+  color: var(--cw-popover-fg, var(--cw-text));
+  box-shadow: var(--cw-popover-shadow, 0 16px 48px rgba(0,0,0,.28));
+}
+.cw-control-popover.is-permission { width: 286px; }
+.cw-control-popover > header,
+.cw-control-popover-divider {
+  padding: 7px 9px 5px;
+  color: var(--cw-muted);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .055em;
+  text-transform: uppercase;
+}
+.cw-control-popover-divider {
+  margin-top: 4px;
+  border-top: 1px solid var(--cw-border);
+}
+.cw-control-popover > button[role="option"] {
+  width: 100%;
+  min-height: 34px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: max(4px, calc(var(--cw-radius) - 1px));
+  color: inherit;
+  text-align: left;
+}
+.cw-control-popover > button[role="option"] > span {
+  min-width: 0;
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.cw-control-popover strong { font-size: 12px; font-weight: 600; }
+.cw-control-popover small { color: var(--cw-muted); font-size: 10px; line-height: 1.35; }
+@media (hover: hover) {
+  .cw-control-popover > button[role="option"]:hover {
+    background: var(--cw-popover-hover-bg, var(--cw-control-hover));
+  }
+}
+.cw-control-popover > button[role="option"]:focus-visible {
+  outline: 2px solid var(--cw-focus-ring);
+  outline-offset: -2px;
+}
+
+.cw-app-shell.cw-shell-wechat .cw-prompt-input > .cw-composer-controls {
+  flex: 0 0 auto;
+  padding: 5px 12px 0;
+  opacity: .78;
+}
+.cw-app-shell.cw-shell-wechat .cw-prompt-input > .cw-composer-controls .cw-control-pill,
+.cw-app-shell.cw-shell-wechat .cw-prompt-input > .cw-composer-controls .cw-control-stop {
+  height: 22px;
 }

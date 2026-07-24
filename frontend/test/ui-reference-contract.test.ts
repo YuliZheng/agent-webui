@@ -12,6 +12,48 @@ const toolResultVue = read("src/components/blocks/ToolResult.vue");
 const stickyVue = read("src/components/StickyPromptOverlay.vue");
 const parserTs = read("src/parser/index.ts");
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function selectorBlocks(source: string, selector: string): string[] {
+  const pattern = new RegExp(`(?:^|})\\s*${escapeRegExp(selector)}\\s*\\{([^{}]*)}`, "g");
+  return [...source.matchAll(pattern)].map((match) => match[1] ?? "");
+}
+
+function declaration(block: string, property: string): string | undefined {
+  const pattern = new RegExp(`${escapeRegExp(property)}\\s*:\\s*([^;]+)\\s*;`, "g");
+  return [...block.matchAll(pattern)].at(-1)?.[1]?.trim();
+}
+
+const expectedWechatDarkTokens = {
+  "--cw-shell-bg": "#111111",
+  "--cw-panel-bg": "#1f1f1f",
+  "--cw-panel-2": "#333333",
+  "--cw-header-bg": "#111111",
+  "--cw-border": "#2a2a2a",
+  "--cw-border-strong": "#4d4d4d",
+  "--cw-text": "#ededed",
+  "--cw-muted": "#888888",
+  "--cw-control-bg": "#2a2a2a",
+  "--cw-control-hover": "#333333",
+  "--cw-input-bg": "#111111",
+  "--cw-accent": "#1aad19",
+  "--cw-accent-text": "#06130d",
+  "--cw-composer-bg": "#111111",
+  "--cw-wechat-user-bg": "#2ba245",
+  "--cw-wechat-user-text": "#07180d",
+  "--cw-wechat-peer-bg": "#2f2f2f",
+} as const;
+
+function hasCanonicalWechatDarkCascade(source: string): boolean {
+  const blocks = selectorBlocks(source, "html.dark.cw-style-wechat");
+  if (blocks.length !== 1) return false;
+  return Object.entries(expectedWechatDarkTokens).every(
+    ([property, expected]) => declaration(blocks[0]!, property) === expected,
+  );
+}
+
 describe("reference UI contract", () => {
   it("mounts the same theme at html, shell, and message-list levels", () => {
     expect(appVue).toContain("cw-app-shell");
@@ -37,16 +79,22 @@ describe("reference UI contract", () => {
     expect(css).toContain("max-width: calc(100% - 84px) !important");
     expect(css).not.toContain("max-width: min(760px, 74%)");
     expect(css).not.toContain("max-width: calc(100% - 48px)");
-    expect(css).toContain("--cw-wechat-user-bg: #2ba245");
-    expect(css).toContain("--cw-wechat-user-text: #07180d");
-    expect(css).toContain("--cw-panel-bg: #1f1f1f");
-    expect(css).toContain("--cw-panel-2: #333333");
-    expect(css).toContain("--cw-header-bg: #111111");
-    expect(css).toContain("--cw-input-bg: #111111");
-    expect(css).toContain("--cw-composer-bg: #111111");
-    expect(css).toContain("--cw-border-strong: #4d4d4d");
+    expect(hasCanonicalWechatDarkCascade(css)).toBe(true);
+    expect(
+      hasCanonicalWechatDarkCascade(
+        `${css}\nhtml.dark.cw-style-wechat { --cw-shell-bg: #000000; }\n`,
+      ),
+      "a later duplicate selector must invalidate the cascade contract",
+    ).toBe(false);
     expect(css).toContain("--tw-prose-counters: #031008");
     expect(css).not.toContain("html.cw-style-wechat:not(.light)");
+  });
+
+  it("does not reintroduce a hard-coded desktop reference pass", () => {
+    expect(css).not.toMatch(/#0e0e0e|#191919|#20b85f|#167b88|#29bd6b|#28bd6a/i);
+    for (const match of css.matchAll(/@media\s*\(\s*min-width\s*:\s*768px\s*\)\s*\{([\s\S]*?)(?=\n\})/g)) {
+      expect(match[1]).not.toMatch(/#0e0e0e|#191919|#20b85f|#167b88|#29bd6b|#28bd6a/i);
+    }
   });
 
   it("keeps WeChat bubble, avatar, prose, image, and fade details", () => {
@@ -69,7 +117,8 @@ describe("reference UI contract", () => {
     expect(css).toContain("min-width: 76px");
     expect(css).toContain("calc(10px + env(safe-area-inset-bottom))");
     expect(css).toContain(".cw-app-shell.cw-shell-wechat .cw-send-button:disabled");
-    expect(appVue).not.toContain("cw-context-footer");
+    expect(messageListVue).toContain("cw-context-notice");
+    expect(messageListVue).toContain("contextUsageSnapshot");
     for (const match of css.matchAll(/([^{}]*\.cw-prompt-input[^{}]*)\{([^}]*)\}/g)) {
       expect(match[2], match[1]).not.toMatch(/position\s*:\s*(?:absolute|fixed)/);
     }

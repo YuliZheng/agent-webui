@@ -3,6 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } 
 import type { MessageDisplayStyle, NormalizedBlock } from "@/types";
 import { renderMarkdown } from "@/render/markdown";
 import { useUiStore } from "@/stores/ui";
+import { useIdentityStore } from "@/stores/identity";
 
 const props = withDefaults(defineProps<{
   block: NormalizedBlock;
@@ -16,6 +17,8 @@ const props = withDefaults(defineProps<{
 });
 const emit = defineEmits<{ rewind: [block: NormalizedBlock]; fork: [block: NormalizedBlock] }>();
 const ui = useUiStore();
+const identity = useIdentityStore();
+const avatarUrl = "/api/me/avatar?v=2";
 const preview = computed(() => props.preview === true);
 const compactImages = computed(() => props.displayStyle === "claude-code");
 const text = computed(() => props.block.text ?? "");
@@ -192,8 +195,8 @@ watch([text, () => images.value.length, promptCollapsePx], async () => {
     </div>
     <div v-if="text" class="cw-user-prompt-text-bubble cw-user-prompt">
       <span v-if="wechatBubbleAvatar" class="cw-bubble-avatar" aria-hidden="true">
-        <span class="cw-message-avatar-fallback">YZ</span>
-        <img :src="'/api/me/avatar?v=2'" alt="" loading="lazy" decoding="async" @error="hideBrokenAvatar" />
+        <span class="cw-message-avatar-fallback">{{ identity.initials }}</span>
+        <img :src="avatarUrl" alt="" loading="lazy" decoding="async" @error="hideBrokenAvatar" />
       </span>
       <div ref="promptBody" class="cw-user-prompt-body" :class="bodyCollapsed ? 'cw-user-prompt-collapsed' : ''">
         <div class="prose" v-html="html" />

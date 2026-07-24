@@ -20,6 +20,28 @@ interface OwnedClaude {
 
 export interface ClaudePromptOptions { model?: string; effort?: string; permissionMode?: string; images?: unknown[] }
 
+export function claudeSpawnArgs(
+  resumeId: string | undefined,
+  model: string | undefined,
+  permissionMode: string | undefined,
+): string[] {
+  const args = ["--print", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--permission-prompt-tool", "stdio"];
+  if (resumeId) args.push("--resume", resumeId);
+  if (model) args.push("--model", model);
+  if (permissionMode) args.push("--permission-mode", permissionMode);
+  return args;
+}
+
+export function claudeExitStatus(
+  code: number | null,
+  signal: NodeJS.Signals | null,
+  normalSignal = false,
+): "exited" | "failed" {
+  return normalSignal || signal !== null || code === null || [0, 130, 137, 143].includes(code)
+    ? "exited"
+    : "failed";
+}
+
 export class ClaudeDriver extends EventEmitter {
   private owned = new Map<string, OwnedClaude>();
   private all = new Set<OwnedClaude>();
@@ -82,13 +104,8 @@ export class ClaudeDriver extends EventEmitter {
     const settings = resumeId ? (await this.state.settings.get())[resumeId] : undefined;
     const prefs = await this.state.prefs.get();
     const model = this.effective(options.model) ?? this.effective(settings?.model) ?? this.effective(prefs.defaultClaudeModel as string | undefined);
-    const effort = this.effective(options.effort) ?? this.effective(settings?.effort) ?? this.effective(prefs.defaultClaudeEffort as string | undefined);
     const permission = this.effective(options.permissionMode) ?? this.effective(settings?.permissionMode) ?? this.effective(prefs.defaultClaudePermissionMode as string | undefined);
-    const args = ["--print", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--permission-prompt-tool", "stdio"];
-    if (resumeId) args.push("--resume", resumeId);
-    if (model) args.push("--model", model);
-    if (effort) args.push("--effort", effort);
-    if (permission) args.push("--permission-mode", permission);
+    const args = claudeSpawnArgs(resumeId, model, permission);
     const child = spawn(this.binary, args, {
       cwd, shell: false, stdio: ["pipe", "pipe", "pipe"], windowsHide: true,
       env: { ...process.env, AGENT_WEBUI: "1", ...(resumeId ? { AGENT_WEBUI_RESUME_SESSION_ID: resumeId } : {}) },
@@ -109,12 +126,6 @@ export class ClaudeDriver extends EventEmitter {
 
   private stdout(proc: OwnedClaude, chunk: string): void {
     proc.buffer += chunk;
-    if (proc.buffer.length > 8 * 1024 * 1024) {
-      proc.buffer = "";
-      proc.child.kill();
-      this.emit("error", { sessionId: proc.sessionId, message: "Claude produced an oversized unframed response" });
-      return;
-    }
     let newline: number;
     while ((newline = proc.buffer.indexOf("\n")) >= 0) {
       const line = proc.buffer.slice(0, newline).trim(); proc.buffer = proc.buffer.slice(newline + 1);
@@ -122,6 +133,10 @@ export class ClaudeDriver extends EventEmitter {
       let event: Record<string, unknown> | null = null;
       try { event = asRecord(JSON.parse(line)); } catch { this.emit("error", { sessionId: proc.sessionId, message: "Malformed Claude stream record" }); }
       if (event) this.handle(proc, event);
+    }
+    if (proc.buffer.length > 4 * 1024 * 1024) {
+      proc.buffer = "";
+      this.emit("error", { sessionId: proc.sessionId, message: "Claude produced an oversized unframed response; stream buffer was reset" });
     }
   }
 
@@ -277,7 +292,7 @@ export class ClaudeDriver extends EventEmitter {
         this.emit("interaction-removed", { sessionId: proc.sessionId, requestId });
       }
     }
-    if (proc.sessionId) this.emit("status", { id: proc.sessionId, status: code === 0 || signal || proc.normalSignal ? "exited" : "failed", webuiAlive: false });
+    if (proc.sessionId) this.emit("status", { id: proc.sessionId, status: claudeExitStatus(code, signal, proc.normalSignal), webuiAlive: false });
   }
 
   close(): void { for (const proc of this.all) { proc.normalSignal = true; proc.child.kill("SIGTERM"); } }

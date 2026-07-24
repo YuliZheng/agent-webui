@@ -761,6 +761,27 @@ export function preserveIndexes(lines: IndexedRawLine[], predicate: (raw: string
   return lines.filter(line => predicate(line.raw));
 }
 
+/**
+ * Claude writes several large bookkeeping records (most notably
+ * file-history-snapshot) into the same append-only transcript. They are still
+ * physical lines, and therefore still count toward every source index, but
+ * they are not useful display payloads.
+ */
+export function isRenderableClaudeLine(raw: string): boolean {
+  let record: unknown;
+  try { record = JSON.parse(raw); } catch { return true; }
+  if (!record || typeof record !== "object" || Array.isArray(record)) return true;
+  const value = record as Record<string, unknown>;
+  if (value.type === "user" || value.type === "assistant" || value.type === "system" || value.type === "queue-operation") {
+    return true;
+  }
+  if (value.type !== "attachment") return false;
+  return !!value.attachment
+    && typeof value.attachment === "object"
+    && !Array.isArray(value.attachment)
+    && (value.attachment as Record<string, unknown>).type === "queued_command";
+}
+
 export type TailEvent =
   | { type: "stream-truncate"; keepCount: number }
   | { type: "stream-reset" }
@@ -773,6 +794,7 @@ export interface TailOptions {
   tailN?: number;
   pollMs?: number;
   truncateVerifyMs?: number;
+  filter?: (raw: string) => boolean;
 }
 
 export class JsonlTailer {
@@ -849,7 +871,10 @@ export class JsonlTailer {
         "forward",
       );
       if (!lines.length) return;
-      this.emit({ type: "stream-batch", lines });
+      const visible = this.options.filter
+        ? preserveIndexes(lines, this.options.filter)
+        : lines;
+      if (visible.length) this.emit({ type: "stream-batch", lines: visible });
       cursor = lines[lines.length - 1]!.index + 1;
       if (cursor < to) await new Promise<void>(resolve => setImmediate(resolve));
     }
@@ -1055,7 +1080,10 @@ export class JsonlTailer {
       this.lastSize = this.positionBytes;
       this.lastMtimeMs = info.mtimeMs;
       const lines = this.consumeAppend(appended.subarray(0, bytesRead));
-      const visible = lines.filter(line => line.index >= this.options.from);
+      const visible = lines.filter(line =>
+        line.index >= this.options.from
+        && (!this.options.filter || this.options.filter(line.raw)),
+      );
       if (visible.length === 1) this.emit({ type: "stream-line", index: visible[0]!.index, data: visible[0]!.raw });
       else if (visible.length) this.emit({ type: "stream-batch", lines: visible });
       await this.updateCheckpoints();

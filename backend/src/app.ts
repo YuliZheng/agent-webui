@@ -18,6 +18,8 @@ import {
   configureLineIndexPersistence,
   flushLineIndexPersistence,
   JsonlTailer,
+  isRenderableClaudeLine,
+  preserveIndexes,
   readRange,
   readTail,
 } from "./services/jsonl.js";
@@ -324,13 +326,60 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     return work;
   }
 
+  function loginPage(reply: FastifyReply, message = "Paste the local access token to continue."): FastifyReply {
+    const safeMessage = escapeHtml(message);
+    return reply
+      .code(401)
+      .header("Cache-Control", "no-store")
+      .header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
+      .type("text/html; charset=utf-8")
+      .send(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Agent WebUI sign in</title>
+  <style>
+    :root{color-scheme:light dark;font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+    *{box-sizing:border-box}
+    body{min-height:100vh;margin:0;display:grid;place-items:center;background:#111;color:#ededed;padding:24px}
+    main{width:min(420px,100%);border:1px solid #333;background:#1f1f1f;padding:24px}
+    h1{font-size:20px;margin:0 0 8px}p{margin:0 0 18px;color:#aaa;line-height:1.5}
+    label{display:block;font-size:13px;margin-bottom:7px;color:#ccc}
+    input{width:100%;height:42px;border:1px solid #4d4d4d;background:#111;color:#fff;padding:0 11px;font:inherit;outline:none}
+    input:focus{border-color:#1aad19}
+    button{width:100%;height:40px;margin-top:12px;border:0;background:#1aad19;color:#06130d;font:600 14px inherit;cursor:pointer}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Agent WebUI</h1>
+    <p>${safeMessage}</p>
+    <form method="get" action="/">
+      <label for="token">Access token</label>
+      <input id="token" name="token" type="password" required autofocus autocomplete="current-password" spellcheck="false">
+      <button type="submit">Sign in</button>
+    </form>
+  </main>
+</body>
+</html>`);
+  }
+
   app.addHook("onRequest", async (request, reply) => {
     const path = rawPath(request);
     const capability = /^(?:\/preview\/[0-9a-f]{8}-[0-9a-f-]{27}\/index\.html)$/i.test(path);
     const bind = request.method === "GET" && path === "/api/auth/bind";
     const rootBind = request.method === "GET" && path === "/" && typeof (request.query as Record<string, unknown>)?.token === "string";
     if (capability || bind || rootBind || path === "/ws/main") return;
-    if (!timingSafeToken(token, requestToken(request))) await reply.code(401).send({ error: "Authentication required" });
+    if (!timingSafeToken(token, requestToken(request))) {
+      const acceptsHtml = request.method === "GET"
+        && !path.startsWith("/api/")
+        && path !== "/api"
+        && !path.startsWith("/assets/")
+        && String(request.headers.accept ?? "").includes("text/html");
+      if (acceptsHtml) return loginPage(reply);
+      await reply.code(401).send({ error: "Authentication required" });
+    }
   });
 
   app.setErrorHandler((error, _request, reply) => {
@@ -352,10 +401,10 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   app.get("/", async (request, reply) => {
     const supplied = (request.query as Record<string, unknown>)?.token;
     if (supplied !== undefined) {
-      if (!timingSafeToken(token, supplied)) return reply.code(401).send({ error: "Invalid token" });
+      if (!timingSafeToken(token, supplied)) return loginPage(reply, "That token is invalid. Check the startup URL and try again.");
       setTokenCookie(reply, token); reply.redirect("/"); return;
     }
-    if (!timingSafeToken(token, requestToken(request))) return reply.code(401).send({ error: "Authentication required" });
+    if (!timingSafeToken(token, requestToken(request))) return loginPage(reply);
     await spa(reply);
   });
   app.get("/api/auth/bind", async (request, reply) => {
@@ -374,11 +423,14 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   app.get("/api/sessions", sessionView);
   app.get("/api/sessions/:id/tail", async request => {
     const { id } = request.params as { id: string }; assertSessionId(id); const session = await index.resolve(id); if (!session) throw new RpcError(404, "Session not found");
-    return readTail(session.path, Number((request.query as Record<string, unknown>).n ?? 200));
+    const lines = await readTail(session.path, Number((request.query as Record<string, unknown>).n ?? 200));
+    return session.agent === "claude" ? preserveIndexes(lines, isRenderableClaudeLine) : lines;
   });
   app.get("/api/sessions/:id/range", async request => {
     const { id } = request.params as { id: string }; assertSessionId(id); const session = await index.resolve(id); if (!session) throw new RpcError(404, "Session not found");
-    const query = request.query as Record<string, unknown>; return readRange(session.path, Number(query.from ?? 0), query.to === undefined ? undefined : Number(query.to));
+    const query = request.query as Record<string, unknown>;
+    const lines = await readRange(session.path, Number(query.from ?? 0), query.to === undefined ? undefined : Number(query.to));
+    return session.agent === "claude" ? preserveIndexes(lines, isRenderableClaudeLine) : lines;
   });
 
   const objectBody = (request: FastifyRequest) => asRecord(request.body) ?? {};
@@ -515,7 +567,11 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     assertSessionId(sessionId); const session = await index.resolve(sessionId); if (!session) throw new RpcError(404, "Session not found");
     let map = subscriptions.get(socket); if (!map) { map = new Map(); subscriptions.set(socket, map); }
     const previous = map.get(sessionId); map.delete(sessionId); if (previous) void previous.stop();
-    const tailer = new JsonlTailer(session.path, { from: Math.max(0, from), tailN }, event => {
+    const tailer = new JsonlTailer(session.path, {
+      from: Math.max(0, from),
+      tailN,
+      filter: session.agent === "claude" ? isRenderableClaudeLine : undefined,
+    }, event => {
       if (event.type === "stream-line") send(socket, { ...event, sessionId });
       else if (event.type === "stream-batch") send(socket, { ...event, sessionId, lines: event.lines.map(line => ({ index: line.index, data: line.raw })) });
       else send(socket, { ...event, sessionId });
@@ -670,8 +726,18 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
           if (searchControllers.get(socket) === controller) searchControllers.delete(socket);
         }
       }
-      case "read-tail": { const id = String(args.sessionId ?? ""); assertSessionId(id); const session = await index.resolve(id); if (!session) throw new RpcError(404, "Session not found"); return readTail(session.path, Number(args.n ?? 200)); }
-      case "read-range": { const id = String(args.sessionId ?? ""); assertSessionId(id); const session = await index.resolve(id); if (!session) throw new RpcError(404, "Session not found"); return readRange(session.path, Number(args.from ?? 0), Number(args.to ?? Number.MAX_SAFE_INTEGER)); }
+      case "read-tail": {
+        const id = String(args.sessionId ?? ""); assertSessionId(id);
+        const session = await index.resolve(id); if (!session) throw new RpcError(404, "Session not found");
+        const lines = await readTail(session.path, Number(args.n ?? 200));
+        return session.agent === "claude" ? preserveIndexes(lines, isRenderableClaudeLine) : lines;
+      }
+      case "read-range": {
+        const id = String(args.sessionId ?? ""); assertSessionId(id);
+        const session = await index.resolve(id); if (!session) throw new RpcError(404, "Session not found");
+        const lines = await readRange(session.path, Number(args.from ?? 0), Number(args.to ?? Number.MAX_SAFE_INTEGER));
+        return session.agent === "claude" ? preserveIndexes(lines, isRenderableClaudeLine) : lines;
+      }
       case "get-prefs": return state.prefs.get();
       case "put-prefs": await state.prefs.put(normalizePrefs(args.prefs)); return undefined;
       case "get-me": return { home };

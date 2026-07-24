@@ -19,7 +19,7 @@ describe("interactive shell layout", () => {
   it("keeps the transcript as the only vertically scrolling shell surface", () => {
     expect(css).toMatch(/\.cw-transcript-scroll\s*\{[^}]*overflow-y:\s*auto;[^}]*touch-action:\s*pan-y;/s);
   });
-  it("does not prefetch background transcripts during application startup", () => {
-    expect(app).not.toContain("live.prefetch(");
+  it("prefetches recent transcript tails independently of WebSocket health", () => {
+    expect(app).toContain("live.prefetch(sessions.sorted)");
   });
 });

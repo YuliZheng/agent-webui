@@ -10,15 +10,18 @@ const socket = vi.hoisted(() => ({
   updateGlobalNotifSinceSeq: vi.fn(),
   updateSessionFrom: vi.fn(),
 }));
+const httpApi = vi.hoisted(() => vi.fn());
 
 vi.mock("@/api/ws", () => ({ mainSocket: socket }));
+vi.mock("@/api/http", () => ({ api: httpApi }));
 
 import { sessionCaches } from "@/persist/session-cache";
 import {
   EARLIER_SESSION_PAGE_LINES,
+  ENGAGE_HTTP_TAIL_LINES,
   INITIAL_SESSION_TAIL_LINES,
-  PREFETCH_MAX_SESSION_BYTES,
   PREFETCH_SESSION_LIMIT,
+  STALE_STREAM_MS,
   useLiveStore,
 } from "@/stores/live";
 import { useSessionsStore } from "@/stores/sessions";
@@ -28,6 +31,7 @@ describe("live transcript residency", () => {
     setActivePinia(createPinia());
     vi.clearAllMocks();
     socket.request.mockResolvedValue([]);
+    httpApi.mockResolvedValue([]);
     await sessionCaches.release("a");
     await sessionCaches.release("b");
     await sessionCaches.release("prefetched");
@@ -40,6 +44,9 @@ describe("live transcript residency", () => {
     ];
     const live = useLiveStore();
     await live.open("a");
+    expect(httpApi).toHaveBeenCalledWith(
+      `/api/sessions/a/tail?n=${ENGAGE_HTTP_TAIL_LINES}`,
+    );
     expect(socket.subscribe).toHaveBeenCalledWith({
       channel: "session",
       sessionId: "a",
@@ -128,7 +135,7 @@ describe("live transcript residency", () => {
   it("does not leave non-selected prefetch caches resident", async () => {
     const sessions = useSessionsStore();
     const live = useLiveStore();
-    socket.request.mockResolvedValueOnce([{ index: 1, raw: "tail" }]);
+    httpApi.mockResolvedValueOnce([{ index: 1, raw: "tail" }]);
     await live.prefetch([
       { id: "prefetched", agent: "claude", cwd: "C:\\p", mtime: new Date().toISOString(), size: 1000 },
     ]);
@@ -136,32 +143,65 @@ describe("live transcript residency", () => {
     expect(sessions.selectedId).toBeNull();
   });
 
-  it("serializes optional prefetch and skips large transcripts", async () => {
+  it("serializes HTTP prefetch and limits it to the eight most recent sessions", async () => {
     const sessions = useSessionsStore();
     const live = useLiveStore();
     let resolveFirst!: (lines: Array<{ index: number; raw: string }>) => void;
     const first = new Promise<Array<{ index: number; raw: string }>>(resolve => { resolveFirst = resolve; });
-    socket.request
+    httpApi
       .mockReturnValueOnce(first)
-      .mockResolvedValueOnce([{ index: 2, raw: "second" }]);
-    const loading = live.prefetch([
-      { id: "a", agent: "claude", cwd: "C:\\a", mtime: new Date().toISOString(), size: 1000 },
-      { id: "b", agent: "claude", cwd: "C:\\b", mtime: new Date().toISOString(), size: 1000 },
-      { id: "too-large", agent: "claude", cwd: "C:\\large", mtime: new Date().toISOString(), size: PREFETCH_MAX_SESSION_BYTES + 1 },
-    ]);
+      .mockResolvedValue([{ index: 2, raw: "next" }]);
+    const items = Array.from({ length: PREFETCH_SESSION_LIMIT + 1 }, (_, index) => ({
+      id: `prefetch-${index}`,
+      agent: "claude" as const,
+      cwd: `C:\\p${index}`,
+      mtime: new Date().toISOString(),
+      size: 1000,
+    }));
+    const loading = live.prefetch(items);
     await Promise.resolve();
-    expect(socket.request).toHaveBeenCalledTimes(1);
+    expect(httpApi).toHaveBeenCalledTimes(1);
     resolveFirst([{ index: 1, raw: "first" }]);
     await loading;
-    expect(socket.request).toHaveBeenCalledTimes(PREFETCH_SESSION_LIMIT);
-    expect(socket.request.mock.calls.map(call => call[1])).toEqual([
-      { sessionId: "a", n: 200 },
-      { sessionId: "b", n: 200 },
-    ]);
-    expect(sessionCaches.has("a")).toBe(false);
-    expect(sessionCaches.has("b")).toBe(false);
-    expect(sessionCaches.has("too-large")).toBe(false);
+    expect(httpApi).toHaveBeenCalledTimes(PREFETCH_SESSION_LIMIT);
+    expect(httpApi.mock.calls.map(call => call[0])).toEqual(
+      items.slice(0, PREFETCH_SESSION_LIMIT).map(
+        item => `/api/sessions/${item.id}/tail?n=200`,
+      ),
+    );
+    for (const item of items) expect(sessionCaches.has(item.id)).toBe(false);
     expect(sessions.selectedId).toBeNull();
+  });
+
+  it("resubscribes an engaged session when touched data does not reach the stream", async () => {
+    vi.useFakeTimers();
+    try {
+      const sessions = useSessionsStore();
+      sessions.items = [
+        { id: "a", agent: "claude", cwd: "C:\\a", mtime: new Date().toISOString(), size: 1000 },
+      ];
+      const live = useLiveStore();
+      await live.open("a");
+      socket.subscribe.mockClear();
+
+      live.onPush({ type: "session-touched", kind: "session-touched", id: "a" });
+      await vi.advanceTimersByTimeAsync(STALE_STREAM_MS - 1);
+      expect(socket.subscribe).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(socket.subscribe).toHaveBeenCalledWith({
+        channel: "session",
+        sessionId: "a",
+        from: 0,
+      });
+
+      socket.subscribe.mockClear();
+      live.onPush({ type: "session-touched", kind: "session-touched", id: "a" });
+      live.onPush({ type: "stream-line", kind: "stream-line", sessionId: "a", index: 0, data: "arrived" });
+      await vi.advanceTimersByTimeAsync(STALE_STREAM_MS);
+      expect(socket.subscribe).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("does not resurrect an old transcript when backfill finishes after a switch", async () => {

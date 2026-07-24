@@ -13,6 +13,7 @@ import { usePreferencesStore } from "@/stores/preferences";
 import { useLiveStore } from "@/stores/live";
 import { attachmentPayloads, useComposerStore } from "@/stores/composer";
 import { useUiStore } from "@/stores/ui";
+import { useIdentityStore } from "@/stores/identity";
 import { mainSocket, installWakeHandlers } from "@/api/ws";
 import { installCacheFlushHandlers } from "@/persist/session-cache";
 import { drafts, pendingSessions } from "@/persist/drafts";
@@ -21,7 +22,6 @@ import { exportUrl } from "@/api/http";
 import { reconstructTodos } from "@/parser";
 import type { AgentKind, PendingPromptChip, SessionListItem } from "@/types";
 import { parseCodexGoalFields } from "@/util/codex-goal";
-import { sessionAppearance } from "@/util/session-appearance";
 import {
   SIDEBAR_MAX_WIDTH,
   SIDEBAR_MIN_WIDTH,
@@ -33,6 +33,7 @@ import {
 const sessions = useSessionsStore(); const prefs = usePreferencesStore(); const live = useLiveStore(); const composer = useComposerStore(); const ui = useUiStore();
 const background = useBackgroundTasksStore();
 const interactions = useInteractionsStore();
+const identity = useIdentityStore();
 const appShellClass = computed(() => `cw-app-shell cw-shell-${prefs.messageDisplayStyle}`);
 const sidebarWidth = ref(420);
 const sidebarResizing = ref(false);
@@ -77,17 +78,17 @@ const firstSourceIndex = computed(() => sourceLines.value[0]?.index ?? 0);
 const nextSourceIndex = computed(() => sourceLines.value.length ? Math.max(...sourceLines.value.map(line => line.index)) + 1 : 0);
 const todos = computed(() => reconstructTodos(blocks.value));
 const inlineToolUseIds = computed(() => blocks.value.flatMap((block) => [block, ...(block.children ?? [])]).map((block) => block.toolUseId).filter((id): id is string => !!id));
-const sessionEmoji = computed(() => session.value
-  ? sessionAppearance(session.value.cwd, session.value.agent, session.value.id).emoji
-  : "💬");
 let removeWake: (() => void) | undefined; let removeFlush: (() => void) | undefined;
 const updateViewing = () => sessions.setViewingSelected(document.visibilityState === "visible" && !ui.mobileListVisible);
 
 onMounted(async () => {
   sidebarWidth.value = storedSidebarWidth(localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY), window.innerWidth);
-  live.install(); removeWake = installWakeHandlers(); removeFlush = installCacheFlushHandlers();
+  live.install();
+  removeWake = installWakeHandlers(mainSocket, () => { void live.prefetch(sessions.sorted); });
+  removeFlush = installCacheFlushHandlers();
   document.addEventListener("visibilitychange", updateViewing); updateViewing();
-  await Promise.allSettled([sessions.refresh(), prefs.load()]);
+  await Promise.allSettled([sessions.refresh(), prefs.load(), identity.load()]);
+  void live.prefetch(sessions.sorted);
   const deepLink = new URL(location.href).searchParams.get("session");
   const first = sessions.items.find((item) => item.id === deepLink)?.id ?? sessions.sorted[0]?.id;
   if (first) await select(first);
@@ -190,6 +191,19 @@ async function loadEarlierSession(id: string) {
   try { await live.loadEarlier(id); }
   catch (error) { ui.toast(error instanceof Error ? error.message : "Could not load earlier messages", "error"); }
 }
+async function compactSelectedSession() {
+  if (!session.value || pending.value) return;
+  try {
+    await mainSocket.request("compact-session", { sessionId: session.value.id }, 60_000);
+  } catch (error) {
+    ui.toast(error instanceof Error ? error.message : "Could not compact the session", "error");
+  }
+}
+async function startNewChatInCurrentDirectory() {
+  if (!session.value) return;
+  const item = pendingSessions.create(session.value.cwd, session.value.agent);
+  await select(item.id);
+}
 async function handleFork(data: { newSessionId: string; prefillText: string }) {
   if (!session.value || !data.newSessionId) return;
   try {
@@ -284,16 +298,13 @@ async function renameSession(id: string, title: string) {
         <SessionHeader
           :session="session"
           :status="sessions.statuses[session.id]"
-          :model="sessions.settings[session.id]?.model"
-          :permission-mode="sessions.settings[session.id]?.permissionMode"
-          :sandbox-mode="sessions.settings[session.id]?.sandboxMode"
           :background-tasks="background.bySession[session.id] || []"
           @back="ui.mobileListVisible = true"
           @renamed="sessions.touch(session.id, { title: $event, titleSource: 'manual' })"
         />
-        <ComposerBar :key="session.id" :session-id="session.id" :agent="session.agent" :active="sessions.statuses[session.id]?.status === 'running'" :start-line="nextSourceIndex" :pending="!!pending" :disabled="pendingSending" @command="command" @send-pending="sendPending" />
+        <ComposerBar :key="session.id" :session-id="session.id" :session="session" :agent="session.agent" :settings="sessions.settings[session.id]" :status="sessions.statuses[session.id]" :active="sessions.statuses[session.id]?.status === 'running'" :start-line="nextSourceIndex" :pending="!!pending" :disabled="pendingSending" @command="command" @send-pending="sendPending" />
         <button v-if="todos.length" class="cw-todo-pill" @click="showTodos = true">{{ todos.filter(t => t.status === 'completed').length }}/{{ todos.length }} todos</button>
-        <TranscriptPane v-if="!pending" :session-id="session.id" :agent="session.agent" :session-emoji="sessionEmoji" :blocks="blocks" :chips="composer.chips[session.id] || []" :style="prefs.messageDisplayStyle" :loading="live.restoring[session.id]" :loading-earlier="live.loadingEarlier[session.id]" :first-source-index="firstSourceIndex" :scroll-target-uuid="ui.searchTarget?.sessionId === session.id ? ui.searchTarget.uuid : undefined" :scroll-target-index="ui.searchTarget?.sessionId === session.id ? ui.searchTarget.index : undefined" @prefill="composer.setText(session.id, $event)" @forked="handleFork" @retry-chip="retryPromptChip" @dismiss-chip="composer.dismiss(session.id, $event)" @load-earlier="loadEarlierSession(session.id)" />
+        <TranscriptPane v-if="!pending" :session-id="session.id" :agent="session.agent" :blocks="blocks" :chips="composer.chips[session.id] || []" :style="prefs.messageDisplayStyle" :loading="live.restoring[session.id]" :loading-earlier="live.loadingEarlier[session.id]" :first-source-index="firstSourceIndex" :scroll-target-uuid="ui.searchTarget?.sessionId === session.id ? ui.searchTarget.uuid : undefined" :scroll-target-index="ui.searchTarget?.sessionId === session.id ? ui.searchTarget.index : undefined" @prefill="composer.setText(session.id, $event)" @forked="handleFork" @retry-chip="retryPromptChip" @dismiss-chip="composer.dismiss(session.id, $event)" @load-earlier="loadEarlierSession(session.id)" @compact="compactSelectedSession" @new-chat="startNewChatInCurrentDirectory" />
         <div v-else class="cw-transcript-frame"><div class="cw-empty cw-pending-empty"><strong>New {{ session.agent }} session</strong><span>{{ session.cwd }}</span><span>Your session starts when you send the first prompt.</span></div></div>
         <InteractionTray :session-id="session.id" :exclude-tool-use-ids="inlineToolUseIds" />
       </template>

@@ -6,6 +6,7 @@ import {
   clearLineIndexMemoryCache,
   configureLineIndexPersistence,
   flushLineIndexPersistence,
+  isRenderableClaudeLine,
   JsonlTailer,
   jsonlColdIndexConcurrency,
   jsonlIndexIoCounters,
@@ -26,6 +27,33 @@ import {
 } from "../src/services/jsonl.js";
 
 describe("JSONL indexing and tails", () => {
+  it("filters Claude display records without renumbering physical indexes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-webui-render-filter-"));
+    const path = join(root, "a.jsonl");
+    const records = [
+      { type: "user", message: { content: "hello" } },
+      { type: "file-history-snapshot", snapshot: "large" },
+      { type: "attachment", attachment: { type: "queued_command", prompt: "later" } },
+      { type: "attachment", attachment: { type: "other" } },
+      { type: "assistant", message: { content: [] } },
+    ];
+    await writeFile(path, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+    expect(preserveIndexes(await readRange(path, 0), isRenderableClaudeLine).map(line => line.index)).toEqual([0, 2, 4]);
+
+    const events: any[] = [];
+    const tailer = new JsonlTailer(path, {
+      from: 0,
+      pollMs: 60_000,
+      filter: isRenderableClaudeLine,
+    }, event => events.push(event));
+    await tailer.start();
+    expect(events.filter(event => event.type === "stream-batch").flatMap(event => event.lines).map(line => line.index)).toEqual([0, 2, 4]);
+    await appendFile(path, `${JSON.stringify({ type: "file-history-snapshot" })}\n${JSON.stringify({ type: "system" })}\n`);
+    await tailer.check();
+    expect(events.at(-1)).toEqual({ type: "stream-line", index: 6, data: JSON.stringify({ type: "system" }) });
+    await tailer.stop();
+  });
+
   it("keeps physical indexes through filtering and ignores a partial final line", async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-webui-jsonl-")); const path = join(root, "a.jsonl");
     await writeFile(path, "a\nignore\nc\npartial");
