@@ -22,10 +22,10 @@ describe("message component contracts", () => {
   it("keeps a standalone prompt anchor and semantic entry attributes", () => {
     expect(pane).toContain('class="cw-user-prompt-anchor"');
     expect(pane).toContain('data-user-prompt="true"');
-    expect(prompt).toContain('data-user-prompt-visual="true"');
+    expect(prompt).not.toContain('data-user-prompt-visual="true"');
     expect(prompt).not.toContain('data-user-prompt="true"');
     expect(entry).toContain(':data-block="blockName"');
-    expect(entry).toContain(':data-role="role"');
+    expect(entry).not.toContain(':data-role=');
     expect(entry).toContain(':data-uuid="entryUuid"');
   });
 

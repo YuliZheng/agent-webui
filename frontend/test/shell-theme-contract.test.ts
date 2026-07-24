@@ -35,7 +35,7 @@ describe("reference shell theme contract", () => {
     for (const hook of [
       "cw-sidebar",
       "cw-sidebar-header",
-      "cw-sidebar-search-header",
+      "cw-sidebar-search-page-header",
       "cw-sidebar-search-input",
       "cw-sidebar-scroller",
       "cw-context-menu",

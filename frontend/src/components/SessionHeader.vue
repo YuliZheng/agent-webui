@@ -1,28 +1,41 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
-import { ArrowLeft, CheckCircle2, Download, LoaderCircle, Minimize2, MoreHorizontal, Octagon, Pencil, Target, Trash2, XCircle } from "lucide-vue-next";
-import AgentLogo from "@/components/AgentLogo.vue";
+import { ArrowLeft, CheckCircle2, Download, LoaderCircle, Minimize2, MoreHorizontal, Octagon, Pencil, Target, Trash2, XCircle } from "@/components/icons";
+import AgentBadge from "@/components/AgentBadge.vue";
 import type { BackgroundTask, SessionListItem, SessionStatus } from "@/types";
 import { mainSocket } from "@/api/ws";
 import { exportUrl } from "@/api/http";
 import { useUiStore } from "@/stores/ui";
-import { sessionAppearance } from "@/util/session-appearance";
+import { useIdentityStore } from "@/stores/identity";
 const props = withDefaults(defineProps<{
   session: SessionListItem;
   status?: SessionStatus;
   backgroundTasks?: BackgroundTask[];
-}>(), { backgroundTasks: () => [] });
+  connected?: boolean;
+}>(), { backgroundTasks: () => [], connected: true });
 const emit = defineEmits<{ back: []; refresh: []; renamed: [title: string] }>();
 const ui = useUiStore();
+const identity = useIdentityStore();
 const goalSupported = ref(props.session.agent === "codex");
 const goalLoaded = ref(false);
 const goalLoading = ref(false);
 const goalData = ref<{ objective: string; status?: string; tokenBudget?: number } | null>(null);
 const goal = computed(() => goalData.value?.objective ?? null);
 const hasGoal = computed(() => Boolean(goal.value?.trim()));
-const appearance = computed(() => sessionAppearance(props.session.cwd, props.session.agent, props.session.id));
 const displayTitle = computed(() => props.session.title || props.session.cwd.split(/[\\/]/).filter(Boolean).pop() || "Untitled");
 const shortSessionId = computed(() => props.session.id.length > 10 ? `${props.session.id.slice(0, 8)}…` : props.session.id);
+const displayCwd = computed(() => {
+  const cwd = props.session.cwd;
+  const home = identity.home.replace(/[\\/]+$/, "");
+  if (!home) return cwd;
+  const normalizedCwd = cwd.replaceAll("\\", "/");
+  const normalizedHome = home.replaceAll("\\", "/");
+  const insensitive = /^[A-Za-z]:\//.test(normalizedCwd);
+  const left = insensitive ? normalizedCwd.toLowerCase() : normalizedCwd;
+  const right = insensitive ? normalizedHome.toLowerCase() : normalizedHome;
+  if (left === right) return "~";
+  return left.startsWith(`${right}/`) ? `~${normalizedCwd.slice(normalizedHome.length)}` : cwd;
+});
 const tasksOpen = ref(false); const completedFlash = ref(false); let completedTimer: ReturnType<typeof setTimeout> | undefined;
 const overflowOpen = ref(false);
 const overflowButton = ref<HTMLButtonElement | null>(null);
@@ -93,6 +106,8 @@ function onOverflowKeydown(event: KeyboardEvent) {
 }
 function compactSession() { closeOverflow(); void mainSocket.request("compact-session", { sessionId: props.session.id }); }
 function killOwned() { closeOverflow(); if (window.confirm("Kill the WebUI-owned process?")) void mainSocket.request("kill", { sessionId: props.session.id }); }
+function stopTurn() { void mainSocket.request("stop", { sessionId: props.session.id }); }
+function retryConnection() { mainSocket.connect(); emit("refresh"); }
 async function rename() { const title = window.prompt("Session title", props.session.title ?? ""); if (title == null) return; await mainSocket.request("set-title", { sessionId: props.session.id, title }); emit("renamed", title); }
 function normalizeGoal(value: unknown): { objective: string; status?: string; tokenBudget?: number } | null {
   if (typeof value === "string") return { objective: value };
@@ -152,13 +167,10 @@ onBeforeUnmount(() => clearTimeout(completedTimer));
 <template>
   <header class="cw-main-header">
     <button class="cw-mobile-back" title="Back to chats" aria-label="Back to chats" @click="emit('back')"><ArrowLeft :size="20" /></button>
-    <span class="cw-header-session-icon" :style="{ '--cw-session-accent': appearance.color, backgroundColor: appearance.color }">{{ session.titleEmoji || appearance.emoji }}</span>
     <div class="cw-header-title">
       <strong>{{ displayTitle }}</strong>
       <small class="cw-header-session-meta">
-        <span class="cw-header-agent-mark" :class="`is-${session.agent}`">
-          <AgentLogo :agent="session.agent" />
-        </span>
+        <AgentBadge :agent="session.agent" :size="15" />
         <span>{{ session.agent === 'codex' ? 'Codex' : 'Claude' }}</span>
         <span class="cw-header-meta-separator" aria-hidden="true">·</span>
         <button
@@ -168,7 +180,7 @@ onBeforeUnmount(() => clearTimeout(completedTimer));
           :title="`Copy path: ${session.cwd}`"
           :aria-label="`Copy path ${session.cwd}`"
           @click="copyMetadata(session.cwd, 'Path')"
-        >{{ session.cwd }}</button>
+        >{{ displayCwd }}</button>
         <span class="cw-header-meta-separator" aria-hidden="true">·</span>
         <button
           class="cw-header-copyable cw-header-session-id"
@@ -181,6 +193,17 @@ onBeforeUnmount(() => clearTimeout(completedTimer));
       </small>
     </div>
     <div class="cw-header-actions">
+      <button v-if="!connected" class="cw-header-status-pill is-disconnected" type="button" @click="retryConnection">
+        Disconnected · tap to retry
+      </button>
+      <span v-else-if="status?.compacting" class="cw-header-status-pill is-working">
+        <span class="cw-status-ping"><i /><i /></span>Compacting…
+      </span>
+      <span v-else-if="status?.status === 'running'" class="cw-header-status-pill is-working">
+        <span class="cw-status-ping"><i /><i /></span>Thinking…
+      </span>
+      <button v-if="status?.status === 'running'" class="cw-header-stop-pill" type="button" title="Interrupt current turn" @click="stopTurn">■ Stop</button>
+      <button v-if="status?.webuiAlive" class="cw-header-kill-pill" type="button" title="Kill the WebUI-owned process" @click="killOwned">Kill</button>
       <button v-if="backgroundTasks.length" class="cw-background-pill" :class="{ 'has-failed': failedTasks.length, completed: completedFlash }" title="Background tasks" @click="tasksOpen = true">
         <LoaderCircle v-if="runningTasks.length" class="cw-spin" :size="14" />
         <XCircle v-else-if="failedTasks.length" :size="14" />

@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import type { MessageDisplayStyle, NormalizedBlock } from "@/types";
-import { renderMarkdown } from "@/render/markdown";
+import { renderUserMarkdown } from "@/render/markdown";
 import { useUiStore } from "@/stores/ui";
 import { useIdentityStore } from "@/stores/identity";
+import ChatImage from "./ChatImage.vue";
 
 const props = withDefaults(defineProps<{
   block: NormalizedBlock;
@@ -27,7 +28,7 @@ const pdfs = computed(() => {
   const value = props.block.meta?.pdfs;
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 });
-const html = computed(() => renderMarkdown(text.value));
+const html = computed(() => renderUserMarkdown(text.value));
 const promptCollapsePx = computed(() => props.displayStyle === "claude-code" ? 54 : 180);
 const promptBody = ref<HTMLDivElement | null>(null);
 const collapsed = ref(true);
@@ -40,7 +41,6 @@ const bodyCollapsed = computed(() => preview.value ? collapsed.value : (collapsi
 const wechatBubbleAvatar = computed(() =>
   props.displayStyle === "wechat" && (images.value.length > 0 || pdfs.value.length > 0) && text.value.length > 0
 );
-const imageDimensions = reactive<Record<string, string>>({});
 let resizeObserver: ResizeObserver | null = null;
 
 function measureCollapse() {
@@ -51,10 +51,6 @@ function measureCollapse() {
 function toggleCollapsed(event: MouseEvent) {
   collapsed.value = !collapsed.value;
   if (event.detail > 0) (event.currentTarget as HTMLElement | null)?.blur();
-}
-function imageLoaded(url: string, event: Event) {
-  const image = event.currentTarget as HTMLImageElement;
-  if (image.naturalWidth && image.naturalHeight) imageDimensions[url] = `${image.naturalWidth}×${image.naturalHeight}`;
 }
 function hideBrokenAvatar(event: Event) {
   const image = event.currentTarget as HTMLImageElement | null;
@@ -168,45 +164,44 @@ watch([text, () => images.value.length, promptCollapsePx], async () => {
       'cw-user-prompt-expanded': collapsible && !collapsed,
       'cw-user-prompt-is-collapsed': bodyCollapsed,
     }"
-    data-user-prompt-visual="true"
-    :data-visual-uuid="block.uuid || ''"
     @pointerdown="onPressDown"
     @pointermove="onPressMove"
     @pointerup="clearPress"
     @pointercancel="clearPress"
     @contextmenu="onContextMenu"
   >
-    <div v-if="images.length || pdfs.length" class="cw-user-prompt-image-bubble cw-user-prompt">
-      <div class="cw-user-prompt-images">
-        <button
+    <div v-if="images.length || pdfs.length" class="cw-user-prompt-image-bubble cw-user-prompt px-4 py-2 border-l-4 relative">
+      <div class="cw-user-prompt-images flex flex-wrap gap-2">
+        <ChatImage
           v-for="image in images"
           :key="image"
-          type="button"
-          :class="compactImages ? 'cw-img-chip' : 'cw-chat-image'"
-          title="Attached image"
-          @click.stop="ui.lightboxUrl = image"
-        >
-          <span><img :src="image" alt="Attached image" loading="lazy" decoding="async" @load="imageLoaded(image, $event)" /></span>
-          <span v-if="compactImages" class="cw-img-chip-name">image</span>
-          <span v-if="compactImages && imageDimensions[image]" class="cw-img-chip-dims">{{ imageDimensions[image] }}</span>
-        </button>
-        <span v-for="pdf in pdfs" :key="pdf" class="cw-user-prompt-pdf-chip" :title="pdf">📄 <span>{{ pdf }}</span></span>
+          :src="image"
+          alt="image"
+          :compact="compactImages"
+          @open="ui.lightboxUrl = image"
+        />
+        <span
+          v-for="pdf in pdfs"
+          :key="pdf"
+          class="cw-user-prompt-pdf-chip inline-flex items-center gap-1.5 px-2 py-1 rounded border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800 text-xs"
+          :title="pdf"
+        >📄 <span class="truncate max-w-40">{{ pdf }}</span></span>
       </div>
     </div>
-    <div v-if="text" class="cw-user-prompt-text-bubble cw-user-prompt">
+    <div v-if="text" class="cw-user-prompt-text-bubble cw-user-prompt px-4 py-2 border-l-4 relative">
       <span v-if="wechatBubbleAvatar" class="cw-bubble-avatar" aria-hidden="true">
         <span class="cw-message-avatar-fallback">{{ identity.initials }}</span>
         <img :src="avatarUrl" alt="" loading="lazy" decoding="async" @error="hideBrokenAvatar" />
       </span>
-      <div ref="promptBody" class="cw-user-prompt-body" :class="bodyCollapsed ? 'cw-user-prompt-collapsed' : ''">
-        <div class="prose" v-html="html" />
-        <div v-if="!preview && collapsible && collapsed" class="cw-user-prompt-fade" />
+      <div ref="promptBody" class="cw-user-prompt-body relative" :class="bodyCollapsed ? 'cw-user-prompt-collapsed' : ''">
+        <div v-code-fences class="prose prose-sm dark:prose-invert max-w-none break-words" v-html="html" />
+        <div v-if="!preview && collapsible && collapsed" class="cw-user-prompt-fade pointer-events-none absolute left-0 right-0 bottom-0 h-10" />
       </div>
       <button v-if="collapsible" type="button" class="cw-user-prompt-toggle" @click="toggleCollapsed">
         {{ collapsed ? "Show more" : "Show less" }}
       </button>
     </div>
-    <div v-if="!text && !images.length && !pdfs.length" class="cw-user-prompt" />
+    <div v-if="!text && !images.length && !pdfs.length" class="cw-user-prompt px-4 py-2 border-l-4 relative" />
     <div v-if="actionable" class="cw-user-prompt-actions">
       <button class="cw-user-prompt-action" title="Copy prompt" :disabled="!text" @click="copyPrompt">Copy</button>
       <button class="cw-user-prompt-action" title="Rewind: discard this and everything after, prefill composer" @click="emit('rewind', block)">↺ Rewind</button>

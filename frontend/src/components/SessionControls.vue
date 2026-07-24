@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
-import { Check, ChevronDown, LoaderCircle, Square } from "lucide-vue-next";
+import { Check, ChevronDown, LoaderCircle, Square } from "@/components/icons";
 import { mainSocket } from "@/api/ws";
 import type {
   AgentCapabilities,

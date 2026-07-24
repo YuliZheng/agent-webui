@@ -14,16 +14,20 @@ export function initialsFromHome(home: string): string {
 
 export const useIdentityStore = defineStore("identity", () => {
   const initials = ref("ME");
+  const home = ref("");
   let inFlight: Promise<void> | null = null;
 
   function load(): Promise<void> {
     if (inFlight) return inFlight;
     inFlight = api<{ home: string }>("/api/me")
-      .then((result) => { initials.value = initialsFromHome(result.home); })
+      .then((result) => {
+        home.value = result.home;
+        initials.value = initialsFromHome(result.home);
+      })
       .catch(() => undefined)
       .finally(() => { inFlight = null; });
     return inFlight;
   }
 
-  return { initials, load };
+  return { initials, home, load };
 });

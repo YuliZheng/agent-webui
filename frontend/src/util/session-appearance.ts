@@ -1,21 +1,21 @@
 import type { AgentKind } from "@/types";
 
 export const SIDEBAR_WIDTH_STORAGE_KEY = "agent-webui:sidebar-width:v1";
-export const SIDEBAR_MIN_WIDTH = 300;
-export const SIDEBAR_MAX_WIDTH = 700;
-export const SIDEBAR_DEFAULT_RATIO = 420 / 2048;
+export const SIDEBAR_MIN_WIDTH = 200;
+export const SIDEBAR_MAX_WIDTH = 720;
+export const SIDEBAR_DEFAULT_WIDTH = 288;
 
-const SESSION_COLORS = [
-  "#37adad",
-  "#835bc6",
-  "#d3a523",
-  "#3e8fc8",
-  "#4aa45e",
-  "#c26478",
-  "#b97338",
-  "#5d74c8",
-  "#9a6ab2",
-  "#2f9b79",
+const SESSION_GRADIENTS = [
+  ["#30a7a7", "#54c2b2"],
+  ["#7b55bc", "#a16bd0"],
+  ["#c99a20", "#e1bc43"],
+  ["#367fb4", "#59a7d2"],
+  ["#3d9651", "#69b36d"],
+  ["#ba596e", "#d47a8d"],
+  ["#ac6734", "#d18a4d"],
+  ["#516abe", "#778bd5"],
+  ["#8c5fa8", "#b07ac4"],
+  ["#278d70", "#4faf8d"],
 ] as const;
 
 const SESSION_EMOJIS = [
@@ -46,25 +46,27 @@ export function normalizeSessionPath(path: string): string {
   return path.trim().replaceAll("\\", "/").replace(/\/+$/, "").toLocaleLowerCase();
 }
 
-export function sessionAppearance(path: string, agent?: AgentKind, sessionId?: string): { color: string; emoji: string } {
+export function sessionAppearance(path: string, agent?: AgentKind, sessionId?: string): { color: string; gradient: string; emoji: string } {
   const normalized = normalizeSessionPath(path) || "/";
   const pathHash = hashString(normalized);
   // Colors belong to the folder; individual chats in that folder still get
   // their own stable emoji, like the reference list.
   const iconHash = hashString(`${sessionId || normalized}:${agent ?? "agent"}`);
+  const pair = SESSION_GRADIENTS[pathHash % SESSION_GRADIENTS.length]!;
   return {
-    color: SESSION_COLORS[pathHash % SESSION_COLORS.length]!,
+    color: pair[0],
+    gradient: `linear-gradient(135deg, ${pair[0]} 0%, ${pair[1]} 100%)`,
     emoji: SESSION_EMOJIS[iconHash % SESSION_EMOJIS.length]!,
   };
 }
 
 export function clampSidebarWidth(width: number): number {
-  if (!Number.isFinite(width)) return SIDEBAR_MIN_WIDTH;
+  if (!Number.isFinite(width)) return SIDEBAR_DEFAULT_WIDTH;
   return Math.round(Math.min(SIDEBAR_MAX_WIDTH, Math.max(SIDEBAR_MIN_WIDTH, width)));
 }
 
-export function defaultSidebarWidth(viewportWidth: number): number {
-  return clampSidebarWidth(viewportWidth * SIDEBAR_DEFAULT_RATIO);
+export function defaultSidebarWidth(_viewportWidth: number): number {
+  return SIDEBAR_DEFAULT_WIDTH;
 }
 
 export function storedSidebarWidth(value: string | null, viewportWidth: number): number {

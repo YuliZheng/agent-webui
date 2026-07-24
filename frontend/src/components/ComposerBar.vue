@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref } from "vue";
-import { FileText, Paperclip, Send, X } from "lucide-vue-next";
+import { FileText, Paperclip, Send, X } from "@/components/icons";
 import type { AgentKind, SessionListItem, SessionSettings, SessionStatus } from "@/types";
 import SessionControls from "@/components/SessionControls.vue";
 import { useComposerStore } from "@/stores/composer";

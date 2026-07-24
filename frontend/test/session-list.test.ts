@@ -60,15 +60,15 @@ describe("session list ordering, selection, and unread", () => {
     expect(store.selectedId).toBe("b"); expect(Date.parse(store.readAt.a!)).toBeGreaterThan(Date.parse("2026-01-01T00:00:00Z")); expect(store.isUnread(store.items[0]!)).toBe(false);
     vi.runAllTimers(); vi.useRealTimers();
   });
-  it("uses one right-side status slot for answering and unread states", () => {
+  it("renders activity and unread state inline with the dynamic preview", () => {
     const answering = mount(SessionRow, { props: { session: item("a", "2026-01-01T00:00:00Z"), answering: true, unreadCount: 120 } });
     expect(answering.get(".cw-session-row").classes()).toContain("is-answering");
-    expect(answering.get(".cw-session-state-slot .cw-session-answering-indicator").attributes("aria-label")).toBe("Agent is answering");
-    expect(answering.find(".cw-session-unread").exists()).toBe(false);
+    expect(answering.get(".cw-session-preview-row .cw-session-running-dot").attributes("aria-label")).toBe("Agent is thinking");
+    expect(answering.get(".cw-session-preview-row .cw-session-unread").text()).toBe("99+");
     const unread = mount(SessionRow, { props: { session: item("b", "2026-01-01T00:00:00Z"), unreadCount: 120 } });
-    expect(unread.get(".cw-session-state-slot .cw-session-unread").text()).toBe("99+");
+    expect(unread.get(".cw-session-preview-row .cw-session-unread").text()).toBe("99+");
     expect(unread.get(".cw-session-unread").attributes("aria-label")).toBe("120 unread replies");
-    expect(unread.find(".cw-session-answering-indicator").exists()).toBe(false);
+    expect(unread.find(".cw-session-running-dot").exists()).toBe(false);
   });
   it("counts completed replies while away and clears the count when read", async () => {
     localStorage.clear(); setActivePinia(createPinia()); vi.spyOn(mainSocket, "request").mockResolvedValue({});

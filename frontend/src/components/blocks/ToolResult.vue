@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 import { useUiStore } from "@/stores/ui";
+import ChatImage from "./ChatImage.vue";
 
 const props = defineProps<{ value: unknown; isError?: boolean }>();
 interface Display { text: string; lines: number; chars: number }
@@ -42,16 +43,20 @@ const open = computed(() => expanded.value || !collapsedByDefault.value);
 </script>
 
 <template>
-  <div :class="isError ? 'cw-tool-result cw-tool-result-error' : 'cw-tool-result'">
-    <button type="button" class="cw-tool-result-toggle" @click="expanded = !expanded">
+  <div :class="isError ? 'cw-tool-result cw-tool-result-error border-l-2 border-red-500 dark:border-red-400 pl-2' : 'cw-tool-result pl-2'">
+    <button type="button" class="cw-tool-result-toggle text-xs opacity-70 cursor-pointer" @click="expanded = !expanded">
       ╰─ Result{{ display.text ? ` · ${display.lines} lines` : "" }}{{ images.length ? ` · ${images.length} image${images.length > 1 ? "s" : ""}` : "" }}{{ isError ? " · error" : "" }} {{ open ? "▾" : "▸" }}
     </button>
     <template v-if="open">
-      <pre v-if="display.text" class="cw-tool-result-text">{{ display.text }}</pre>
-      <div v-if="images.length" class="cw-tool-result-images">
-        <button v-for="(image, index) in images" :key="index" type="button" @click.stop="ui.lightboxUrl = image">
-          <img :src="image" alt="[image]" loading="lazy" decoding="async" />
-        </button>
+      <pre v-if="display.text" class="cw-tool-result-text whitespace-pre-wrap text-xs mt-1">{{ display.text }}</pre>
+      <div v-if="images.length" class="cw-tool-result-images flex flex-wrap gap-2 mt-1">
+        <ChatImage
+          v-for="(image, index) in images"
+          :key="index"
+          :src="image"
+          alt="[image]"
+          @open="ui.lightboxUrl = image"
+        />
       </div>
     </template>
   </div>

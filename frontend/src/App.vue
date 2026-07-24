@@ -25,6 +25,7 @@ import { parseCodexGoalFields } from "@/util/codex-goal";
 import {
   SIDEBAR_MAX_WIDTH,
   SIDEBAR_MIN_WIDTH,
+  SIDEBAR_DEFAULT_WIDTH,
   SIDEBAR_WIDTH_STORAGE_KEY,
   clampSidebarWidth,
   storedSidebarWidth,
@@ -35,7 +36,7 @@ const background = useBackgroundTasksStore();
 const interactions = useInteractionsStore();
 const identity = useIdentityStore();
 const appShellClass = computed(() => `cw-app-shell cw-shell-${prefs.messageDisplayStyle}`);
-const sidebarWidth = ref(420);
+const sidebarWidth = ref(SIDEBAR_DEFAULT_WIDTH);
 const sidebarResizing = ref(false);
 const appShellStyle = computed(() => ({ "--cw-sidebar-width": `${sidebarWidth.value}px` }));
 let sidebarResizePointer: number | null = null;
@@ -69,7 +70,8 @@ watch(
   },
   { immediate: true },
 );
-const showNew = ref(false); const showSettings = ref(false); const showTodos = ref(false); const pendingSelected = ref<string | null>(null); const pendingSending = ref(false);
+const showNew = ref(false); const newSessionCwd = ref(""); const showSettings = ref(false); const showTodos = ref(false); const pendingSelected = ref<string | null>(null); const pendingSending = ref(false);
+const recentCwds = computed(() => [...new Set(sessions.sorted.map((item) => item.cwd).filter(Boolean))].slice(0, 8));
 const pending = computed(() => pendingSessions.items.find((item) => item.id === pendingSelected.value));
 const session = computed<SessionListItem | null>(() => sessions.selected ?? (pending.value ? { id: pending.value.id, cwd: pending.value.cwd, agent: pending.value.agent, mtime: new Date(pending.value.createdAt).toISOString(), size: 0, title: "New session" } : null));
 const blocks = computed(() => sessions.selectedId ? live.blocks(sessions.selectedId) : []);
@@ -172,6 +174,10 @@ async function create(data: { cwd: string; agent: AgentKind; prompt: string }) {
   if (!data.prompt.trim()) { const item = pendingSessions.create(normalized.cwd, data.agent); await select(item.id); return; }
   const result = await mainSocket.request<{ sessionId?: string; id?: string }>("new-session", { ...data, cwd: normalized.cwd }, 60_000);
   await sessions.refresh(); const id = result.sessionId ?? result.id ?? sessions.items.find((item) => item.cwd === normalized.cwd && item.agent === data.agent)?.id; if (id) await select(id);
+}
+function openNew(cwd?: string) {
+  newSessionCwd.value = cwd ?? session.value?.cwd ?? "";
+  showNew.value = true;
 }
 async function sendPending(text: string) {
   if (pendingSending.value || !pending.value || (!text.trim() && !(composer.attachments[pending.value.id]?.length))) return;
@@ -280,7 +286,7 @@ async function renameSession(id: string, title: string) {
 
 <template>
   <div class="cw-app" data-shell-version="viewport-v1" :class="[appShellClass, { 'cw-show-list': ui.mobileListVisible, 'cw-sidebar-is-resizing': sidebarResizing }]" :style="appShellStyle">
-    <Sidebar @select="select" @new="showNew = true" @settings="showSettings = true" @refresh="sessions.refresh" @delete="deleteSession" @delete-many="deleteManySessions" @rename="renameSession" />
+    <Sidebar @select="select" @new="openNew" @settings="showSettings = true" @refresh="sessions.refresh" @delete="deleteSession" @delete-many="deleteManySessions" @rename="renameSession" />
     <div
       class="cw-sidebar-resizer"
       role="separator"
@@ -299,6 +305,7 @@ async function renameSession(id: string, title: string) {
           :session="session"
           :status="sessions.statuses[session.id]"
           :background-tasks="background.bySession[session.id] || []"
+          :connected="live.connected"
           @back="ui.mobileListVisible = true"
           @renamed="sessions.touch(session.id, { title: $event, titleSource: 'manual' })"
         />
@@ -310,7 +317,7 @@ async function renameSession(id: string, title: string) {
       </template>
       <div v-else class="cw-empty cw-no-selection"><strong>Select or start a session</strong><span>Claude Code and Codex histories appear here.</span></div>
     </main>
-    <NewSessionDialog v-if="showNew" @close="showNew = false" @create="create" />
+    <NewSessionDialog v-if="showNew" :initial-cwd="newSessionCwd" :recent-cwds="recentCwds" @close="showNew = false" @create="create" />
     <SettingsDialog v-if="showSettings" @close="showSettings = false" />
     <Teleport to="body"><div v-if="showTodos" class="cw-modal-scrim cw-modal-overlay" @click.self="showTodos = false"><section class="cw-modal cw-modal-card cw-todo-modal"><header><h2>Session tasks</h2><button @click="showTodos = false">Close</button></header><ol><li v-for="todo in todos" :key="todo.id" :class="`is-${todo.status}`"><span class="cw-todo-check">{{ todo.status === 'completed' ? '✓' : '' }}</span><div><strong>{{ todo.subject }}</strong><small>{{ todo.status.replaceAll('_', ' ') }}</small></div></li></ol></section></div></Teleport>
     <OverlayHost />

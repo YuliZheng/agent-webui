@@ -132,7 +132,7 @@ describe("SessionHeader controls", () => {
 
   it("renders the Claude product mark", () => {
     const wrapper = mountHeader("claude");
-    expect(wrapper.find('.cw-header-agent-mark svg[aria-label="Claude"]').exists()).toBe(true);
+    expect(wrapper.find('.cw-header-session-meta [aria-label="Claude"]').exists()).toBe(true);
   });
 
   it("renders composer popovers and sends their exact values", async () => {

@@ -17,7 +17,7 @@ describe("themes and sticky prompt invariants", () => {
     expect(CLAUDE_CODE_STICKY_GAP_PX).toBe(12);
     expect(css).toMatch(/\.cw-sticky-prompt-overlay-frame\s*\{[\s\S]*?position:\s*absolute;[\s\S]*?overflow:\s*hidden;[\s\S]*?pointer-events:\s*none;/);
     expect(css).toMatch(/\.cw-sticky-prompt-overlay\s*\{[\s\S]*?padding:\s*12px clamp\(16px, 2vw, 42px\) 8px;[\s\S]*?pointer-events:\s*none;/);
-    expect(css).toMatch(/\.cw-sticky-prompt-overlay \.cw-show-more\s*\{\s*pointer-events:\s*auto;/);
+    expect(css).toMatch(/\.cw-sticky-prompt-overlay \.cw-user-prompt-toggle\s*\{\s*pointer-events:\s*auto;/);
     expect(component).toContain("preview hide-actions");
   });
   it("gates hover and never makes the real prompt row sticky", () => {

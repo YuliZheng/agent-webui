@@ -17,6 +17,17 @@ function mountDialog() {
   });
 }
 
+function setControlValue(wrapper: ReturnType<typeof mountDialog>, selector: string, value: string | boolean) {
+  const element = wrapper.get(selector).element as HTMLInputElement | HTMLSelectElement;
+  if (typeof value === "boolean") {
+    (element as HTMLInputElement).checked = value;
+  } else {
+    element.value = value;
+  }
+  const eventType = element instanceof HTMLSelectElement || element.type === "checkbox" ? "change" : "input";
+  element.dispatchEvent(new Event(eventType, { bubbles: true }));
+}
+
 beforeEach(() => {
   localStorage.clear();
   vi.restoreAllMocks();
@@ -39,18 +50,19 @@ describe("settings dialog", () => {
     expect(wrapper.get('[data-testid="default-claude-model"]').find('option[value=""]').exists()).toBe(false);
     expect(wrapper.get('[data-testid="default-codex-model"]').find('option[value=""]').exists()).toBe(false);
 
-    await wrapper.get('[data-testid="auto-title-frequency"]').setValue("12");
-    await wrapper.get('[data-testid="auto-title-language"]').setValue("中文");
-    await wrapper.get('[data-testid="default-claude-model"]').setValue("sonnet");
-    await wrapper.get('[data-testid="default-claude-effort"]').setValue("high");
-    await wrapper.get('[data-testid="default-claude-permission"]').setValue("plan");
-    await wrapper.get('[data-testid="default-codex-model"]').setValue("gpt-5.6-terra");
-    await wrapper.get('[data-testid="default-codex-effort"]').setValue("xhigh");
-    await wrapper.get('[data-testid="default-codex-approval"]').setValue("on-request");
-    await wrapper.get('[data-testid="default-codex-sandbox"]').setValue("workspace-write");
-    await wrapper.get('[data-testid="scratch-enabled"]').setValue(true);
-    await wrapper.get('[data-testid="scratch-path"]').setValue("~/scratch");
-    await wrapper.get('[data-testid="thinking-trigger-enabled"]').setValue(false);
+    setControlValue(wrapper, '[data-testid="auto-title-frequency"]', "12");
+    setControlValue(wrapper, '[data-testid="auto-title-language"]', "中文");
+    setControlValue(wrapper, '[data-testid="default-claude-model"]', "sonnet");
+    setControlValue(wrapper, '[data-testid="default-claude-effort"]', "high");
+    setControlValue(wrapper, '[data-testid="default-claude-permission"]', "plan");
+    setControlValue(wrapper, '[data-testid="default-codex-model"]', "gpt-5.6-terra");
+    setControlValue(wrapper, '[data-testid="default-codex-effort"]', "xhigh");
+    setControlValue(wrapper, '[data-testid="default-codex-approval"]', "on-request");
+    setControlValue(wrapper, '[data-testid="default-codex-sandbox"]', "workspace-write");
+    setControlValue(wrapper, '[data-testid="scratch-enabled"]', true);
+    setControlValue(wrapper, '[data-testid="scratch-path"]', "~/scratch");
+    setControlValue(wrapper, '[data-testid="thinking-trigger-enabled"]', false);
+    await flushPromises();
     await wrapper.get("form").trigger("submit");
     await flushPromises();
 

@@ -40,7 +40,7 @@ const taskState = computed(() => String(props.block.meta?.status ?? "").toLowerC
   </div>
   <div v-else-if="block.kind === 'away-summary'" class="cw-away-summary">
     <strong>Recap</strong>
-    <div class="prose" v-html="renderMarkdown(block.text || '')" />
+    <div v-code-fences class="prose prose-sm dark:prose-invert max-w-none break-words" v-html="renderMarkdown(block.text || '')" />
   </div>
   <div v-else class="cw-system-block" :class="{ 'cw-system-error': block.isError }">
     {{ block.text || block.kind }}

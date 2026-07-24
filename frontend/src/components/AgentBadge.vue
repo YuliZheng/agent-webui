@@ -13,6 +13,10 @@ withDefaults(defineProps<{
 <template>
   <span
     class="cw-agent-badge"
+    :class="{
+      'cw-agent-badge-claude': agent === 'claude',
+      'cw-agent-badge-codex': agent === 'codex',
+    }"
     :style="{ width: `${size}px`, height: `${size}px` }"
     :title="agent === 'codex' ? 'Codex' : 'Claude Code'"
   >

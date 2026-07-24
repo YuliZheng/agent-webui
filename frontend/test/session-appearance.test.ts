@@ -34,11 +34,11 @@ describe("reference sidebar appearance", () => {
   });
 
   it("clamps, defaults, and restores the persisted sidebar width", () => {
-    expect(defaultSidebarWidth(2048)).toBe(420);
+    expect(defaultSidebarWidth(2048)).toBe(288);
     expect(clampSidebarWidth(100)).toBe(SIDEBAR_MIN_WIDTH);
     expect(clampSidebarWidth(900)).toBe(SIDEBAR_MAX_WIDTH);
     expect(storedSidebarWidth("518", 2048)).toBe(518);
-    expect(storedSidebarWidth("not-a-number", 2048)).toBe(420);
+    expect(storedSidebarWidth("not-a-number", 2048)).toBe(288);
   });
 
   it("uses the compact time labels from the reference chat list", () => {
@@ -53,8 +53,10 @@ describe("reference sidebar appearance", () => {
     const matching = mount(SessionRow, { props: { session: item("two", "c:/tmp/same-path") } });
     expect(wrapper.get(".cw-session-avatar").attributes("style")).toBe(matching.get(".cw-session-avatar").attributes("style"));
     expect(wrapper.get(".cw-session-avatar-emoji").text()).not.toBe(matching.get(".cw-session-avatar-emoji").text());
-    expect(wrapper.get(".cw-session-agent-badge").text()).toBe("✦");
+    expect(wrapper.find('.cw-session-agent-badge [aria-label="Claude"]').exists()).toBe(true);
     expect(wrapper.get(".cw-session-preview").text()).toBe("A short preview");
-    expect(wrapper.get(".cw-session-cwd").text()).toBe("C:\\tmp\\same-path");
+    expect(wrapper.find(".cw-session-cwd").exists()).toBe(false);
+    const withCwd = mount(SessionRow, { props: { session: item("one", "C:\\tmp\\same-path"), hideCwd: false } });
+    expect(withCwd.get(".cw-session-cwd").text()).toBe("C:\\tmp\\same-path");
   });
 });

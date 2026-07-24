@@ -29,7 +29,6 @@ const blockName = computed(() => {
   if (props.block.kind === "tool") return "AssistantBlock";
   return "SystemBlock";
 });
-const role = computed(() => props.block.kind === "user" ? "user" : props.block.kind === "assistant" || props.block.kind === "thinking" || props.block.kind === "tool" || props.block.kind === "tool-run" ? "assistant" : "system");
 const entryUuid = computed(() => props.block.uuid || props.block.toolUseId || undefined);
 const avatarUrl = "/api/me/avatar?v=2";
 const isWechatAvatarEntry = computed(() =>
@@ -49,12 +48,8 @@ function hideBrokenAvatar(event: Event): void {
     class="cw-message-entry"
     :class="{ 'cw-search-highlight': block.matched }"
     :data-block="blockName"
-    :data-role="role"
     :data-uuid="entryUuid"
-    :data-bubble-uuid="entryUuid"
-    :data-message-uuid="entryUuid"
     :data-message-key="block.key"
-    :data-source-index="block.index"
   >
     <span
       v-if="blockName === 'UserPromptBlock' || blockName === 'AssistantBlock' || blockName === 'ToolRunBlock'"

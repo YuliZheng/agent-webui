@@ -1,6 +1,5 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
-import { ExternalLink, FileCode, Image } from "lucide-vue-next";
 import type { Interaction, NormalizedBlock } from "@/types";
 import { useUiStore } from "@/stores/ui";
 import { mainSocket } from "@/api/ws";
@@ -33,16 +32,16 @@ async function openSource() {
 </script>
 
 <template>
-  <div class="cw-block cw-tool-call" :class="{ 'cw-tool-call-error': block.isError, 'cw-tool-call-embedded': embedded }">
-    <button type="button" class="cw-tool-call-header" :aria-expanded="open" @click="open = !open">{{ header }}</button>
+  <div class="cw-block cw-tool-call px-4 py-1 border-l-2 border-gray-300 dark:border-gray-700 opacity-80" :class="{ 'cw-tool-call-error': block.isError, 'cw-tool-call-embedded': embedded }">
+    <button type="button" class="cw-tool-call-header text-xs font-mono cursor-pointer" :aria-expanded="open" @click="open = !open">{{ header }}</button>
     <InteractionTray v-if="interactions.length" :items="interactions" inline />
     <div v-if="sourcePath || previewUrl || imageUrl" class="cw-tool-links">
-      <button v-if="sourcePath" @click="openSource"><FileCode :size="13" /> Source</button>
-      <button v-if="previewUrl" @click="ui.previewUrl = previewUrl"><ExternalLink :size="13" /> Preview</button>
-      <button v-if="imageUrl" @click="ui.lightboxUrl = imageUrl"><Image :size="13" /> Image</button>
+      <button v-if="sourcePath" @click="openSource">⌘ Source</button>
+      <button v-if="previewUrl" @click="ui.previewUrl = previewUrl">↗ Preview</button>
+      <button v-if="imageUrl" @click="ui.lightboxUrl = imageUrl">▧ Image</button>
     </div>
     <div v-if="open" class="cw-tool-body">
-      <pre class="cw-tool-input">{{ JSON.stringify(block.toolInput, null, 2) }}</pre>
+      <pre class="cw-tool-input text-xs whitespace-pre-wrap bg-gray-50 dark:bg-gray-900 p-2 rounded-sm">{{ JSON.stringify(block.toolInput, null, 2) }}</pre>
       <ToolResult v-if="block.toolResult !== undefined" :value="block.toolResult" :is-error="block.isError" />
       <div v-if="block.children?.length" class="cw-subagent-timeline">
         <strong>Subagent timeline</strong>

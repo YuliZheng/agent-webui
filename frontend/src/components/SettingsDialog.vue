@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from "vue";
-import { LoaderCircle } from "lucide-vue-next";
+import { LoaderCircle } from "@/components/icons";
 import { THEME_OPTIONS, normalizePrefs, usePreferencesStore } from "@/stores/preferences";
 import { mainSocket } from "@/api/ws";
 import type { AgentCapabilities, AgentKind, PrefsBlob } from "@/types";
@@ -150,7 +150,7 @@ async function save(): Promise<void> {
               <label>
                 Color
                 <select v-model="draft.colorPreference" data-testid="color-preference">
-                  <option value="system">System</option>
+                  <option value="system">Auto</option>
                   <option value="light">Light</option>
                   <option value="dark">Dark</option>
                 </select>
