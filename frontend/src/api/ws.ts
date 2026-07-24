@@ -190,8 +190,11 @@ export class MainSocket extends EventTarget {
 
 export const mainSocket = new MainSocket();
 
-export function installWakeHandlers(socket = mainSocket): () => void {
-  const wake = () => socket.wake();
+export function installWakeHandlers(socket = mainSocket, afterWake?: () => void): () => void {
+  const wake = () => {
+    socket.wake();
+    afterWake?.();
+  };
   window.addEventListener("online", wake);
   window.addEventListener("focus", wake);
   document.addEventListener("visibilitychange", wake);

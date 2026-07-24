@@ -46,7 +46,11 @@ function normalizeUser(line: IndexedRawLine, record: Record<string, unknown>): N
   if (record.isCompactSummary === true || msg.isCompactSummary === true) {
     return [{ ...base(line, record), kind: "compact-summary", text: textOf(content) }];
   }
-  if (typeof content === "string") return content.trim() ? [{ ...base(line, record), kind: "user", text: content }] : [];
+  if (typeof content === "string") {
+    const special = normalizeUserString(line, record, content);
+    if (special !== null) return special;
+    return content.trim() ? [{ ...base(line, record), kind: "user", text: content }] : [];
+  }
   if (!Array.isArray(content)) {
     const text = textOf(content); return text ? [{ ...base(line, record), kind: "user", text }] : [];
   }
@@ -74,10 +78,15 @@ function normalizeUser(line: IndexedRawLine, record: Record<string, unknown>): N
         pdfs.push(name?.trim() || `document-${pdfs.length + 1}.pdf`);
       }
     } else {
-      const text = textOf(part); if (text) texts.push(text);
+      const text = textOf(part);
+      if (text) texts.push(text);
     }
   }
   const prompt = texts.join("\n").trim();
+  if (!toolResults.length && !images.length && !pdfs.length && prompt) {
+    const special = normalizeUserString(line, record, prompt);
+    if (special !== null) return special;
+  }
   const promptBlock = prompt || images.length || pdfs.length
     ? [{
         ...base(line, record),
@@ -126,5 +135,69 @@ function normalizeSystem(line: IndexedRawLine, record: Record<string, unknown>):
   if (subtype.includes("error")) return [{ ...base(line, record), kind: "api-error", text: text || subtype, isError: true }];
   if (subtype.includes("local_command") || record.isLocalCommand === true) return [{ ...base(line, record), kind: "local-command", text }];
   if (subtype.includes("task_notification")) return [{ ...base(line, record), kind: "task-notification", text }];
+  if (subtype.includes("away_summary")) return [{ ...base(line, record), kind: "away-summary", text }];
   return [];
+}
+
+function normalizeUserString(
+  line: IndexedRawLine,
+  record: Record<string, unknown>,
+  content: string,
+): NormalizedBlock[] | null {
+  const trimmed = content.trim();
+  if (!trimmed.startsWith("<")) return null;
+
+  if (/^<(?:command-name|local-command-(?:stdout|stderr))>/i.test(trimmed)) {
+    const command = tagText(trimmed, "command-name").trim();
+    if (/^\/(?:compact|clear)(?:\s|$)/i.test(command)) return [];
+    const stdout = tagText(trimmed, "local-command-stdout").trim();
+    const stderr = tagText(trimmed, "local-command-stderr").trim();
+    const args = tagText(trimmed, "command-args").trim();
+    const visible = [
+      command && args ? `${command} ${args}` : command,
+      stdout,
+      stderr,
+    ].filter(Boolean).join("\n");
+    return [{
+      ...base(line, record),
+      kind: "local-command",
+      text: visible || stripXml(trimmed),
+      meta: { command, stdout, stderr },
+      isError: !!stderr,
+    }];
+  }
+
+  if (/^<task-notification>/i.test(trimmed)) {
+    const status = tagText(trimmed, "status").trim();
+    const summary = (
+      tagText(trimmed, "summary") ||
+      tagText(trimmed, "message") ||
+      tagText(trimmed, "result")
+    ).trim();
+    const taskId = tagText(trimmed, "task-id").trim();
+    return [{
+      ...base(line, record),
+      kind: "task-notification",
+      text: summary || status || taskId || stripXml(tagText(trimmed, "task-notification")),
+      isError: /fail|error/i.test(status),
+      meta: { status, taskId },
+    }];
+  }
+
+  return null;
+}
+
+function tagText(source: string, name: string): string {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return source.match(new RegExp(`<${escaped}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${escaped}>`, "i"))?.[1] ?? "";
+}
+
+function stripXml(source: string): string {
+  return source
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&")
+    .replace(/\s+/g, " ")
+    .trim();
 }

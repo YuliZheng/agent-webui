@@ -7,11 +7,11 @@ import { mainSocket } from "@/api/ws";
 import { useInteractionsStore } from "@/stores/sessions";
 import { useUiStore } from "@/stores/ui";
 import { useLiveStore } from "@/stores/live";
+import { contextUsageSnapshot } from "@/parser";
 
 const props = defineProps<{
   sessionId: string;
   agent: AgentKind;
-  sessionEmoji?: string;
   blocks: NormalizedBlock[];
   chips: PendingPromptChip[];
   style: MessageDisplayStyle;
@@ -27,6 +27,8 @@ const emit = defineEmits<{
   retryChip: [chip: PendingPromptChip];
   dismissChip: [chipId: string];
   loadEarlier: [];
+  compact: [];
+  newChat: [];
 }>();
 const interactions = useInteractionsStore();
 const ui = useUiStore();
@@ -34,6 +36,17 @@ const live = useLiveStore();
 const messageDisplayStyle = computed(() => props.style);
 const messageDisplayClass = computed(() => `cw-display-${messageDisplayStyle.value}`);
 const scroller = ref<HTMLElement | null>(null);
+const contextUsage = computed(() => contextUsageSnapshot(props.blocks));
+const showContextNotice = computed(() =>
+  !!contextUsage.value && (contextUsage.value.percent > 70 || contextUsage.value.overLimit)
+);
+
+function formatTokenCount(value: number | null): string {
+  if (value === null) return "—";
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}k`;
+  return String(value);
+}
 
 const INITIAL_RENDER_FAST = 30;
 const INITIAL_RENDER_FULL = 200;
@@ -351,12 +364,20 @@ onBeforeUnmount(() => {
           :actions="true"
           :interactions="blockInteractions(block)"
           :display-style="style"
-          :session-emoji="sessionEmoji"
           @rewind="rewind"
           @fork="fork"
         />
       </template>
-      <div v-for="chip in chips" :key="chip.id" class="cw-pending-chip cw-queue-chip" :class="`cw-pending-${chip.state}`">
+      <div
+        v-for="chip in chips"
+        :key="chip.id"
+        class="cw-pending-chip cw-queue-chip"
+        :class="[
+          `cw-pending-${chip.state}`,
+          { 'cw-queue-chip-optimistic': chip.state === 'sending' || chip.state === 'queued' || chip.state === 'steered' },
+          { 'cw-queue-chip-failed': chip.state === 'retry' }
+        ]"
+      >
         <span class="cw-queue-chip-label">{{ chip.steered ? "steered" : chip.state }}</span>
         {{ chip.text || `${chip.imageCount} attachment(s)` }}
         <span v-if="chip.state === 'retry' || chip.steered" class="cw-pending-actions">
@@ -365,6 +386,20 @@ onBeforeUnmount(() => {
         </span>
       </div>
       <div class="cw-transcript-spacer" />
+    </div>
+    <div
+      v-if="showContextNotice && contextUsage"
+      class="cw-context-notice"
+      :class="{ 'is-over-limit': contextUsage.overLimit }"
+      role="status"
+    >
+      <span>
+        context {{ formatTokenCount(contextUsage.usedTokens) }}
+        <template v-if="contextUsage.totalTokens !== null"> · total {{ formatTokenCount(contextUsage.totalTokens) }}</template>
+        · {{ contextUsage.overLimit ? "over limit" : `usage ${contextUsage.percent}%` }}
+      </span>
+      <button type="button" @click="emit('compact')">Compact</button>
+      <button type="button" @click="emit('newChat')">New chat</button>
     </div>
     <div class="cw-prompt-nav">
       <button type="button" class="cw-floating-nav-button" aria-label="Previous prompt" @click="navigatePrompt(-1)">↑</button>

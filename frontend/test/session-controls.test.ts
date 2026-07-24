@@ -1,6 +1,7 @@
 import { flushPromises, mount } from "@vue/test-utils";
 import { createPinia, setActivePinia } from "pinia";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import SessionControls from "@/components/SessionControls.vue";
 import SessionHeader from "@/components/SessionHeader.vue";
 import { mainSocket } from "@/api/ws";
 import { useUiStore } from "@/stores/ui";
@@ -31,8 +32,11 @@ function mountHeader(agent: AgentKind, extra: Record<string, unknown> = {}) {
   });
 }
 
-function optionValues(wrapper: ReturnType<typeof mountHeader>, selector: string): string[] {
-  return wrapper.findAll(`${selector} option`).map((option) => option.attributes("value") ?? "");
+function mountControls(agent: AgentKind, extra: Record<string, unknown> = {}) {
+  return mount(SessionControls, {
+    props: { session: session(agent), ...extra },
+    global: { stubs: { Teleport: true } }
+  });
 }
 
 beforeEach(() => {
@@ -131,30 +135,38 @@ describe("SessionHeader controls", () => {
     expect(wrapper.find('.cw-header-agent-mark svg[aria-label="Claude"]').exists()).toBe(true);
   });
 
-  it("renders compact selects and sends their exact values", async () => {
-    const request = vi.spyOn(mainSocket, "request").mockResolvedValue(undefined);
-    const wrapper = mountHeader("claude", { model: "private-claude", permissionMode: "plan" });
+  it("renders composer popovers and sends their exact values", async () => {
+    const request = vi.spyOn(mainSocket, "request").mockImplementation(async () => undefined);
+    const wrapper = mountControls("claude", {
+      settings: { model: "private-claude", permissionMode: "plan" }
+    });
 
-    expect(wrapper.get('[data-testid="session-model"]').element.tagName).toBe("SELECT");
-    expect(optionValues(wrapper, '[data-testid="session-model"]')).toEqual([
-      "private-claude",
-      "sonnet",
-      "opus",
-      "haiku"
-    ]);
-    expect(optionValues(wrapper, '[data-testid="session-permission"]')).toEqual([
-      "auto",
-      "acceptEdits",
-      "manual",
-      "dontAsk",
-      "plan",
-      "bypassPermissions"
-    ]);
+    expect(wrapper.get('[data-testid="session-model"]').element.tagName).toBe("BUTTON");
+    expect(wrapper.get('[data-testid="session-model"]').text()).toContain("private-claude");
+    expect(wrapper.get('[data-testid="session-permission"]').text()).toContain("Plan");
     expect(wrapper.find('[data-testid="session-effort"]').exists()).toBe(false);
-    expect(wrapper.find(".cw-session-toolbar").text().toLowerCase()).not.toContain("default");
+    expect(wrapper.text().toLowerCase()).not.toContain("default");
 
-    await wrapper.get('[data-testid="session-model"]').setValue("opus");
-    await wrapper.get('[data-testid="session-permission"]').setValue("bypassPermissions");
+    await wrapper.get('[data-testid="session-model"]').trigger("click");
+    await flushPromises();
+    const modelOptions = wrapper.findAll('[role="option"]');
+    expect(modelOptions.map((option) => option.text())).toEqual(
+      expect.arrayContaining(["private-claude", "Sonnet", "Opus", "Haiku"])
+    );
+    await modelOptions.find((option) => option.text() === "Opus")!.trigger("click");
+
+    await wrapper.get('[data-testid="session-permission"]').trigger("click");
+    await flushPromises();
+    const permissionOptions = wrapper.findAll('[role="option"]');
+    expect(permissionOptions.map((option) => option.find("strong").text())).toEqual([
+      "Auto",
+      "Accept edits",
+      "Manual",
+      "Don't ask",
+      "Plan",
+      "Bypass"
+    ]);
+    await permissionOptions.find((option) => option.find("strong").text() === "Bypass")!.trigger("click");
 
     expect(request).toHaveBeenCalledWith("set-model", { sessionId: "claude_session", model: "opus" });
     expect(request).toHaveBeenCalledWith("set-permission-mode", {
@@ -173,11 +185,10 @@ describe("SessionHeader controls", () => {
     await flushPromises();
 
     expect(wrapper.find(".cw-goal-chip").exists()).toBe(false);
-    expect(wrapper.find(".cw-session-toolbar").text()).not.toContain("Ship the release");
+    expect(wrapper.text()).not.toContain("Ship the release");
     expect(wrapper.find(".cw-header-goal-indicator").exists()).toBe(false);
     expect(request).not.toHaveBeenCalledWith("codex-goal-get", expect.anything());
     expect(wrapper.get('button[aria-haspopup="menu"]').attributes("aria-label")).toBe("Session actions");
-    expect(wrapper.get('[data-testid="session-stop"]').attributes("disabled")).toBeUndefined();
 
     await wrapper.get('button[aria-haspopup="menu"]').trigger("click");
     await flushPromises();
@@ -199,11 +210,13 @@ describe("SessionHeader controls", () => {
 
   it("moves owned-process kill into overflow and keeps a disabled square Stop while idle", async () => {
     vi.spyOn(mainSocket, "request").mockResolvedValue(undefined);
-    const wrapper = mountHeader("claude", { status: { status: "exited", webuiAlive: true } });
+    const status = { status: "exited" as const, webuiAlive: true };
+    const wrapper = mountHeader("claude", { status });
+    const controls = mountControls("claude", { status });
 
-    expect(wrapper.get('[data-testid="session-stop"]').attributes("disabled")).toBeDefined();
-    expect(wrapper.get('[data-testid="session-stop"]').classes()).toContain("cw-toolbar-stop");
-    expect(wrapper.find(".cw-session-toolbar").text()).not.toContain("Kill");
+    expect(controls.get('[data-testid="session-stop"]').attributes("disabled")).toBeDefined();
+    expect(controls.get('[data-testid="session-stop"]').classes()).toContain("cw-control-stop");
+    expect(controls.text()).not.toContain("Kill");
 
     await wrapper.get('button[aria-haspopup="menu"]').trigger("click");
     expect(wrapper.get('[role="menu"]').text()).toContain("Kill owned process");

@@ -2,6 +2,7 @@ import { computed, reactive, ref, watch } from "vue";
 import { defineStore } from "pinia";
 import type { IndexedRawLine, Interaction, PushEvent, SessionListItem } from "@/types";
 import { mainSocket } from "@/api/ws";
+import { api } from "@/api/http";
 import { sessionCaches } from "@/persist/session-cache";
 import { normalizeLines } from "@/parser";
 import { useBackgroundTasksStore, useInteractionsStore, useSessionsStore } from "./sessions";
@@ -12,12 +13,9 @@ import { clearInteractionAnswerClaim } from "@/util/interactions";
 
 export const INITIAL_SESSION_TAIL_LINES = 200;
 export const EARLIER_SESSION_PAGE_LINES = 200;
-// Prefetch is intentionally conservative and is not run at app startup. A cold
-// tail needs an exact physical-line count, so parallel prefetch of several
-// large JSONL files can saturate a Windows disk (and its antivirus scanner)
-// even though the resulting browser caches are immediately released.
-export const PREFETCH_MAX_SESSION_BYTES = 4 * 1024 * 1024;
-export const PREFETCH_SESSION_LIMIT = 2;
+export const ENGAGE_HTTP_TAIL_LINES = 60;
+export const PREFETCH_SESSION_LIMIT = 8;
+export const STALE_STREAM_MS = 3000;
 
 export const useLiveStore = defineStore("live", () => {
   const linesBySession = reactive<Record<string, IndexedRawLine[]>>({});
@@ -25,6 +23,7 @@ export const useLiveStore = defineStore("live", () => {
   const loadingEarlier = reactive<Record<string, boolean>>({});
   const connected = ref(false);
   const subscribed = new Set<string>();
+  const staleStreamTimers = new Map<string, ReturnType<typeof setTimeout>>();
   let openSequence = 0;
   let handingOffInsideOpen = false;
   let installed = false;
@@ -51,7 +50,12 @@ export const useLiveStore = defineStore("live", () => {
     mainSocket.addEventListener("push", ((event: CustomEvent<PushEvent>) => onPush(event.detail)) as EventListener);
     mainSocket.addEventListener("connection", ((event: CustomEvent<{ connected: boolean }>) => {
       connected.value = event.detail.connected;
-      if (!connected.value) sessions.clearTransientStatuses();
+      if (!connected.value) {
+        sessions.clearTransientStatuses();
+        clearAllStaleStreamTimers();
+      } else {
+        void prefetch(sessions.sorted);
+      }
     }) as EventListener);
     mainSocket.subscribe({ channel: "global", notifSinceSeq: notifSeq });
     mainSocket.connect();
@@ -59,6 +63,7 @@ export const useLiveStore = defineStore("live", () => {
 
   async function open(sessionId: string): Promise<void> {
     const sequence = ++openSequence;
+    const httpTail = readHttpTail(sessionId, ENGAGE_HTTP_TAIL_LINES).catch(() => [] as IndexedRawLine[]);
     const previousId = sessions.selectedId;
     handingOffInsideOpen = true;
     try {
@@ -95,10 +100,18 @@ export const useLiveStore = defineStore("live", () => {
       });
       subscribed.add(sessionId);
     } else mainSocket.updateSessionFrom(sessionId, cache.nextLineIndex);
+    void httpTail.then((lines) => {
+      if (sequence !== openSequence || sessions.selectedId !== sessionId || !subscribed.has(sessionId)) return;
+      const activeCache = sessionCaches.get(sessionId);
+      activeCache.merge(lines, "forward");
+      linesBySession[sessionId] = [...activeCache.lines];
+      mainSocket.updateSessionFrom(sessionId, activeCache.nextLineIndex);
+    }).catch(() => undefined);
     void sessions.markRead(sessionId);
   }
 
   function close(sessionId: string): void {
+    clearStaleStreamTimer(sessionId);
     if (!subscribed.has(sessionId)) return;
     mainSocket.unsubscribe({ channel: "session", sessionId }); subscribed.delete(sessionId);
   }
@@ -169,14 +182,15 @@ export const useLiveStore = defineStore("live", () => {
   }
 
   async function prefetch(items: SessionListItem[], n = 200): Promise<void> {
-    // Keep this helper for an explicit future "cache for offline" action, but
-    // serialize its I/O. The normal open flow remains selected-session-only.
-    for (const item of items.filter(item => item.size <= PREFETCH_MAX_SESSION_BYTES).slice(0, PREFETCH_SESSION_LIMIT)) {
+    // HTTP prefetch is intentionally independent of WebSocket health. Keep the
+    // requests serialized and release non-selected caches immediately so the
+    // latest eight sessions are warm in IndexedDB without becoming resident.
+    for (const item of items.slice(0, PREFETCH_SESSION_LIMIT)) {
       try {
-        const lines = await mainSocket.request<IndexedRawLine[]>("read-tail", { sessionId: item.id, n });
-        if (sessions.selectedId === item.id) continue;
+        const lines = await readHttpTail(item.id, n);
         const cache = sessionCaches.get(item.id);
         cache.merge(lines, "forward");
+        if (sessions.selectedId === item.id) linesBySession[item.id] = [...cache.lines];
         // Prefetch warms only IndexedDB. Non-selected transcripts must not
         // remain resident after their short request completes.
         if (sessions.selectedId !== item.id) await sessionCaches.release(item.id);
@@ -202,8 +216,12 @@ export const useLiveStore = defineStore("live", () => {
       // all sessions for every streamed append made an active transcript turn
       // into a continuous O(session-count) RPC/render loop.
       sessions.touch(sessionId, event.session as Partial<SessionListItem> ?? {});
+      if (subscribed.has(sessionId)) armStaleStreamTimer(sessionId);
     }
     else if (kind === "session-renamed" && sessionId) sessions.touch(sessionId, { title: String(event.title ?? "") });
+    else if (kind === "session-boundary" && sessionId && typeof event.at === "string") {
+      sessions.touch(sessionId, { lastBoundaryAt: event.at });
+    }
     else if (kind === "session-status" && sessionId) sessions.setStatus(sessionId, { status: (event.status as any) ?? null, webuiAlive: event.webuiAlive === true, compacting: event.compacting === true });
     else if (kind === "session-settings" && sessionId) sessions.settings[sessionId] = {
       model: String(event.model ?? ""),
@@ -230,6 +248,7 @@ export const useLiveStore = defineStore("live", () => {
   }
 
   function mergeStream(sessionId: string, lines: IndexedRawLine[]): void {
+    clearStaleStreamTimer(sessionId);
     const valid = lines.filter((line) => Number.isInteger(line.index) && typeof line.raw === "string"); if (!valid.length) return;
     const cache = sessionCaches.get(sessionId); cache.merge(valid, "forward"); linesBySession[sessionId] = [...cache.lines];
     mainSocket.updateSessionFrom(sessionId, cache.nextLineIndex);
@@ -242,6 +261,7 @@ export const useLiveStore = defineStore("live", () => {
   }
 
   async function truncate(sessionId: string, keepCount: number): Promise<void> {
+    clearStaleStreamTimer(sessionId);
     const cache = sessionCaches.get(sessionId);
     await cache.truncate(keepCount);
     if (!subscribed.has(sessionId) || sessions.selectedId !== sessionId) return;
@@ -257,10 +277,35 @@ export const useLiveStore = defineStore("live", () => {
     if ("Notification" in window && Notification.permission === "granted" && document.visibilityState !== "visible") new Notification(title, { body, tag: String(event.id ?? event.uuid ?? "agent") });
   }
 
+  function armStaleStreamTimer(sessionId: string): void {
+    clearStaleStreamTimer(sessionId);
+    staleStreamTimers.set(sessionId, setTimeout(() => {
+      staleStreamTimers.delete(sessionId);
+      if (!subscribed.has(sessionId) || sessions.selectedId !== sessionId) return;
+      const cache = sessionCaches.get(sessionId);
+      mainSocket.subscribe({ channel: "session", sessionId, from: cache.nextLineIndex });
+    }, STALE_STREAM_MS));
+  }
+
+  function clearStaleStreamTimer(sessionId: string): void {
+    const timer = staleStreamTimers.get(sessionId);
+    if (timer !== undefined) clearTimeout(timer);
+    staleStreamTimers.delete(sessionId);
+  }
+
+  function clearAllStaleStreamTimers(): void {
+    for (const timer of staleStreamTimers.values()) clearTimeout(timer);
+    staleStreamTimers.clear();
+  }
+
   return { linesBySession, restoring, loadingEarlier, connected, selectedBlocks: computed(() => sessions.selectedId ? blocks(sessions.selectedId) : []), install, open, close, reload, blocks, loadEarlier, loadAround, prefetch, onPush };
 });
 
 function toLine(value: Record<string, unknown>): IndexedRawLine {
   const data = value.data;
   return { index: Number(value.index), raw: typeof value.raw === "string" ? value.raw : typeof data === "string" ? data : JSON.stringify(data) };
+}
+
+async function readHttpTail(sessionId: string, n: number): Promise<IndexedRawLine[]> {
+  return api<IndexedRawLine[]>(`/api/sessions/${encodeURIComponent(sessionId)}/tail?n=${Math.max(1, Math.floor(n))}`);
 }

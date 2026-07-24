@@ -81,7 +81,14 @@ export const useSessionsStore = defineStore("sessions", () => {
   function observeCurrent(id: string, at = new Date().toISOString()): void {
     if (selectedId.value !== id || !viewingSelected.value) return;
     readAt[id] = at; clearUnreadCount(id); syncBadge(); clearTimeout(readTimers.get(id));
-    readTimers.set(id, setTimeout(() => { readTimers.delete(id); void mainSocket.request("mark-read", { sessionId: id, at: readAt[id] }).catch(() => undefined); }, 500));
+    readTimers.set(id, setTimeout(() => {
+      readTimers.delete(id);
+      try {
+        void Promise.resolve(mainSocket.request("mark-read", { sessionId: id, at: readAt[id] })).catch(() => undefined);
+      } catch {
+        // A socket replacement can race this debounced watermark update.
+      }
+    }, 500));
   }
   function handoffSelection(nextId: string | null): void {
     const previous = selectedId.value;

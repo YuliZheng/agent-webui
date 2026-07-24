@@ -1,12 +1,23 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref } from "vue";
 import { FileText, Paperclip, Send, X } from "lucide-vue-next";
-import type { AgentKind } from "@/types";
+import type { AgentKind, SessionListItem, SessionSettings, SessionStatus } from "@/types";
+import SessionControls from "@/components/SessionControls.vue";
 import { useComposerStore } from "@/stores/composer";
 import { usePreferencesStore } from "@/stores/preferences";
 import { useUiStore } from "@/stores/ui";
 import { parseLocalSlashCommand } from "@/util/slash-commands";
-const props = defineProps<{ sessionId: string; agent: AgentKind; active: boolean; startLine: number; disabled?: boolean; pending?: boolean }>();
+const props = defineProps<{
+  sessionId: string;
+  agent: AgentKind;
+  session: SessionListItem;
+  settings?: SessionSettings;
+  status?: SessionStatus;
+  active: boolean;
+  startLine: number;
+  disabled?: boolean;
+  pending?: boolean;
+}>();
 const emit = defineEmits<{ command: [text: string]; sendPending: [text: string] }>();
 const composer = useComposerStore(); composer.ensure(props.sessionId);
 const prefs = usePreferencesStore();
@@ -101,6 +112,7 @@ function openAttachment(item: { file: File; objectUrl?: string; preview?: string
       aria-label="Resize composer"
       @pointerdown="resizeComposer"
     ><span /></button>
+    <SessionControls v-if="isWechat && !pending" :session="session" :settings="settings" :status="status" />
     <div v-if="composer.attachments[sessionId]?.length" class="cw-attachments cw-image-draft-strip">
       <span v-for="item in composer.attachments[sessionId]" :key="item.id">
         <button v-if="item.preview" class="cw-attachment-preview" title="Open image" @click="openAttachment(item)"><img :src="item.preview" /></button>
@@ -121,6 +133,7 @@ function openAttachment(item: { file: File; objectUrl?: string; preview?: string
       />
       <div class="cw-cc-toolbar">
         <button type="button" class="cw-attach-button cw-cc-tool-btn" title="Attach image or PDF" @click="input?.click()"><Paperclip :size="18" /></button>
+        <SessionControls v-if="!pending" :session="session" :settings="settings" :status="status" />
         <span class="cw-cc-spacer" />
         <button
           type="button"

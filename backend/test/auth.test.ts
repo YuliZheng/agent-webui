@@ -42,6 +42,26 @@ describe("token authentication", () => {
     expect((await app.inject({ url: "/assets/missing-deadbeef.js", headers: { cookie } })).statusCode).toBe(404);
   });
 
+  it("serves a token form for unauthenticated browser routes without changing API errors", async () => {
+    const app = await fixture();
+    const root = await app.inject({ url: "/", headers: { accept: "text/html" } });
+    expect(root.statusCode).toBe(401);
+    expect(root.headers["content-type"]).toContain("text/html");
+    expect(root.body).toContain('<form method="get" action="/">');
+    expect(root.body).toContain('name="token"');
+    expect(root.body).not.toContain("a".repeat(64));
+
+    const deepLink = await app.inject({ url: "/sessions/example", headers: { accept: "text/html" } });
+    expect(deepLink.statusCode).toBe(401);
+    expect(deepLink.body).toContain("Agent WebUI");
+    expect(deepLink.body).toContain('type="password"');
+
+    const api = await app.inject({ url: "/api/me", headers: { accept: "text/html" } });
+    expect(api.statusCode).toBe(401);
+    expect(api.headers["content-type"]).toContain("application/json");
+    expect(api.json()).toEqual({ error: "Authentication required" });
+  });
+
   it("rejects an unauthenticated WebSocket with policy code 1008", async () => {
     const app = await fixture(); await app.listen({ host: "127.0.0.1", port: 0 });
     const address = app.server.address(); if (!address || typeof address === "string") throw new Error("no address");

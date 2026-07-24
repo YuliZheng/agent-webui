@@ -6,19 +6,21 @@ import AssistantBlock from "./blocks/AssistantBlock.vue";
 import ToolBlock from "./blocks/ToolBlock.vue";
 import ToolRunBlock from "./blocks/ToolRunBlock.vue";
 import SystemBlock from "./blocks/SystemBlock.vue";
+import AgentBadge from "./AgentBadge.vue";
+import { useIdentityStore } from "@/stores/identity";
 
 const props = withDefaults(defineProps<{
   block: NormalizedBlock;
   actions?: boolean;
   interactions?: Interaction[];
   displayStyle?: MessageDisplayStyle;
-  sessionEmoji?: string;
 }>(), {
   actions: true,
   interactions: () => [],
   displayStyle: "claude-code"
 });
 defineEmits<{ rewind: [block: NormalizedBlock]; fork: [block: NormalizedBlock] }>();
+const identity = useIdentityStore();
 
 const blockName = computed(() => {
   if (props.block.kind === "user") return "UserPromptBlock";
@@ -29,10 +31,16 @@ const blockName = computed(() => {
 });
 const role = computed(() => props.block.kind === "user" ? "user" : props.block.kind === "assistant" || props.block.kind === "thinking" || props.block.kind === "tool" || props.block.kind === "tool-run" ? "assistant" : "system");
 const entryUuid = computed(() => props.block.uuid || props.block.toolUseId || undefined);
+const avatarUrl = "/api/me/avatar?v=2";
 const isWechatAvatarEntry = computed(() =>
   props.block.kind === "user" ||
   (props.block.kind === "assistant" && !!props.block.text?.trim())
 );
+
+function hideBrokenAvatar(event: Event): void {
+  const image = event.currentTarget as HTMLImageElement | null;
+  if (image) image.style.display = "none";
+}
 </script>
 
 <template>
@@ -59,9 +67,16 @@ const isWechatAvatarEntry = computed(() =>
     >
       <template v-if="isWechatAvatarEntry">
         <template v-if="blockName === 'UserPromptBlock'">
-          <span class="cw-message-avatar-fallback cw-session-message-emoji">{{ sessionEmoji || "💬" }}</span>
+          <span class="cw-message-avatar-fallback">{{ identity.initials }}</span>
+          <img
+            :src="avatarUrl"
+            alt=""
+            loading="lazy"
+            decoding="async"
+            @error="hideBrokenAvatar"
+          />
         </template>
-        <span v-else class="cw-agent-badge" :title="block.agent === 'codex' ? 'Codex' : 'Claude Code'">🤖</span>
+        <AgentBadge v-else :agent="block.agent" :size="28" />
       </template>
     </span>
     <UserPromptBlock

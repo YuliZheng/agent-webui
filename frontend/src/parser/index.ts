@@ -103,10 +103,45 @@ function containsValue(value: unknown, needle: string): boolean {
 }
 
 export interface TodoItem { id: string; subject: string; status: string }
+export interface ContextUsageSnapshot {
+  usedTokens: number;
+  totalTokens: number | null;
+  contextWindow: number;
+  percent: number;
+  overLimit: boolean;
+}
+
 export function contextUsagePercent(blocks: readonly NormalizedBlock[]): number | null {
   const latest = latestUsageMetadata(blocks);
   if (!latest.found) return null;
   return usagePercent(latest.value);
+}
+
+export function contextUsageSnapshot(blocks: readonly NormalizedBlock[]): ContextUsageSnapshot | null {
+  const latest = latestUsageMetadata(blocks);
+  if (!latest.found || !isUsageRecord(latest.value)) return null;
+
+  const root = latest.value;
+  const current = namedUsage(root, ["current_token_usage", "currentTokenUsage"]);
+  const last = namedUsage(root, ["last_token_usage", "lastTokenUsage"]);
+  const selected = current.present ? current.value : last.present ? last.value : directUsage(root);
+  if (!selected || !isUsageRecord(selected)) return null;
+
+  const contextWindow = contextWindowOf(root, selected);
+  const usedTokens = usedTokensOf(selected);
+  if (contextWindow === null || usedTokens === null) return null;
+
+  const cumulative = namedUsage(root, ["total_token_usage", "totalTokenUsage"]);
+  const totalTokens = cumulative.present && isUsageRecord(cumulative.value)
+    ? totalTokensOf(cumulative.value)
+    : totalTokensOf(selected);
+  return {
+    usedTokens,
+    totalTokens,
+    contextWindow,
+    percent: Math.floor(usedTokens / contextWindow * 100),
+    overLimit: usedTokens > contextWindow
+  };
 }
 
 function latestUsageMetadata(blocks: readonly NormalizedBlock[]): { found: boolean; value?: unknown } {
@@ -185,6 +220,31 @@ function usedTokensOf(usage: Record<string, unknown>): number | null {
 
   const keys = [
     "input_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+  ];
+  const present = keys.filter((key) => Object.prototype.hasOwnProperty.call(usage, key));
+  if (!present.length) return null;
+  let total = 0;
+  for (const key of present) {
+    const value = tokenInteger(usage[key], true);
+    if (value === null || !Number.isSafeInteger(total + value)) return null;
+    total += value;
+  }
+  return total;
+}
+
+function totalTokensOf(usage: Record<string, unknown>): number | null {
+  if (Object.prototype.hasOwnProperty.call(usage, "total_tokens")) {
+    return tokenInteger(usage.total_tokens, true);
+  }
+  if (Object.prototype.hasOwnProperty.call(usage, "totalTokens")) {
+    return tokenInteger(usage.totalTokens, true);
+  }
+
+  const keys = [
+    "input_tokens",
+    "output_tokens",
     "cache_creation_input_tokens",
     "cache_read_input_tokens",
   ];

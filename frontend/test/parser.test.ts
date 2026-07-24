@@ -23,6 +23,48 @@ describe("transcript parser", () => {
     expect(normalizeClaudeLine(line(4, { type: "attachment", attachment: { type: "queued_command", command: "next" } }))[0]).toMatchObject({ index: 4, kind: "user", text: "next" });
     expect(normalizeClaudeLine(line(5, { type: "queue-operation", operation: "enqueue" }))).toEqual([]);
   });
+  it("dispatches Claude local-command and task XML without leaking markup", () => {
+    const local = normalizeClaudeLine(line(6, {
+      type: "user",
+      message: { content: "<command-name>/doctor</command-name><command-args>--verbose</command-args><local-command-stdout>healthy</local-command-stdout>" },
+    }));
+    expect(local).toEqual([
+      expect.objectContaining({
+        kind: "local-command",
+        text: "/doctor --verbose\nhealthy",
+        meta: { command: "/doctor", stdout: "healthy", stderr: "" },
+      }),
+    ]);
+    expect(local[0]?.text).not.toContain("<command-name>");
+
+    const task = normalizeClaudeLine(line(7, {
+      type: "user",
+      message: { content: "<task-notification><task-id>task-7</task-id><status>completed</status><summary>Tests passed</summary></task-notification>" },
+    }));
+    expect(task).toEqual([
+      expect.objectContaining({
+        kind: "task-notification",
+        text: "Tests passed",
+        meta: { status: "completed", taskId: "task-7" },
+      }),
+    ]);
+    expect(task[0]?.text).not.toContain("<task-notification>");
+  });
+  it("drops compact/clear command echoes and renders away summaries", () => {
+    for (const command of ["/compact", "/clear"]) {
+      expect(normalizeClaudeLine(line(8, {
+        type: "user",
+        message: { content: `<command-name>${command}</command-name><command-args></command-args>` },
+      }))).toEqual([]);
+    }
+    expect(normalizeClaudeLine(line(9, {
+      type: "system",
+      subtype: "away_summary",
+      summary: "Work completed while you were away.",
+    }))).toEqual([
+      expect.objectContaining({ kind: "away-summary", text: "Work completed while you were away." }),
+    ]);
+  });
   it("dispatches and pairs Claude tool use/results without renumbering", () => {
     const blocks = normalizeLines("claude", [
       line(7, { type: "assistant", uuid: "a", message: { content: [{ type: "tool_use", id: "t1", name: "Read", input: { file: "x" } }] } }),

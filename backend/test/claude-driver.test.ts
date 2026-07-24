@@ -2,10 +2,46 @@ import { describe, expect, it, vi } from "vitest";
 import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ClaudeDriver } from "../src/services/claude-driver.js";
+import { ClaudeDriver, claudeExitStatus, claudeSpawnArgs } from "../src/services/claude-driver.js";
 import { AppState } from "../src/services/state.js";
 
 describe("Claude ownership and interactions", () => {
+  it("uses the supported Claude stream flags and never passes effort", () => {
+    const args = claudeSpawnArgs("session", "opus", "acceptEdits");
+    expect(args).toEqual([
+      "--print",
+      "--input-format", "stream-json",
+      "--output-format", "stream-json",
+      "--verbose",
+      "--permission-prompt-tool", "stdio",
+      "--resume", "session",
+      "--model", "opus",
+      "--permission-mode", "acceptEdits",
+    ]);
+    expect(args).not.toContain("--effort");
+  });
+
+  it("classifies normal numeric signal exits neutrally", () => {
+    for (const code of [0, 130, 137, 143]) expect(claudeExitStatus(code, null)).toBe("exited");
+    expect(claudeExitStatus(null, null)).toBe("exited");
+    expect(claudeExitStatus(1, "SIGTERM")).toBe("exited");
+    expect(claudeExitStatus(1, null, true)).toBe("exited");
+    expect(claudeExitStatus(1, null)).toBe("failed");
+  });
+
+  it("resets an oversized unframed stdout buffer without killing the process", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-webui-buffer-"));
+    const driver = new ClaudeDriver("claude", join(root, "sessions"), new AppState(root)) as any;
+    const errors: unknown[] = [];
+    driver.on("error", (error: unknown) => errors.push(error));
+    const kill = vi.fn();
+    const proc = { sessionId: "session", buffer: "", child: { kill } };
+    driver.stdout(proc, "x".repeat(4 * 1024 * 1024 + 1));
+    expect(proc.buffer).toBe("");
+    expect(kill).not.toHaveBeenCalled();
+    expect(errors).toHaveLength(1);
+  });
+
   it("conservatively conflicts with a live foreign registration", async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-webui-owner-")); const registrations = join(root, "sessions"); await mkdir(registrations);
     await writeFile(join(registrations, "foreign.json"), JSON.stringify({ sessionId: "foreign", pid: process.pid }));

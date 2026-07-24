@@ -1,47 +1,25 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
-import { ArrowLeft, CheckCircle2, ChevronDown, Download, LoaderCircle, Minimize2, MoreHorizontal, Octagon, Pencil, Square, Target, Trash2, XCircle } from "lucide-vue-next";
+import { ArrowLeft, CheckCircle2, Download, LoaderCircle, Minimize2, MoreHorizontal, Octagon, Pencil, Target, Trash2, XCircle } from "lucide-vue-next";
 import AgentLogo from "@/components/AgentLogo.vue";
-import type { AgentCapabilities, BackgroundTask, SessionListItem, SessionStatus } from "@/types";
+import type { BackgroundTask, SessionListItem, SessionStatus } from "@/types";
 import { mainSocket } from "@/api/ws";
 import { exportUrl } from "@/api/http";
 import { useUiStore } from "@/stores/ui";
 import { sessionAppearance } from "@/util/session-appearance";
-import {
-  effectiveModelValue,
-  effectivePermissionValue,
-  effectiveSandboxValue,
-  fallbackAgentCapabilities,
-  modelControlOptions,
-  permissionControlOptions,
-  sandboxControlOptions
-} from "@/util/session-controls";
 const props = withDefaults(defineProps<{
   session: SessionListItem;
   status?: SessionStatus;
-  model?: string;
-  permissionMode?: string;
-  sandboxMode?: string;
   backgroundTasks?: BackgroundTask[];
 }>(), { backgroundTasks: () => [] });
 const emit = defineEmits<{ back: []; refresh: []; renamed: [title: string] }>();
 const ui = useUiStore();
-const capabilities = ref<AgentCapabilities>(fallbackAgentCapabilities(props.session.agent));
-const capabilitiesLoading = ref(false);
-const capabilitiesLoaded = ref(false);
-let capabilitiesSequence = 0;
 const goalSupported = ref(props.session.agent === "codex");
 const goalLoaded = ref(false);
 const goalLoading = ref(false);
 const goalData = ref<{ objective: string; status?: string; tokenBudget?: number } | null>(null);
 const goal = computed(() => goalData.value?.objective ?? null);
 const hasGoal = computed(() => Boolean(goal.value?.trim()));
-const selectedModel = computed(() => effectiveModelValue(props.session.agent, props.model, capabilities.value));
-const selectedPermission = computed(() => effectivePermissionValue(props.session.agent, props.permissionMode, capabilities.value));
-const selectedSandbox = computed(() => effectiveSandboxValue(props.sandboxMode, capabilities.value));
-const modelOptions = computed(() => modelControlOptions(props.session.agent, selectedModel.value, capabilities.value));
-const permissionOptions = computed(() => permissionControlOptions(props.session.agent, selectedPermission.value, capabilities.value));
-const sandboxOptions = computed(() => sandboxControlOptions(selectedSandbox.value, capabilities.value));
 const appearance = computed(() => sessionAppearance(props.session.cwd, props.session.agent, props.session.id));
 const displayTitle = computed(() => props.session.title || props.session.cwd.split(/[\\/]/).filter(Boolean).pop() || "Untitled");
 const shortSessionId = computed(() => props.session.id.length > 10 ? `${props.session.id.slice(0, 8)}…` : props.session.id);
@@ -53,9 +31,6 @@ const overflowPosition = ref({ left: 8, top: 8 });
 let goalLoadSequence = 0;
 const runningTasks = computed(() => props.backgroundTasks.filter((task) => task.status === "running"));
 const failedTasks = computed(() => props.backgroundTasks.filter((task) => task.status === "failed" || task.status === "cancelled"));
-async function setModel(event: Event) { await mainSocket.request("set-model", { sessionId: props.session.id, model: (event.target as HTMLSelectElement).value }); }
-async function setPermission(event: Event) { await mainSocket.request("set-permission-mode", { sessionId: props.session.id, mode: (event.target as HTMLSelectElement).value }); }
-async function setSandbox(event: Event) { await mainSocket.request("set-sandbox-mode", { sessionId: props.session.id, mode: (event.target as HTMLSelectElement).value }); }
 async function copyMetadata(value: string, label: "Path" | "Session ID") {
   try {
     if (!navigator.clipboard?.writeText) throw new Error("Clipboard API unavailable");
@@ -77,35 +52,6 @@ async function copyMetadata(value: string, label: "Path" | "Session ID") {
     }
   }
   ui.toast(`${label} copied`);
-}
-async function ensureCapabilities() {
-  if (capabilitiesLoaded.value || capabilitiesLoading.value) return;
-  const sequence = ++capabilitiesSequence;
-  const sessionId = props.session.id;
-  capabilitiesLoading.value = true;
-  try {
-    const result = await mainSocket.request<AgentCapabilities>("get-agent-capabilities", {
-      agent: props.session.agent,
-      cwd: props.session.cwd
-    });
-    if (sequence !== capabilitiesSequence || sessionId !== props.session.id) return;
-    if (
-      !result
-      || result.agent !== props.session.agent
-      || !Array.isArray(result.models)
-      || !Array.isArray(result.permissionModes)
-      || !Array.isArray(result.sandboxModes)
-    ) {
-      capabilitiesLoaded.value = true;
-      return;
-    }
-    capabilities.value = result;
-    capabilitiesLoaded.value = true;
-  } catch {
-    if (sequence === capabilitiesSequence) capabilitiesLoaded.value = true;
-  } finally {
-    if (sequence === capabilitiesSequence) capabilitiesLoading.value = false;
-  }
 }
 function closeOverflow(returnFocus = false) {
   overflowOpen.value = false;
@@ -188,10 +134,6 @@ async function loadGoal() {
   }
 }
 watch(() => [props.session.id, props.session.agent], () => {
-  capabilitiesSequence++;
-  capabilities.value = fallbackAgentCapabilities(props.session.agent);
-  capabilitiesLoading.value = false;
-  capabilitiesLoaded.value = false;
   goalLoadSequence++;
   goalSupported.value = props.session.agent === "codex";
   goalLoaded.value = false;
@@ -253,35 +195,6 @@ onBeforeUnmount(() => clearTimeout(completedTimer));
       </button>
     </div>
   </header>
-  <div class="cw-session-toolbar">
-    <label class="cw-toolbar-select cw-toolbar-model" title="Model">
-      <select class="cw-header-model" :value="selectedModel" aria-label="Model" data-testid="session-model" @pointerdown="ensureCapabilities" @focus="ensureCapabilities" @change="setModel">
-        <option v-for="option in modelOptions" :key="option.value" :value="option.value" :title="option.description || undefined">{{ option.value }}</option>
-      </select>
-      <ChevronDown :size="12" aria-hidden="true" />
-    </label>
-    <label class="cw-toolbar-select cw-toolbar-permission" :title="session.agent === 'codex' ? 'Approval policy' : 'Permission mode'">
-      <select class="cw-header-permission" :value="selectedPermission" :aria-label="session.agent === 'codex' ? 'Approval policy' : 'Permission mode'" data-testid="session-permission" @pointerdown="ensureCapabilities" @focus="ensureCapabilities" @change="setPermission">
-        <option v-for="option in permissionOptions" :key="option.value" :value="option.value" :title="option.description || undefined">{{ option.value }}</option>
-      </select>
-      <ChevronDown :size="12" aria-hidden="true" />
-    </label>
-    <label v-if="session.agent === 'codex'" class="cw-toolbar-select cw-toolbar-sandbox" title="Sandbox mode">
-      <select class="cw-header-sandbox" :value="selectedSandbox" aria-label="Sandbox mode" data-testid="session-sandbox" @pointerdown="ensureCapabilities" @focus="ensureCapabilities" @change="setSandbox">
-        <option v-for="option in sandboxOptions" :key="option.value" :value="option.value" :title="option.description || undefined">{{ option.value }}</option>
-      </select>
-      <ChevronDown :size="12" aria-hidden="true" />
-    </label>
-    <button
-      class="cw-toolbar-stop"
-      data-testid="session-stop"
-      title="Stop turn"
-      aria-label="Stop turn"
-      :disabled="status?.status !== 'running'"
-      @click="mainSocket.request('stop', { sessionId: session.id })"
-    ><Square :size="10" :stroke-width="0" fill="currentColor" /></button>
-    <span v-if="capabilitiesLoading" class="cw-capabilities-loading" title="Reading installed agent capabilities"><LoaderCircle class="cw-spin" :size="12" /></span>
-  </div>
   <Teleport to="body"><template v-if="overflowOpen">
     <button class="cw-popover-scrim" aria-label="Close session actions" @click="closeOverflow(true)" />
     <div ref="overflowMenu" class="cw-action-popover cw-session-context cw-context-menu" role="menu" aria-label="Session actions" :style="{ left: `${overflowPosition.left}px`, top: `${overflowPosition.top}px` }" @keydown="onOverflowKeydown">

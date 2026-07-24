@@ -119,7 +119,7 @@ export interface PendingSessionDraft { id: string; cwd: string; agent: AgentKind
 export type NormalizedBlockKind =
   | "user" | "assistant" | "thinking" | "tool" | "tool-result" | "tool-run"
   | "compact-summary" | "compact-boundary" | "duration" | "api-error"
-  | "local-command" | "task-notification" | "unknown";
+  | "local-command" | "task-notification" | "away-summary" | "unknown";
 
 export interface NormalizedBlock {
   key: string;
