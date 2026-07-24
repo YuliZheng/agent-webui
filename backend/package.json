@@ -1,0 +1,31 @@
+{
+  "name": "@agent-webui/backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/server.js",
+  "types": "dist/server.d.ts",
+  "scripts": {
+    "dev": "tsx watch src/server.ts --port 8787",
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "start": "node dist/server.js"
+  },
+  "dependencies": {
+    "@agent-webui/shared": "0.1.0",
+    "@fastify/compress": "^8.1.0",
+    "@fastify/cookie": "^11.0.2",
+    "@fastify/static": "^10.1.2",
+    "@fastify/websocket": "^11.2.0",
+    "chokidar": "^4.0.3",
+    "fastify": "^5.4.0",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.16.5",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.20.3",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}

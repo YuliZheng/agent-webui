@@ -1,0 +1,45 @@
+{
+  "name": "@agent-webui/shared",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./api": {
+      "types": "./dist/api.d.ts",
+      "default": "./dist/api.js"
+    },
+    "./events": {
+      "types": "./dist/events.d.ts",
+      "default": "./dist/events.js"
+    },
+    "./prefs": {
+      "types": "./dist/prefs.d.ts",
+      "default": "./dist/prefs.js"
+    },
+    "./claude": {
+      "types": "./dist/claude.d.ts",
+      "default": "./dist/claude.js"
+    },
+    "./codex": {
+      "types": "./dist/codex/index.d.ts",
+      "default": "./dist/codex/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}

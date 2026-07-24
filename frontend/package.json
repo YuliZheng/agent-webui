@@ -1,0 +1,38 @@
+{
+  "name": "@agent-webui/frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "vue-tsc --noEmit && vite build",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@agent-webui/shared": "0.1.0",
+    "@shikijs/engine-oniguruma": "^3.8.1",
+    "@shikijs/langs": "^3.8.1",
+    "@shikijs/themes": "^3.8.1",
+    "@vueuse/core": "^13.6.0",
+    "dompurify": "^3.2.6",
+    "idb": "^8.0.3",
+    "lucide-vue-next": "^0.468.0",
+    "markdown-it": "^14.1.0",
+    "pinia": "^3.0.3",
+    "shiki": "^3.8.1",
+    "vue": "^3.5.18"
+  },
+  "devDependencies": {
+    "@types/markdown-it": "^14.1.2",
+    "@vitejs/plugin-vue": "^6.0.1",
+    "@vue/test-utils": "^2.4.6",
+    "autoprefixer": "^10.4.21",
+    "jsdom": "^26.1.0",
+    "postcss": "^8.5.6",
+    "tailwindcss": "^3.4.17",
+    "vite": "^7.0.6",
+    "vitest": "^3.2.4",
+    "vue-tsc": "^3.0.3"
+  }
+}

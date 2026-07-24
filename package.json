@@ -1,0 +1,27 @@
+{
+  "name": "agent-webui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "workspaces": [
+    "shared",
+    "backend",
+    "frontend"
+  ],
+  "scripts": {
+    "dev": "concurrently -k -n backend,frontend -c blue,green \"npm run dev -w @agent-webui/backend\" \"npm run dev -w @agent-webui/frontend\"",
+    "build": "npm run build -w @agent-webui/shared && npm run build -w @agent-webui/frontend && npm run build -w @agent-webui/backend",
+    "test": "npm run test -w @agent-webui/shared && npm run test -w @agent-webui/backend && npm run test -w @agent-webui/frontend && npm run test:scope",
+    "test:scope": "node scripts/audit-scope.mjs",
+    "perf:smoke": "npm run build -w @agent-webui/backend && node --expose-gc scripts/perf-smoke.mjs",
+    "start": "npm run start -w @agent-webui/backend"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

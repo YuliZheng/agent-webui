@@ -1,0 +1,34 @@
+node_modules/
+dist/
+coverage/
+.vite/
+*.log
+
+# Local WebUI state and agent/session data
+.agent-webui/
+.claude/
+.codex/
+attachments/
+previews/
+*.jsonl
+*.sqlite
+*.sqlite3
+*.db
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+
+# Local QA and implementation notes
+.qa-visual/
+progress.md
+
+# Accidental TypeScript config emit
+frontend/vite.config.js
+frontend/vite.config.js.map
