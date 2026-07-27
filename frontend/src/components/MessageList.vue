@@ -94,16 +94,6 @@ const pendingProbeAttempted = new Set<string>();
 const optimisticallyStarting = computed(() =>
   pendingPrompts.value.some(prompt => prompt.phase === "dispatched"),
 );
-// The bottom-most assistant turn — its ContextFooter is the only one that
-// surfaces the Compact / New-chat actions when context fills up.
-const lastAssistantNode = computed<TimelineNode | null>(() => {
-  for (let i = timeline.value.length - 1; i >= 0; i--) {
-    const n = timeline.value[i];
-    if (n && n.kind === "event" && n.block === "AssistantBlock") return n;
-  }
-  return null;
-});
-
 // Backend-queue chips. Walks the jsonl tail backwards from EOF until it
 // hits a clearing event (`assistant`, queue-op remove/dequeue), collecting
 // queue-op enqueue records along the way. `assistant` as a clearing event
@@ -1405,7 +1395,7 @@ function propsFor(entry: { node: TimelineNode; usage: Usage | null }): Record<st
     return { node: entry.node, sessionId: props.sessionId };
   }
   if (entry.node.block === "AssistantBlock") {
-    return { node: entry.node, sessionId: props.sessionId, isLatest: entry.node === lastAssistantNode.value };
+    return { node: entry.node };
   }
   return { node: entry.node };
 }

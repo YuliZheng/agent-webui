@@ -661,6 +661,7 @@ export interface ContextContributor {
     | "agents"
     | "skills"
     | "instructions"
+    | "base"
     | "images"
     | "shell"
     | "browser"
@@ -791,6 +792,7 @@ const CONTRIBUTOR_LABELS: Record<ContextContributor["source"], string> = {
   agents: "AGENTS.md",
   skills: "skills",
   instructions: "system / context",
+  base: "Codex base context",
   images: "images",
   shell: "shell",
   browser: "browser",

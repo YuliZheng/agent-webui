@@ -29,6 +29,18 @@ html, body { overscroll-behavior: none; }
    click delay on some elements). manipulation = pan + pinch only. */
 html { touch-action: manipulation; }
 
+.cw-main-header-meta,
+.cw-main-header-meta button {
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 400;
+  letter-spacing: normal;
+}
+.cw-main-header-meta .cw-agent-badge-label {
+  font: inherit;
+  opacity: 1;
+}
+
 /* Body colors: light default, dark via media query (auto) or .dark class (manual). */
 body { @apply bg-white text-; }
 .dark body { @apply bg-black text-; }
@@ -582,34 +594,12 @@ body { @apply bg-white text-; }
 .dark .cw-context-over {
   color: #fbbf24;
 }
-.cw-context-usage-trigger {
+.cw-context-usage-label {
   display: inline-flex;
-  min-height: 1.75rem;
   align-items: center;
-  gap: 0.2rem;
   padding: 0 0.1rem;
-  border: 0;
-  border-radius: 0;
-  background: transparent;
   color: var(--cw-muted, #6b7280);
   line-height: 1;
-  -webkit-tap-highlight-color: transparent;
-  transition: color 120ms ease, opacity 120ms ease;
-}
-.cw-context-usage-trigger:hover,
-.cw-context-usage-trigger[aria-expanded="true"] {
-  background: transparent;
-  color: var(--cw-text, #111827);
-}
-.cw-context-usage-trigger:focus-visible {
-  outline: none;
-  color: var(--cw-text, #111827);
-  text-decoration: underline;
-  text-underline-offset: 2px;
-}
-.cw-context-usage-chevron {
-  font-size: 0.65rem;
-  opacity: 0.65;
 }
 .cw-context-usage-detail {
   --cw-context-user: #22c55e;
@@ -617,6 +607,7 @@ body { @apply bg-white text-; }
   --cw-context-agents: #f97316;
   --cw-context-skills: #eab308;
   --cw-context-instructions: #64748b;
+  --cw-context-base: #14b8a6;
   --cw-context-images: #84cc16;
   --cw-context-messages: #22c55e;
   --cw-context-tools: #06b6d4;

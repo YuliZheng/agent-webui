@@ -1,11 +1,7 @@
 <script setup lang="ts">
-// Per-turn context readout shown under an end-turn assistant block:
-//   context 92.3k · total 1.0M · usage 9%
-// On the latest turn, once usage crosses ACTION_PCT, it grows inline
-// "Compact here" / "New chat here" actions (same behaviour the old bottom
-// "Long context" banner had — moved here so the prompt to act sits right next
-// to the number that triggers it).
-import { computed, getCurrentInstance, ref } from "vue";
+// Context readout used in the session-details page. The source chart stays
+// expanded so context information has one stable home outside the transcript.
+import { computed, ref } from "vue";
 import { effectiveContextLimit } from "@claude-webui/shared/prefs";
 import { useSessionsStore } from "../../stores/sessions.js";
 import { useSessionSettingsStore } from "../../stores/session-settings.js";
@@ -33,10 +29,6 @@ const props = defineProps<{
   ctxBreakdownFullScanRecords?: number | null;
   ctxBreakdownFallback?: boolean;
 }>();
-const emit = defineEmits<{
-  "open-usage": [];
-}>();
-
 const sessions = useSessionsStore();
 const sessionSettings = useSessionSettingsStore();
 const prefs = usePrefsStore();
@@ -80,15 +72,6 @@ const contributorTitle = computed(() =>
   contributorText.value
     ? `Estimated source attribution reconciled to Codex's reported total: ${contributorText.value}`
     : undefined,
-);
-const usageOpen = ref(false);
-function toggleUsage(): void {
-  usageOpen.value = !usageOpen.value;
-  if (usageOpen.value) emit("open-usage");
-}
-const componentUid = getCurrentInstance()?.uid ?? 0;
-const usagePanelId = computed(
-  () => `context-usage-${props.sessionId.replace(/[^a-zA-Z0-9_-]/g, "-")}-${componentUid}`,
 );
 const contributors = computed(() =>
   (props.ctxContributors ?? []).filter((item) => Number.isFinite(item.tokens) && item.tokens > 0),
@@ -220,24 +203,18 @@ async function startContinuationSession() {
   <div
     v-if="ctxTokens"
     class="cw-context-footer px-4 py-1 text-xs flex flex-wrap items-center gap-x-2 gap-y-1"
-    @keydown.escape="usageOpen = false"
   >
     <span :class="over ? 'cw-context-over' : 'opacity-50'" :title="contextTitle">
       context {{ ctxEstimatedTokens ? "~" : "" }}{{ fmt(ctxTokens) }}<template v-if="limit"> · {{ isCodex ? "compact at" : "total" }} {{ fmt(limit) }}</template>
     </span>
-    <button
+    <span
       v-if="limit"
-      type="button"
-      class="cw-context-usage-trigger"
+      class="cw-context-usage-label"
       :class="{ 'cw-context-over': over }"
-      :aria-expanded="usageOpen"
-      :aria-controls="usagePanelId"
       :title="contributorTitle ?? contextTitle"
-      @click="toggleUsage"
     >
       usage {{ usageText }}
-      <span class="cw-context-usage-chevron" aria-hidden="true">{{ usageOpen ? "▴" : "▾" }}</span>
-    </button>
+    </span>
     <span v-if="showActions" class="cw-context-actions">
       <button
         type="button"
@@ -256,8 +233,7 @@ async function startContinuationSession() {
       {{ compactError || continuationError }}
     </span>
     <div
-      v-if="usageOpen && limit"
-      :id="usagePanelId"
+      v-if="limit"
       class="cw-context-usage-detail"
       role="region"
       aria-label="Context usage details"
@@ -310,7 +286,7 @@ async function startContinuationSession() {
           </div>
           <div class="cw-context-usage-note">
             <template v-if="ctxBreakdownFullScanRecords !== null && ctxBreakdownFullScanRecords !== undefined">
-              Every physical rollout record was scanned. Context that Codex does not represent as rollout rows—such as hidden base instructions and tool schemas—stays under “unattributed context”; known rows are never inflated to fill it.
+              Every physical rollout record was scanned. The stable first-turn residual is shown as “Codex base context” because Codex counts its hidden base instructions and tool schemas without writing them as rollout rows. Only the remaining changing estimate gap stays under “unattributed context”; known rows are never inflated to fill it.
             </template>
             <template v-else>
               Source attribution is approximate because Codex reports only the total. Missing or unloaded context stays under “unattributed context”; known rows are never inflated to fill it.

@@ -126,6 +126,11 @@ describe("message display style CSS", () => {
     expect(pillRowVue).toContain("var(--cw-pill-bg");
     expect(pillRowVue).toContain("var(--cw-popover-bg");
     expect(promptInputVue).toContain("cw-image-remove-button");
+    expect(promptInputVue).toContain("useLightboxStore");
+    expect(promptInputVue).toContain("lightbox.open(img.dataUrl");
+    expect(promptInputVue.match(/@click="previewImage\(img\)"/g)).toHaveLength(2);
+    expect(promptInputVue.match(/@click\.stop="removeImage\(img\.id\)"/g)).toHaveLength(2);
+    expect(promptInputVue).toContain("cursor-zoom-in");
     expect(promptInputVue).toContain("cw-wechat-resize-handle");
     expect(promptInputVue).toContain("showSendButton");
     expect(promptInputVue).toContain("isDesktopViewport");
@@ -296,27 +301,27 @@ describe("message display style CSS", () => {
     expect(css).toContain(".cw-context-over");
   });
 
-  it("keeps context source details behind a toggleable usage chart", () => {
-    expect(contextFooterVue).toContain(':aria-expanded="usageOpen"');
-    expect(contextFooterVue).toContain('@click="toggleUsage"');
-    expect(contextFooterVue).toContain('emit("open-usage")');
-    expect(contextFooterVue).toContain('v-if="usageOpen && limit"');
+  it("keeps the context source chart expanded without a disclosure arrow", () => {
+    expect(contextFooterVue).not.toContain("usageOpen");
+    expect(contextFooterVue).not.toContain("toggleUsage");
+    expect(contextFooterVue).not.toContain("cw-context-usage-chevron");
+    expect(contextFooterVue).toContain('v-if="limit"');
     expect(contextFooterVue).toContain("Scanning the full rollout for source attribution");
     expect(contextFooterVue).toContain("Full rollout scan complete");
     expect(contextFooterVue).toContain("bounded compatibility fallback until restart");
     expect(contextFooterVue).not.toContain("sources {{ contributorText }}");
     expect(contextFooterVue).toContain("Source attribution is approximate because Codex reports only the total.");
     expect(contextFooterVue).toContain("unattributed context");
+    expect(contextFooterVue).toContain("Codex base context");
+    expect(css).toContain("--cw-context-base");
     expect(contextFooterVue).toContain("rows sum to this total");
     expect(contextFooterVue).toContain("~1.8k default visual estimate");
     expect(contextFooterVue).toContain("hosted image-generation cost is separate from context tokens");
     expect(contextFooterVue).toContain("Tool results are capped at ~2k each.");
     expect(css).toContain(".cw-context-usage-chart");
     expect(contextFooterVue).toContain("conic-gradient");
-    expect(css).toContain(".cw-context-usage-trigger");
-    expect(css).toContain("background: transparent");
-    expect(css).toContain("border: 0");
+    expect(css).toContain(".cw-context-usage-label");
+    expect(css).not.toContain(".cw-context-usage-trigger");
     expect(css).toContain("grid-template-columns: minmax(0, 1fr)");
-    expect(css).toContain("text-decoration: underline");
   });
 });

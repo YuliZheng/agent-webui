@@ -7,6 +7,7 @@ import { useImageDraftsStore, type PendingImage } from "../stores/image-drafts.j
 import { usePrefsStore } from "../stores/prefs.js";
 import { useNotificationsStore } from "../stores/notifications.js";
 import { useUiStore } from "../stores/ui.js";
+import { useLightboxStore } from "../stores/lightbox.js";
 import { usePromptPendingStore } from "../stores/prompt-pending.js";
 import { useSessionCacheStore } from "../stores/session-cache.js";
 import { useSessionSkillsStore } from "../stores/session-skills.js";
@@ -16,6 +17,8 @@ import SlashCommandMenu from "./SlashCommandMenu.vue";
 import { useSessionSettingsStore } from "../stores/session-settings.js";
 import { promotePendingDraft } from "../stores/live.js";
 import { parseLocalCommand, runLocalCommand, latestContextUsage, HIDDEN_CLI_COMMANDS } from "../util/local-commands.js";
+import { APP_BACK_PRIORITY, registerAppBackHandler } from "../util/app-back.js";
+import { setPwaLayerActive } from "../util/pwa-history.js";
 
 const props = defineProps<{ sessionId: string; running: boolean }>();
 const emit = defineEmits<{ "mobile-composer-focus": [] }>();
@@ -24,6 +27,7 @@ const drafts = useDraftsStore();
 const imageDrafts = useImageDraftsStore();
 const prefs = usePrefsStore();
 const sessions = useSessionsStore();
+let unregisterAppBack: (() => void) | undefined;
 
 // Returns the trigger keyword IF it should be appended to the outgoing
 // message, or "" if not (off, or already present in the typed text).
@@ -53,6 +57,7 @@ function idempotencyFingerprint(value: string): string {
 }
 const notifications = useNotificationsStore();
 const ui = useUiStore();
+const lightbox = useLightboxStore();
 const promptPending = usePromptPendingStore();
 const sessionCache = useSessionCacheStore();
 const sessionSettings = useSessionSettingsStore();
@@ -184,6 +189,11 @@ function removeImage(imgId: string) {
   imageDrafts.remove(props.sessionId, imgId);
 }
 
+function previewImage(img: PendingImage) {
+  if (isPdfDraft(img.mime)) return;
+  lightbox.open(img.dataUrl, img.name ?? "待发送图片");
+}
+
 function imagePayload(): OutgoingImage[] {
   return pendingImages.value.map((p) => ({ mime: p.mime, data: p.base64 }));
 }
@@ -196,6 +206,16 @@ const text = computed<string>({
 const caret = ref(0);
 const sessionIdRef = computed(() => props.sessionId);
 const slash = useSlashMenu({ text, caret, sessionId: sessionIdRef });
+watch(
+  [() => slash.open.value, attachmentTrayOpen],
+  ([slashOpen, trayOpen]) => {
+    setPwaLayerActive(
+      `composer-overlay:${props.sessionId}`,
+      slashOpen || trayOpen,
+      props.sessionId,
+    );
+  },
+);
 
 // Recompute the menu whenever the caret might have moved or content changed.
 function syncSlash() {
@@ -600,6 +620,17 @@ watch(
 );
 
 onMounted(() => {
+  unregisterAppBack = registerAppBackHandler(() => {
+    if (slash.open.value) {
+      slash.close();
+      return true;
+    }
+    if (attachmentTrayOpen.value) {
+      attachmentTrayOpen.value = false;
+      return true;
+    }
+    return false;
+  }, APP_BACK_PRIORITY.menu);
   if (typeof window.matchMedia === "function") {
     desktopViewportQuery = window.matchMedia("(min-width: 768px)");
     updateDesktopViewport(desktopViewportQuery);
@@ -607,6 +638,7 @@ onMounted(() => {
   }
 });
 onBeforeUnmount(() => {
+  unregisterAppBack?.();
   desktopViewportQuery?.removeEventListener("change", updateDesktopViewport);
   desktopViewportQuery = null;
   stopWechatComposerResize();
@@ -679,14 +711,22 @@ onBeforeUnmount(() => {
           class="relative group border border-[var(--cw-border)]  rounded overflow-hidden"
           :title="`${img.name ?? img.mime} · ${(img.bytes / 1024).toFixed(0)} KB`"
         >
-          <img v-if="!isPdfDraft(img.mime)" :src="img.dataUrl" alt="" class="block h-16 w-16 object-cover" />
+          <button
+            v-if="!isPdfDraft(img.mime)"
+            type="button"
+            class="block cursor-zoom-in"
+            :aria-label="`预览 ${img.name ?? '待发送图片'}`"
+            @click="previewImage(img)"
+          >
+            <img :src="img.dataUrl" alt="" class="block h-16 w-16 object-cover" />
+          </button>
           <div v-else class="cw-pdf-draft-chip flex items-center gap-1.5 h-16 px-2 max-w-40 text-xs text-[var(--cw-text)]  bg-[var(--cw-panel-2)] ">
             <span aria-hidden="true">📄</span>
             <span class="truncate pr-4">{{ img.name ?? "PDF" }}</span>
           </div>
           <button
             class="cw-image-remove-button absolute top-0 right-0 bg-black/60 text-white text-xs leading-none px-1.5 py-0.5 rounded-bl opacity-80 hover:opacity-100"
-            @click="removeImage(img.id)"
+            @click.stop="removeImage(img.id)"
             title="Remove"
           >×</button>
         </div>
@@ -765,14 +805,22 @@ onBeforeUnmount(() => {
         class="relative group border border-[var(--cw-border)]  rounded overflow-hidden"
         :title="`${img.name ?? img.mime} · ${(img.bytes / 1024).toFixed(0)} KB`"
       >
-        <img v-if="!isPdfDraft(img.mime)" :src="img.dataUrl" alt="" class="block h-16 w-16 object-cover" />
+        <button
+          v-if="!isPdfDraft(img.mime)"
+          type="button"
+          class="block cursor-zoom-in"
+          :aria-label="`预览 ${img.name ?? '待发送图片'}`"
+          @click="previewImage(img)"
+        >
+          <img :src="img.dataUrl" alt="" class="block h-16 w-16 object-cover" />
+        </button>
         <div v-else class="cw-pdf-draft-chip flex items-center gap-1.5 h-16 px-2 max-w-40 text-xs text-[var(--cw-text)]  bg-[var(--cw-panel-2)] ">
           <span aria-hidden="true">📄</span>
           <span class="truncate pr-4">{{ img.name ?? "PDF" }}</span>
         </div>
         <button
           class="cw-image-remove-button absolute top-0 right-0 bg-black/60 text-white text-xs leading-none px-1.5 py-0.5 rounded-bl opacity-80 hover:opacity-100"
-          @click="removeImage(img.id)"
+          @click.stop="removeImage(img.id)"
           title="Remove"
         >×</button>
       </div>

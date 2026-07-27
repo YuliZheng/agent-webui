@@ -4,6 +4,8 @@ import { readLocalFile, type LocalFileResponse } from "../api/local-files.js";
 import { highlightToHtml } from "../render/shiki.js";
 import { useLocalFileViewerStore } from "../stores/local-file-viewer.js";
 import { useUiStore } from "../stores/ui.js";
+import { APP_BACK_PRIORITY, registerAppBackHandler } from "../util/app-back.js";
+import { setPwaLayerActive } from "../util/pwa-history.js";
 import { useDark } from "../util/theme.js";
 
 const viewer = useLocalFileViewerStore();
@@ -15,6 +17,7 @@ const file = ref<LocalFileResponse | null>(null);
 const highlightedLines = ref<string[]>([]);
 const dark = useDark();
 let loadToken = 0;
+let unregisterAppBack: (() => void) | undefined;
 
 const active = computed(() => viewer.open && viewer.sessionId === ui.selectedSessionId);
 const title = computed(() => {
@@ -119,6 +122,9 @@ async function load() {
 }
 
 watch(() => [active.value, viewer.path, viewer.line] as const, () => { void load(); }, { immediate: true });
+watch(active, open => {
+  setPwaLayerActive("local-file-viewer", open, ui.selectedSessionId);
+});
 watch(dark, async () => {
   if (!active.value || !file.value) return;
   const token = ++loadToken;
@@ -136,8 +142,18 @@ function onKey(e: KeyboardEvent) {
   }
 }
 
-onMounted(() => window.addEventListener("keydown", onKey));
-onUnmounted(() => window.removeEventListener("keydown", onKey));
+onMounted(() => {
+  window.addEventListener("keydown", onKey);
+  unregisterAppBack = registerAppBackHandler(() => {
+    if (!active.value) return false;
+    close();
+    return true;
+  }, APP_BACK_PRIORITY.surface);
+});
+onUnmounted(() => {
+  unregisterAppBack?.();
+  window.removeEventListener("keydown", onKey);
+});
 </script>
 
 <template>

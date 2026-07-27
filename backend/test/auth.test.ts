@@ -223,6 +223,7 @@ describe("token authentication", () => {
     expect(result.json()).toMatchObject({
       completeHistoryScan: true,
       recordsScanned: 3,
+      compactionCount: 0,
       tokens: 1_000,
       reportedTokens: 1_000,
       limit: 200_000,

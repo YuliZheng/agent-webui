@@ -13,8 +13,9 @@ import { avatarGradient, avatarText, gradientForIndex, paletteColor } from "../u
 import { imTime } from "../util/time.js";
 import { nowMs, formatElapsed } from "../util/now-tick.js";
 import { currentTurnBackgroundTasks } from "../util/runtime-work.js";
+import { APP_BACK_PRIORITY, registerAppBackHandler } from "../util/app-back.js";
+import { setPwaLayerActive } from "../util/pwa-history.js";
 import { retitleSession, setSessionTitle } from "../api/sessions.js";
-import AgentBadge from "./AgentBadge.vue";
 
 // Module-scoped — only one row across the whole sidebar can be in the
 // swiped-open state at a time. Opening a different row collapses any
@@ -45,7 +46,6 @@ const bgRunning = computed(() => currentTurnBackgroundTasks(
   item.value?.agent === "codex" ? item.value.lastBoundaryAt : undefined,
 ).length);
 
-const agent = computed(() => item.value?.agent ?? "claude");
 const status = computed(() => sessions.statusBySession[props.id] ?? null);
 const selected = computed(() => ui.selectedSessionId === props.id);
 const cwd = computed(() => displayCwd(item.value?.cwd, ui.home));
@@ -190,6 +190,9 @@ let suppressBlurCommit = false;
 // touch point) or right-click on desktop (anchored at mouse cursor).
 // Closes on outside-click or after any action.
 const menuOpen = ref(false);
+watch([menuOpen, editing], ([menu, rename]) => {
+  setPwaLayerActive(`session-row:${props.id}`, menu || rename, ui.selectedSessionId);
+});
 const menuStyle = ref<{ top: string; left: string }>({ top: "0", left: "0" });
 
 function pick() { ui.select(props.id); }
@@ -562,8 +565,20 @@ function closeMenu() {
   document.removeEventListener("click", onDocClick);
 }
 function onDocClick() { closeMenu(); }
+const unregisterAppBack = registerAppBackHandler(() => {
+  if (menuOpen.value) {
+    closeMenu();
+    return true;
+  }
+  if (editing.value) {
+    cancelRename();
+    return true;
+  }
+  return false;
+}, APP_BACK_PRIORITY.menu);
 
 onBeforeUnmount(() => {
+  unregisterAppBack();
   document.removeEventListener("click", onDocClick);
   document.removeEventListener("pointerdown", onOutsideTap);
   clearTrayHideTimer();
@@ -752,10 +767,6 @@ function onTitleKey(e: KeyboardEvent) {
       :style="{ background: avatarBg }"
       :title="cwd"
     >{{ avatarChar }}
-      <!-- Agent badge: which backend owns this session (claude vs codex). -->
-      <span class="absolute -bottom-1 -right-1">
-        <AgentBadge :agent="agent" :size="16" />
-      </span>
     </div>
 
     <!-- Middle column: takes the full remaining width.

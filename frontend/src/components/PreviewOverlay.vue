@@ -2,6 +2,8 @@
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { usePreviewModalStore } from "../stores/preview-modal.js";
 import { useUiStore } from "../stores/ui.js";
+import { APP_BACK_PRIORITY, registerAppBackHandler } from "../util/app-back.js";
+import { setPwaLayerActive } from "../util/pwa-history.js";
 
 // Iframe-only overlay. The preview's title bar lives in MainPane's <header>
 // (swapped in when active) so there's a single bar that aligns with the
@@ -13,6 +15,7 @@ const modal = usePreviewModalStore();
 const ui = useUiStore();
 const stale = ref(false);
 const checking = ref(false);
+let unregisterAppBack: (() => void) | undefined;
 
 const active = computed(() => modal.open && modal.sessionId === ui.selectedSessionId);
 const iframeSrc = computed(() => (active.value ? window.location.origin + modal.path : ""));
@@ -38,7 +41,10 @@ async function checkStale() {
   }
 }
 
-watch(active, (v) => { if (v) checkStale(); });
+watch(active, (v) => {
+  setPwaLayerActive("preview-overlay", v, ui.selectedSessionId);
+  if (v) checkStale();
+});
 
 function onKey(e: KeyboardEvent) {
   if (e.key === "Escape" && active.value) {
@@ -47,8 +53,18 @@ function onKey(e: KeyboardEvent) {
   }
 }
 
-onMounted(() => window.addEventListener("keydown", onKey));
-onUnmounted(() => window.removeEventListener("keydown", onKey));
+onMounted(() => {
+  window.addEventListener("keydown", onKey);
+  unregisterAppBack = registerAppBackHandler(() => {
+    if (!active.value) return false;
+    modal.close();
+    return true;
+  }, APP_BACK_PRIORITY.surface);
+});
+onUnmounted(() => {
+  unregisterAppBack?.();
+  window.removeEventListener("keydown", onKey);
+});
 </script>
 
 <template>

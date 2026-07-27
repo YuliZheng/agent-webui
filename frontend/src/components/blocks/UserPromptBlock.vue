@@ -9,6 +9,8 @@ import { useNotificationsStore } from "../../stores/notifications.js";
 import { useLightboxStore } from "../../stores/lightbox.js";
 import { usePrefsStore } from "../../stores/prefs.js";
 import { extractAttachedImages } from "../../util/extract-images.js";
+import { APP_BACK_PRIORITY, registerAppBackHandler } from "../../util/app-back.js";
+import { setPwaLayerActive } from "../../util/pwa-history.js";
 import ChatImage from "./ChatImage.vue";
 import UserAvatar from "../UserAvatar.vue";
 
@@ -117,6 +119,7 @@ const previewLikelyCollapsible = computed(() =>
 const collapsible = computed(() => canCollapse.value || previewLikelyCollapsible.value);
 const bodyCollapsed = computed(() => preview.value ? collapsed.value : (collapsible.value && collapsed.value));
 let resizeObserver: ResizeObserver | null = null;
+let unregisterAppBack: (() => void) | undefined;
 
 function measureCollapse() {
   const el = promptBody.value;
@@ -125,11 +128,17 @@ function measureCollapse() {
 }
 
 onMounted(() => {
+  unregisterAppBack = registerAppBackHandler(() => {
+    if (!menuOpen.value) return false;
+    closeMenu();
+    return true;
+  }, APP_BACK_PRIORITY.menu);
   resizeObserver = new ResizeObserver(measureCollapse);
   if (promptBody.value) resizeObserver.observe(promptBody.value);
   void nextTick(measureCollapse);
 });
 onBeforeUnmount(() => {
+  unregisterAppBack?.();
   resizeObserver?.disconnect();
   resizeObserver = null;
 });
@@ -209,6 +218,13 @@ async function fork() {
 // triggers it (and never fights text selection).
 const actionable = computed(() => !!(props.sessionId && uuid.value));
 const menuOpen = ref(false);
+watch(menuOpen, open => {
+  setPwaLayerActive(
+    `message-menu:${uuid.value ?? "pending"}`,
+    open,
+    props.sessionId ?? ui.selectedSessionId,
+  );
+});
 const menuX = ref(0);
 const menuY = ref(0);
 const menuEl = ref<HTMLDivElement | null>(null);

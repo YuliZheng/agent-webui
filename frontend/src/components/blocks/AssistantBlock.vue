@@ -5,42 +5,17 @@ import { renderMarkdown } from "../../render/markdown.js";
 import { observeCodeFences } from "../../render/code-fence-mounting.js";
 import { useDark } from "../../util/theme.js";
 import ToolCall from "./tool/ToolCall.vue";
-import ContextFooter from "./ContextFooter.vue";
-import {
-  readFullCodexContextUsage,
-  readSessionRange,
-  rephrasePrompt,
-} from "../../api/sessions.js";
-import type { LineEntry } from "../../api/sessions.js";
+import { rephrasePrompt } from "../../api/sessions.js";
 import { useUiStore } from "../../stores/ui.js";
 import { useDraftsStore } from "../../stores/drafts.js";
 import { useNotificationsStore } from "../../stores/notifications.js";
-import { useSessionsStore } from "../../stores/sessions.js";
-import { useSessionCacheStore } from "../../stores/session-cache.js";
-import { useSessionSettingsStore } from "../../stores/session-settings.js";
-import { usePrefsStore } from "../../stores/prefs.js";
-import { effectiveContextLimit } from "@claude-webui/shared/prefs";
-import { latestCodexContextUsage } from "../../util/local-commands.js";
-import type { ContextUsage } from "../../util/local-commands.js";
-import {
-  hasLoadedCodexUsageBoundary,
-  mergeIndexedUsageLines,
-  needsCodexUsageBackfill,
-  USAGE_BACKFILL_MAX_LINES,
-} from "../../util/context-usage-history.js";
 
 const props = defineProps<{
   node: Extract<TimelineNode, { kind: "event" }>;
-  sessionId?: string;
-  isLatest?: boolean;
 }>();
 const ui = useUiStore();
 const drafts = useDraftsStore();
 const notifications = useNotificationsStore();
-const sessions = useSessionsStore();
-const sessionCache = useSessionCacheStore();
-const sessionSettings = useSessionSettingsStore();
-const prefs = usePrefsStore();
 
 interface Item { kind: "text" | "tool" | "thinking"; text?: string; pair?: ToolPair }
 
@@ -81,8 +56,6 @@ const items = computed<Item[]>(() => {
 const thinkingItems = computed(() => items.value.filter((it) => it.kind === "thinking"));
 const contentItems = computed(() => items.value.filter((it) => it.kind !== "thinking"));
 const showThinking = ref(false);
-
-const isEndTurn = computed(() => message.value.stop_reason === "end_turn");
 
 // Anthropic Usage Policy refusal. Claude Code emits this as a normal assistant
 // text record (not isApiErrorMessage), so AssistantApiErrorBlock doesn't catch
@@ -126,140 +99,6 @@ async function onRephrase() {
     rephraseErr.value = (e as Error).message || "rephrase failed";
   }
 }
-
-// Session id for the context footer's actions. Prefer the prop (passed by the
-// timeline); fall back to the globally-selected session.
-const footerSessionId = computed(() => props.sessionId || ui.selectedSessionId || "");
-
-const isCodex = computed(() => sessions.byId[footerSessionId.value]?.agent === "codex");
-
-const usageOlderLines = ref<LineEntry[]>([]);
-const usageBackfillLoading = ref(false);
-const usageBackfillAttempted = ref(false);
-const usageBackfillError = ref("");
-const usageBackfillFrom = ref<number | null>(null);
-const usageBackfillTruncated = ref(false);
-const fullCodexUsage = ref<ContextUsage | null>(null);
-const usageFullScanRecords = ref<number | null>(null);
-const usageUsingFallback = ref(false);
-const codexUsageLines = computed(() => {
-  const cached = sessionCache.bySession[footerSessionId.value]?.lines ?? [];
-  return usageOlderLines.value.length
-    ? mergeIndexedUsageLines(usageOlderLines.value, cached)
-    : cached;
-});
-const usageBackfillLimited = computed(() =>
-  !fullCodexUsage.value
-  && usageBackfillAttempted.value
-  && (
-    usageBackfillTruncated.value
-    || (
-      (usageBackfillFrom.value ?? 0) > 0
-      && !hasLoadedCodexUsageBoundary(codexUsageLines.value)
-    )
-  ),
-);
-
-watch(footerSessionId, () => {
-  usageOlderLines.value = [];
-  usageBackfillLoading.value = false;
-  usageBackfillAttempted.value = false;
-  usageBackfillError.value = "";
-  usageBackfillFrom.value = null;
-  usageBackfillTruncated.value = false;
-  fullCodexUsage.value = null;
-  usageFullScanRecords.value = null;
-  usageUsingFallback.value = false;
-});
-
-// Codex carries no per-message usage (codex-adapt drops token_count), so its
-// context occupancy is session-level: read the latest token_count from the
-// rollout. Claude keeps the per-turn usage on the assistant message itself.
-const codexUsage = computed(() =>
-  isCodex.value && props.isLatest
-    ? (
-        fullCodexUsage.value
-        ?? latestCodexContextUsage(
-          codexUsageLines.value,
-          prefs.codexAutoCompactWindow,
-        )
-      )
-    : null,
-);
-
-async function loadCodexUsageBreakdown(): Promise<void> {
-  if (!isCodex.value || usageBackfillLoading.value) return;
-  if (usageBackfillAttempted.value && !usageBackfillError.value) return;
-  const id = footerSessionId.value;
-  const entry = sessionCache.bySession[id];
-  if (!id || !entry) return;
-
-  usageBackfillLoading.value = true;
-  usageBackfillError.value = "";
-  usageUsingFallback.value = false;
-  try {
-    try {
-      const full = await readFullCodexContextUsage(id, prefs.codexAutoCompactWindow);
-      fullCodexUsage.value = full;
-      usageFullScanRecords.value = full.recordsScanned;
-      usageBackfillAttempted.value = true;
-      return;
-    } catch {
-      // The currently running backend may predate the full-scan endpoint.
-      // Preserve the bounded range path until the user restarts into the build
-      // that contains it.
-      usageUsingFallback.value = true;
-    }
-
-    if (!needsCodexUsageBackfill(entry.firstLoadedIndex, codexUsageLines.value)) {
-      usageBackfillAttempted.value = true;
-      return;
-    }
-
-    const to = entry.firstLoadedIndex;
-    const from = Math.max(0, to - USAGE_BACKFILL_MAX_LINES);
-    usageBackfillFrom.value = from;
-    const response = await readSessionRange(id, from, to);
-    usageOlderLines.value = response.lines.filter(
-      (line): line is LineEntry => Number.isSafeInteger(line.index) && typeof line.raw === "string" && !!line.raw,
-    );
-    const lastReturnedIndex = usageOlderLines.value.reduce(
-      (last, line) => Math.max(last, line.index),
-      from - 1,
-    );
-    usageBackfillTruncated.value = to > from && lastReturnedIndex < to - 1;
-    usageBackfillAttempted.value = true;
-  } catch (error) {
-    usageBackfillAttempted.value = true;
-    usageBackfillError.value = error instanceof Error ? error.message : String(error);
-  } finally {
-    usageBackfillLoading.value = false;
-  }
-}
-
-// Context-window usage = everything fed to the model on this call.
-const ctxTokens = computed(() => {
-  if (isCodex.value) return codexUsage.value?.tokens ?? 0;
-  const u = message.value.usage;
-  if (!u) return 0;
-  return (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0);
-});
-
-// Effective limit handed to the footer (always concrete number|null — never
-// undefined, which exactOptionalPropertyTypes would reject). The rollout parser
-// resolves Codex's real auto-compact boundary. Claude uses its model window
-// capped by autoCompactWindow.
-const footerCtxLimit = computed<number | null>(() =>
-  isCodex.value
-    ? (codexUsage.value?.limit ?? null)
-    : effectiveContextLimit(sessionSettings.effective(footerSessionId.value).model, false, prefs.autoCompactWindow),
-);
-
-// When to show the footer: Claude on each end-turn block; Codex on the latest
-// assistant block of the session (no per-turn end_turn signal there).
-const showFooter = computed(
-  () => (isCodex.value ? !!props.isLatest : isEndTurn.value) && !!ctxTokens.value && !!footerSessionId.value,
-);
 
 const root = ref<HTMLDivElement | null>(null);
 const dark = useDark();
@@ -342,21 +181,5 @@ watch(dark, () => rehighlight(), { flush: "post" });
       />
       <ToolCall v-else-if="it.kind === 'tool' && it.pair" :pair="it.pair" />
     </template>
-    <ContextFooter
-      v-if="showFooter"
-      :session-id="footerSessionId"
-      :ctx-tokens="ctxTokens"
-      :is-latest="!!isLatest"
-      :ctx-limit="footerCtxLimit"
-      :ctx-reported-tokens="codexUsage?.reportedTokens"
-      :ctx-estimated-tokens="codexUsage?.estimatedTokens"
-      :ctx-contributors="codexUsage?.contributors"
-      :ctx-breakdown-loading="usageBackfillLoading"
-      :ctx-breakdown-limited="usageBackfillLimited"
-      :ctx-breakdown-error="usageBackfillError"
-      :ctx-breakdown-full-scan-records="usageFullScanRecords"
-      :ctx-breakdown-fallback="usageUsingFallback"
-      @open-usage="loadCodexUsageBreakdown"
-    />
   </div>
 </template>

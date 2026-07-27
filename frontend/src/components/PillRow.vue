@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref, onMounted, nextTick } from "vue";
+import { computed, onBeforeUnmount, ref, onMounted, nextTick, watch } from "vue";
 import { MODEL_CHOICES, CODEX_MODEL_CHOICES, CODEX_DEFAULT_MODEL, CODEX_APPROVAL_PRESETS, CODEX_DEFAULT_APPROVAL, PERMISSION_MODES } from "@claude-webui/shared/prefs";
 import { useSessionSettingsStore } from "../stores/session-settings.js";
 import { useSessionsStore } from "../stores/sessions.js";
@@ -12,8 +12,11 @@ import {
   setSessionServiceTier,
   stopSession,
 } from "../api/sessions.js";
+import { APP_BACK_PRIORITY, registerAppBackHandler } from "../util/app-back.js";
+import { setPwaLayerActive } from "../util/pwa-history.js";
 
 const props = defineProps<{ sessionId: string }>();
+let unregisterAppBack: (() => void) | undefined;
 
 const settings = useSessionSettingsStore();
 const sessions = useSessionsStore();
@@ -100,6 +103,9 @@ const permLabel = computed(() => currentPerm.value || "(default)");
 
 // Popover state. Only one open at a time — opening the other closes the first.
 const open = ref<null | "model" | "effort" | "perm">(null);
+watch(open, value => {
+  setPwaLayerActive(`pill-menu:${props.sessionId}`, value !== null, props.sessionId);
+});
 // Pill triggers + the floating popover are anchored via fixed coordinates and
 // Teleported to <body>. The claude-code desktop composer (.cw-cc-composer) has
 // `overflow: hidden` to clip its rounded corners, which would otherwise slice
@@ -152,11 +158,17 @@ function onKey(e: KeyboardEvent) {
 }
 function onResize() { if (open.value) close(); }
 onMounted(() => {
+  unregisterAppBack = registerAppBackHandler(() => {
+    if (!open.value) return false;
+    close();
+    return true;
+  }, APP_BACK_PRIORITY.menu);
   document.addEventListener("click", onDocClick);
   document.addEventListener("keydown", onKey);
   window.addEventListener("resize", onResize);
 });
 onBeforeUnmount(() => {
+  unregisterAppBack?.();
   document.removeEventListener("click", onDocClick);
   document.removeEventListener("keydown", onKey);
   window.removeEventListener("resize", onResize);

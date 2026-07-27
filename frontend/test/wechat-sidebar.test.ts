@@ -28,6 +28,7 @@ describe("WeChat sidebar parity", () => {
   });
 
   it("uses the softer WeChat gray hierarchy and text-column dividers", () => {
+    expect(sessionRow).not.toContain("AgentBadge");
     expect(css).toContain("--cw-shell-bg: #1e1e1f");
     expect(css).toContain("--cw-panel-bg: #2f2f30");
     expect(css).toContain("--cw-control-bg: #3a3a3b");
@@ -42,7 +43,15 @@ describe("WeChat sidebar parity", () => {
     );
   });
 
-  it("uses a search-first compact header in the WeChat skin", () => {
+  it("uses native mobile and search-first desktop headers in the WeChat skin", () => {
+    expect(sidebar).toContain("cw-wechat-mobile-home-header");
+    expect(sidebar).toContain('会话<span v-if="totalVisibleUnread > 0">');
+    expect(sidebar).toContain("mobileUnreadLabel");
+    expect(sidebar).toContain('aria-controls="cw-mobile-header-menu"');
+    expect(sidebar).toContain(">新建会话</button>");
+    expect(sidebar).toContain('flatMode ? "按文件夹分组" : "按最近排序"');
+    expect(sidebar).toContain(">设置</button>");
+    expect(sidebar).toContain("'hidden flex-1 min-w-0 md:flex'");
     expect(sidebar).toContain("cw-sidebar-search-trigger");
     expect(sidebar).toContain(">搜索</span>");
     expect(sidebar).not.toContain("搜索聊天");

@@ -54,6 +54,7 @@ describe("full Codex context usage scan", () => {
 
     expect(result.completeHistoryScan).toBe(true);
     expect(result.recordsScanned).toBe(lines.length);
+    expect(result.compactionCount).toBe(1);
     expect(result.tokens).toBe(100_000);
     expect(result.contributors?.some((item) => item.source === "assistant")).toBe(false);
     expect(result.contributors?.find((item) => item.source === "user")?.tokens).toBeGreaterThan(25_000);
@@ -83,5 +84,29 @@ describe("full Codex context usage scan", () => {
     expect(result.oversizedRecords).toBe(1);
     expect(result.contributors?.find((item) => item.source === "shell")?.tokens).toBeGreaterThanOrEqual(2_000);
     expect(result.contributors?.reduce((sum, item) => sum + item.tokens, 0)).toBe(8_000);
+  });
+
+  it("carries the calibrated hidden base context across compaction", async () => {
+    const lines = [
+      response({
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "first request" }],
+      }),
+      usage(10_000),
+      JSON.stringify({ type: "event_msg", payload: { type: "context_compacted" } }),
+      response({
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "next request" }],
+      }),
+      usage(15_000),
+    ];
+    const result = await fullCodexContextUsage(await rollout(lines));
+
+    expect(result.compactionCount).toBe(1);
+    expect(result.contributors?.find((item) => item.source === "base")?.tokens).toBeGreaterThan(9_000);
+    expect(result.contributors?.find((item) => item.source === "other")?.tokens).toBeGreaterThan(4_000);
+    expect(result.contributors?.reduce((sum, item) => sum + item.tokens, 0)).toBe(15_000);
   });
 });

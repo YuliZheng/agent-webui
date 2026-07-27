@@ -14,6 +14,8 @@ import { applyTheme, syncThemeColor } from "./util/theme.js";
 import { getMe } from "./api/me.js";
 import { adaptBackendPrefs } from "./api/prefs.js";
 import { isOrdinarySidebarSessionVisible } from "./util/session-visibility.js";
+import { dispatchAppBack } from "./util/app-back.js";
+import { handlePwaPopState, initializeAppHistory } from "./util/pwa-history.js";
 
 const sessions = useSessionsStore();
 const prefs = usePrefsStore();
@@ -81,6 +83,15 @@ function initialSessionFromUrl(): string | null {
 }
 
 function onPopState(e: PopStateEvent) {
+  const pwaResult = handlePwaPopState(
+    ui.selectedSessionId,
+    e.state,
+    () => dispatchAppBack(),
+  );
+  if (pwaResult.handled) {
+    if ("selection" in pwaResult) ui.selectFromHistory(pwaResult.selection ?? null);
+    return;
+  }
   const fromState = (e.state as { sessionId?: string | null } | null)?.sessionId;
   const id = fromState ?? initialSessionFromUrl();
   ui.selectFromHistory(id ?? null);
@@ -115,7 +126,7 @@ onMounted(async () => {
     // popstate (mouse-back / mobile back-gesture) to switch sessions.
     const initialId = initialSessionFromUrl();
     if (initialId) ui.selectFromHistory(initialId);
-    window.history.replaceState({ sessionId: initialId }, "", window.location.href);
+    initializeAppHistory(initialId);
     window.addEventListener("popstate", onPopState);
 
     // Re-pull the sessions list to re-anchor preview / lastTurnAt /

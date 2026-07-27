@@ -1,6 +1,7 @@
 import { defineStore } from "pinia";
 import { useSessionsStore } from "./sessions.js";
 import { useNotificationsStore } from "./notifications.js";
+import { updateHistoryForSelection } from "../util/pwa-history.js";
 
 export type ThemeMode = "auto" | "dark" | "light";
 export type EnterBehavior = "send" | "newline";
@@ -14,14 +15,6 @@ function loadEnterBehavior(): EnterBehavior {
     if (v === "newline" || v === "send") return v;
   } catch { /* ignore */ }
   return "send";
-}
-
-function pushHistoryFor(id: string | null): void {
-  if (typeof window === "undefined") return;
-  const url = new URL(window.location.href);
-  if (id) url.searchParams.set("session", id);
-  else url.searchParams.delete("session");
-  window.history.pushState({ sessionId: id }, "", url.toString());
 }
 
 // Drafts are deliberately NOT dropped on switch-away anymore (WeChat-style:
@@ -44,6 +37,7 @@ export const useUiStore = defineStore("ui", {
     // popstate, which the app routes to selectFromHistory.
     select(id: string | null) {
       if (id === this.selectedSessionId) return;
+      const previousId = this.selectedSessionId;
       this.selectedSessionId = id;
       if (id) {
         useSessionsStore().markRead(id);
@@ -51,7 +45,7 @@ export const useUiStore = defineStore("ui", {
       }
       // Auto-dismiss the mobile slide-in when the user picks a session.
       this.sidebarOpen = false;
-      pushHistoryFor(id);
+      updateHistoryForSelection(id, previousId);
     },
 
     // Apply a selection coming from popstate (browser back/forward, mouse

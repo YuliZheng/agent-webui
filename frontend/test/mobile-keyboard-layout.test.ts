@@ -23,7 +23,7 @@ describe("mobile software-keyboard layout", () => {
   });
 
   it("keeps the title and composer as non-shrinking edges around the message scroller", () => {
-    expect(mainPane).toContain("cw-main-header shrink-0");
+    expect(mainPane).toContain("cw-main-header cw-session-header shrink-0");
     expect(mainPane).toContain("cw-main-header cw-preview-header shrink-0");
     expect(promptInput).toContain("cw-prompt-input shrink-0");
   });

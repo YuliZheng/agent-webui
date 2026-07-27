@@ -344,6 +344,7 @@ export interface FullContextUsageResponse extends ContextUsage {
   completeHistoryScan: true;
   recordsScanned: number;
   oversizedRecords: number;
+  compactionCount: number;
 }
 
 // Fast initial-load: returns just the last `n` lines of a session jsonl.

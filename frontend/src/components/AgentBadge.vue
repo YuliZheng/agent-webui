@@ -33,6 +33,6 @@ const inner = computed(() => Math.round(px.value * 0.72));
       </svg>
       <img v-else src="/clawd.svg" :width="inner" :height="inner" alt="Claude Code" />
     </span>
-    <span v-if="label" class="text-[11px] font-medium opacity-80">{{ name }}</span>
+    <span v-if="label" class="cw-agent-badge-label text-[11px] font-medium opacity-80">{{ name }}</span>
   </span>
 </template>

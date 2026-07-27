@@ -148,6 +148,7 @@ describe("sessions API HTTP reads", () => {
       completeHistoryScan: true,
       recordsScanned: 2_501,
       oversizedRecords: 0,
+      compactionCount: 2,
     };
     const fetchMock = vi.fn(async () => ({
       ok: true,

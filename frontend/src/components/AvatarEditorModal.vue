@@ -1,8 +1,10 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { deleteUserAvatar, putUserAvatar } from "../api/avatar.js";
 import { useUiStore } from "../stores/ui.js";
 import { useUserAvatarStore } from "../stores/user-avatar.js";
+import { APP_BACK_PRIORITY, registerAppBackHandler } from "../util/app-back.js";
+import { setPwaLayerActive } from "../util/pwa-history.js";
 import { userInitials } from "../util/user-initials.js";
 
 const AVATAR_SIZE = 320;
@@ -18,6 +20,11 @@ const busy = ref(false);
 const dragging = ref(false);
 const error = ref("");
 const previewSrc = computed(() => candidate.value ?? avatar.src);
+let unregisterAppBack: (() => void) | undefined;
+
+watch(() => avatar.editorOpen, open => {
+  setPwaLayerActive("avatar-editor", open, ui.selectedSessionId);
+});
 
 function close() {
   if (!busy.value) {
@@ -137,8 +144,18 @@ function onKeydown(event: KeyboardEvent) {
   if (event.key === "Escape" && avatar.editorOpen) close();
 }
 
-onMounted(() => window.addEventListener("keydown", onKeydown));
-onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
+onMounted(() => {
+  window.addEventListener("keydown", onKeydown);
+  unregisterAppBack = registerAppBackHandler(() => {
+    if (!avatar.editorOpen) return false;
+    if (!busy.value) close();
+    return true;
+  }, APP_BACK_PRIORITY.overlay);
+});
+onBeforeUnmount(() => {
+  unregisterAppBack?.();
+  window.removeEventListener("keydown", onKeydown);
+});
 </script>
 
 <template>

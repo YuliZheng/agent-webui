@@ -1,13 +1,27 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref, watch } from "vue";
-import type { SessionStatusRow } from "../util/local-commands.js";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import type { ContextUsage, SessionStatusRow } from "../util/local-commands.js";
 import { buildSessionStatusSummary, latestContextUsage } from "../util/local-commands.js";
-import { killSession } from "../api/sessions.js";
+import type { LineEntry } from "../api/sessions.js";
+import {
+  killSession,
+  readFullCodexContextUsage,
+  readSessionRange,
+} from "../api/sessions.js";
 import { useNotificationsStore } from "../stores/notifications.js";
 import { usePrefsStore } from "../stores/prefs.js";
 import { useSessionCacheStore } from "../stores/session-cache.js";
 import { useSessionSettingsStore } from "../stores/session-settings.js";
 import { useSessionsStore } from "../stores/sessions.js";
+import {
+  hasLoadedCodexUsageBoundary,
+  mergeIndexedUsageLines,
+  needsCodexUsageBackfill,
+  USAGE_BACKFILL_MAX_LINES,
+} from "../util/context-usage-history.js";
+import ContextFooter from "./blocks/ContextFooter.vue";
+import { APP_BACK_PRIORITY, registerAppBackHandler } from "../util/app-back.js";
+import { setPwaLayerActive } from "../util/pwa-history.js";
 
 const props = defineProps<{ sessionId: string; open: boolean }>();
 const emit = defineEmits<{ close: [] }>();
@@ -27,12 +41,55 @@ const canKillAgent = computed(() => isCodex.value || canKillClaude.value);
 const killLabel = computed(() => (
   isCodex.value ? "强制终止 Codex 后台" : "终止 Claude 进程"
 ));
+const effectiveModel = computed(() => (
+  isCodex.value
+    ? sessionSettings.effectiveCodex(props.sessionId).model
+    : sessionSettings.effective(props.sessionId).model
+));
 
 const rows = ref<SessionStatusRow[]>([]);
+const statusRows = computed(() => rows.value.filter(row => row.label !== "Context"));
 const loading = ref(false);
 const confirmingKill = ref(false);
+const usageOlderLines = ref<LineEntry[]>([]);
+const usageBackfillLoading = ref(false);
+const usageBackfillAttempted = ref(false);
+const usageBackfillError = ref("");
+const usageBackfillFrom = ref<number | null>(null);
+const usageBackfillTruncated = ref(false);
+const fullCodexUsage = ref<ContextUsage | null>(null);
+const usageFullScanRecords = ref<number | null>(null);
+const fullCompactionCount = ref<number | null>(null);
+const usageUsingFallback = ref(false);
 let loadSeq = 0;
 let confirmTimer: ReturnType<typeof setTimeout> | undefined;
+let unregisterAppBack: (() => void) | undefined;
+
+const codexUsageLines = computed(() => {
+  const cached = sessionCache.bySession[props.sessionId]?.lines ?? [];
+  return usageOlderLines.value.length
+    ? mergeIndexedUsageLines(usageOlderLines.value, cached)
+    : cached;
+});
+const localContextUsage = computed(() => latestContextUsage(
+  codexUsageLines.value,
+  isCodex.value,
+  effectiveModel.value,
+  prefs.autoCompactWindow,
+  prefs.codexAutoCompactWindow,
+));
+const contextUsage = computed(() => fullCodexUsage.value ?? localContextUsage.value);
+const usageBackfillLimited = computed(() =>
+  !fullCodexUsage.value
+  && usageBackfillAttempted.value
+  && (
+    usageBackfillTruncated.value
+    || (
+      (usageBackfillFrom.value ?? 0) > 0
+      && !hasLoadedCodexUsageBoundary(codexUsageLines.value)
+    )
+  ),
+);
 
 function resetKillConfirmation() {
   confirmingKill.value = false;
@@ -45,21 +102,26 @@ function closePage() {
   emit("close");
 }
 
+function resetUsageBreakdown() {
+  usageOlderLines.value = [];
+  usageBackfillLoading.value = false;
+  usageBackfillAttempted.value = false;
+  usageBackfillError.value = "";
+  usageBackfillFrom.value = null;
+  usageBackfillTruncated.value = false;
+  fullCodexUsage.value = null;
+  usageFullScanRecords.value = null;
+  fullCompactionCount.value = null;
+  usageUsingFallback.value = false;
+}
+
 async function loadStatus() {
   const seq = ++loadSeq;
   const id = props.sessionId;
   const codex = isCodex.value;
-  const model = codex
-    ? sessionSettings.effectiveCodex(id).model
-    : sessionSettings.effective(id).model;
+  const model = effectiveModel.value;
   const lines = sessionCache.bySession[id]?.lines ?? [];
-  const usage = latestContextUsage(
-    lines,
-    codex,
-    model,
-    prefs.autoCompactWindow,
-    prefs.codexAutoCompactWindow,
-  );
+  const usage = contextUsage.value;
   loading.value = true;
   try {
     const summary = await buildSessionStatusSummary({
@@ -76,6 +138,56 @@ async function loadStatus() {
     if (seq === loadSeq && props.open && props.sessionId === id) rows.value = summary.rows;
   } finally {
     if (seq === loadSeq) loading.value = false;
+  }
+}
+
+async function loadCodexUsageBreakdown(): Promise<void> {
+  if (!isCodex.value || usageBackfillLoading.value) return;
+  if (usageBackfillAttempted.value && !usageBackfillError.value) return;
+  const id = props.sessionId;
+  const entry = sessionCache.bySession[id];
+  if (!id || !entry) return;
+
+  usageBackfillLoading.value = true;
+  usageBackfillError.value = "";
+  usageUsingFallback.value = false;
+  try {
+    try {
+      const full = await readFullCodexContextUsage(id, prefs.codexAutoCompactWindow);
+      fullCodexUsage.value = full;
+      usageFullScanRecords.value = full.recordsScanned;
+      fullCompactionCount.value = full.compactionCount;
+      usageBackfillAttempted.value = true;
+      return;
+    } catch {
+      // Keep the bounded range fallback until the user restarts the currently
+      // running backend into the build that provides the full-scan endpoint.
+      usageUsingFallback.value = true;
+    }
+
+    if (!needsCodexUsageBackfill(entry.firstLoadedIndex, codexUsageLines.value)) {
+      usageBackfillAttempted.value = true;
+      return;
+    }
+
+    const to = entry.firstLoadedIndex;
+    const from = Math.max(0, to - USAGE_BACKFILL_MAX_LINES);
+    usageBackfillFrom.value = from;
+    const response = await readSessionRange(id, from, to);
+    usageOlderLines.value = response.lines.filter(
+      (line): line is LineEntry => Number.isSafeInteger(line.index) && typeof line.raw === "string" && !!line.raw,
+    );
+    const lastReturnedIndex = usageOlderLines.value.reduce(
+      (last, line) => Math.max(last, line.index),
+      from - 1,
+    );
+    usageBackfillTruncated.value = to > from && lastReturnedIndex < to - 1;
+    usageBackfillAttempted.value = true;
+  } catch (error) {
+    usageBackfillAttempted.value = true;
+    usageBackfillError.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    usageBackfillLoading.value = false;
   }
 }
 
@@ -108,10 +220,13 @@ function onKeydown(event: KeyboardEvent) {
 watch(
   [() => props.open, () => props.sessionId],
   ([open]) => {
+    setPwaLayerActive("session-status", open, props.sessionId);
     resetKillConfirmation();
     if (open) {
+      resetUsageBreakdown();
       window.addEventListener("keydown", onKeydown);
       void loadStatus();
+      void loadCodexUsageBreakdown();
     } else {
       loadSeq++;
       window.removeEventListener("keydown", onKeydown);
@@ -121,8 +236,17 @@ watch(
 );
 
 onBeforeUnmount(() => {
+  unregisterAppBack?.();
   resetKillConfirmation();
   window.removeEventListener("keydown", onKeydown);
+});
+
+onMounted(() => {
+  unregisterAppBack = registerAppBackHandler(() => {
+    if (!props.open) return false;
+    closePage();
+    return true;
+  }, APP_BACK_PRIORITY.sheet);
 });
 </script>
 
@@ -131,31 +255,39 @@ onBeforeUnmount(() => {
     <Transition name="cw-status-page">
       <div
         v-if="open"
-        class="fixed inset-0 z-[90] flex flex-col bg-[var(--cw-panel-2)] text-[var(--cw-text)] md:hidden"
-        role="dialog"
-        aria-modal="true"
-        aria-label="会话状态与操作"
+        class="fixed inset-0 z-[90] flex flex-col bg-[var(--cw-panel-2)] text-[var(--cw-text)] md:items-center md:justify-center md:bg-black/40 md:p-6"
+        @click.self="closePage"
       >
-        <header
-          class="grid shrink-0 grid-cols-[44px_1fr_44px] items-center border-b border-[var(--cw-border)] bg-[var(--cw-panel-bg)] px-1 pb-2"
-          style="padding-top:max(0.5rem, env(safe-area-inset-top))"
+        <div
+          class="flex min-h-0 w-full flex-1 flex-col bg-[var(--cw-panel-2)] md:max-h-[min(820px,calc(100vh-3rem))] md:max-w-2xl md:flex-none md:overflow-hidden md:rounded-2xl md:border md:border-[var(--cw-border)] md:shadow-2xl"
+          role="dialog"
+          aria-modal="true"
+          aria-label="会话状态与操作"
         >
-          <button
-            type="button"
-            class="flex h-10 w-10 items-center justify-center rounded-full active:bg-[var(--cw-panel-2)]"
-            aria-label="返回会话"
-            @click="closePage"
+          <header
+            class="grid shrink-0 grid-cols-[44px_1fr_44px] items-center border-b border-[var(--cw-border)] bg-[var(--cw-panel-bg)] px-1 pb-2 md:px-2 md:pt-2"
+            style="padding-top:max(0.5rem, env(safe-area-inset-top))"
           >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" class="h-5 w-5" aria-hidden="true">
-              <line x1="20" y1="12" x2="4" y2="12" />
-              <polyline points="11 5 4 12 11 19" />
-            </svg>
-          </button>
-          <h1 class="truncate text-center text-base font-semibold">会话信息</h1>
-          <span aria-hidden="true" />
-        </header>
+            <button
+              type="button"
+              class="flex h-10 w-10 items-center justify-center rounded-full [@media(hover:hover)]:hover:bg-[var(--cw-panel-2)] active:bg-[var(--cw-panel-2)]"
+              aria-label="返回会话"
+              @click="closePage"
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" class="h-5 w-5 md:hidden" aria-hidden="true">
+                <line x1="20" y1="12" x2="4" y2="12" />
+                <polyline points="11 5 4 12 11 19" />
+              </svg>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" class="hidden h-5 w-5 md:block" aria-hidden="true">
+                <line x1="6" y1="6" x2="18" y2="18" />
+                <line x1="18" y1="6" x2="6" y2="18" />
+              </svg>
+            </button>
+            <h1 class="truncate text-center text-base font-semibold">会话信息</h1>
+            <span aria-hidden="true" />
+          </header>
 
-        <main class="min-h-0 flex-1 overflow-y-auto px-4 py-5">
+          <main class="min-h-0 flex-1 overflow-y-auto px-4 py-5 md:px-6">
           <section class="overflow-hidden rounded-xl bg-[var(--cw-panel-bg)]">
             <div class="border-b border-[var(--cw-border)] px-4 py-3">
               <h2 class="text-sm font-medium">会话状态</h2>
@@ -165,7 +297,7 @@ onBeforeUnmount(() => {
             </div>
             <dl v-else class="divide-y divide-[var(--cw-border)] px-4">
               <div
-                v-for="row in rows"
+                v-for="row in statusRows"
                 :key="row.label"
                 class="grid grid-cols-[minmax(104px,0.42fr)_minmax(0,1fr)] gap-3 py-3.5"
               >
@@ -176,6 +308,35 @@ onBeforeUnmount(() => {
                 >{{ row.value }}</dd>
               </div>
             </dl>
+          </section>
+
+          <section
+            v-if="contextUsage.tokens"
+            class="mt-5 overflow-hidden rounded-xl bg-[var(--cw-panel-bg)]"
+          >
+            <div class="flex items-center justify-between gap-3 border-b border-[var(--cw-border)] px-4 py-3">
+              <h2 class="text-sm font-medium">上下文用量</h2>
+              <span v-if="isCodex" class="text-xs text-[var(--cw-muted)]">
+                <template v-if="fullCompactionCount !== null">已压缩 {{ fullCompactionCount }} 次</template>
+                <template v-else-if="usageBackfillLoading">正在统计压缩次数…</template>
+                <template v-else>压缩次数待全量扫描</template>
+              </span>
+            </div>
+            <div class="py-2">
+              <ContextFooter
+                :session-id="sessionId"
+                :ctx-tokens="contextUsage.tokens"
+                :ctx-limit="contextUsage.limit"
+                :ctx-reported-tokens="contextUsage.reportedTokens"
+                :ctx-estimated-tokens="contextUsage.estimatedTokens"
+                :ctx-contributors="contextUsage.contributors"
+                :ctx-breakdown-loading="usageBackfillLoading"
+                :ctx-breakdown-limited="usageBackfillLimited"
+                :ctx-breakdown-error="usageBackfillError"
+                :ctx-breakdown-full-scan-records="usageFullScanRecords"
+                :ctx-breakdown-fallback="usageUsingFallback"
+              />
+            </div>
           </section>
 
           <section class="mt-5 overflow-hidden rounded-xl bg-[var(--cw-panel-bg)]">
@@ -197,7 +358,8 @@ onBeforeUnmount(() => {
               这会终止 WebUI 管理的 Claude 进程；普通停止回复请使用输入框旁的停止键。
             </template>
           </p>
-        </main>
+          </main>
+        </div>
       </div>
     </Transition>
   </Teleport>
@@ -212,6 +374,12 @@ onBeforeUnmount(() => {
 .cw-status-page-leave-to {
   opacity: 0;
   transform: translateX(18px);
+}
+@media (min-width: 768px) {
+  .cw-status-page-enter-from,
+  .cw-status-page-leave-to {
+    transform: none;
+  }
 }
 @media (prefers-reduced-motion: reduce) {
   .cw-status-page-enter-active,

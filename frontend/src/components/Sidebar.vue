@@ -9,6 +9,8 @@ import { useScrollTargetStore } from "../stores/scroll-target.js";
 import { useSearchHighlightStore } from "../stores/search-highlight.js";
 import { displayCwd } from "../util/cwd-display.js";
 import { isOrdinarySidebarSessionVisible } from "../util/session-visibility.js";
+import { APP_BACK_PRIORITY, registerAppBackHandler } from "../util/app-back.js";
+import { setPwaLayerActive } from "../util/pwa-history.js";
 import { wake as wsWake } from "../api/ws.js";
 import SessionRow from "./SessionRow.vue";
 import NewSessionModal from "./modals/NewSessionModal.vue";
@@ -280,6 +282,7 @@ function effectiveMtime(id: string): number {
 const ui = useUiStore();
 
 const showNew = ref(false);
+const mobileHeaderMenuOpen = ref(false);
 
 // WeChat-style search "page". Tap the ⌕ button to swap the entire sidebar
 // (header + chat tree) for a focused search view: back arrow + large input
@@ -292,6 +295,7 @@ function toggleSearch() {
   else openSearch();
 }
 function openSearch() {
+  mobileHeaderMenuOpen.value = false;
   searchOpen.value = true;
   // Re-focus next tick so :autofocus works reliably on Safari/iOS where
   // the attribute is sometimes ignored when the element wasn't in the DOM
@@ -327,6 +331,36 @@ function quickHere(targetCwd?: string) {
   ui.select(draftId);
 }
 const showSettings = ref(false);
+let unregisterAppBack: (() => void) | undefined;
+const sidebarLayerOpen = computed(() =>
+  showSettings.value
+  || showNew.value
+  || searchOpen.value
+  || mobileHeaderMenuOpen.value,
+);
+watch(sidebarLayerOpen, open => {
+  setPwaLayerActive("sidebar-overlay", open, ui.selectedSessionId);
+});
+
+function handleAppBack(): boolean {
+  if (showSettings.value) {
+    showSettings.value = false;
+    return true;
+  }
+  if (showNew.value) {
+    showNew.value = false;
+    return true;
+  }
+  if (searchOpen.value) {
+    closeSearch();
+    return true;
+  }
+  if (mobileHeaderMenuOpen.value) {
+    mobileHeaderMenuOpen.value = false;
+    return true;
+  }
+  return false;
+}
 
 // Per-group collapsed state. Keys are group names plus the special keys
 // "__pinned__" and "__ungrouped__" for the built-in sections. Default = expanded (false).
@@ -532,6 +566,12 @@ const visibleIds = computed(() =>
       matchesSearch(id),
   ),
 );
+const totalVisibleUnread = computed(() =>
+  visibleIds.value.reduce((total, id) => total + (sessions.unreadBySession[id] ?? 0), 0),
+);
+const mobileUnreadLabel = computed(() =>
+  totalVisibleUnread.value > 99 ? "99+" : String(totalVisibleUnread.value),
+);
 
 // The exact top-to-bottom order of rows as rendered, deduped (Active/Pinned
 // surface sessions that also live in a group below — keep the first/topmost
@@ -640,6 +680,11 @@ function isSingleVisualLine(textarea: HTMLTextAreaElement): boolean {
 // rename, settings, IME, and modified-arrow behavior remain untouched.
 function onSessionNavKey(e: KeyboardEvent) {
   if (e.defaultPrevented || e.isComposing) return;
+  if (e.key === "Escape" && mobileHeaderMenuOpen.value) {
+    e.preventDefault();
+    mobileHeaderMenuOpen.value = false;
+    return;
+  }
   if (e.ctrlKey || e.metaKey || e.altKey) return;
 
   if (
@@ -660,8 +705,14 @@ function onSessionNavKey(e: KeyboardEvent) {
   e.preventDefault();
   switchSession(e.shiftKey ? -1 : 1);
 }
-onMounted(() => window.addEventListener("keydown", onSessionNavKey));
-onBeforeUnmount(() => window.removeEventListener("keydown", onSessionNavKey));
+onMounted(() => {
+  window.addEventListener("keydown", onSessionNavKey);
+  unregisterAppBack = registerAppBackHandler(handleAppBack, APP_BACK_PRIORITY.sheet);
+});
+onBeforeUnmount(() => {
+  unregisterAppBack?.();
+  window.removeEventListener("keydown", onSessionNavKey);
+});
 
 const pinnedSessionIds = computed(() =>
   prefs.pinned
@@ -928,16 +979,85 @@ function runningInIds(ids: string[]): boolean {
       </div>
     </template>
 
-    <!-- IM-style header. WeChat uses its compact search field as the primary
-         object; other skins retain the title/count treatment. Flat/group,
-         new-chat and settings remain directly reachable in both modes. -->
+    <!-- Responsive IM header. Mobile WeChat mirrors the native app with a
+         centered title plus Search / Add on the right; Add opens the less
+         frequent view/settings actions. Desktop WeChat keeps the efficient
+         search-first toolbar, while other skins retain title/count. -->
     <header
       v-else
-      class="cw-sidebar-header flex items-center border-b border-[var(--cw-border)]  shrink-0"
+      class="cw-sidebar-header relative flex items-center border-b border-[var(--cw-border)] shrink-0"
       :class="prefs.messageDisplayStyle === 'wechat'
-        ? 'gap-2 px-3 py-2'
+        ? 'min-h-14 px-3 md:min-h-0 md:gap-2 md:py-2'
         : 'justify-between px-4 py-3'"
     >
+      <div
+        v-if="prefs.messageDisplayStyle === 'wechat'"
+        class="cw-wechat-mobile-home-header relative flex h-14 w-full items-center justify-center md:hidden"
+      >
+        <h1 class="max-w-[45%] truncate text-[17px] font-semibold leading-none">
+          会话<span v-if="totalVisibleUnread > 0">({{ mobileUnreadLabel }})</span>
+        </h1>
+        <div class="absolute right-0 flex items-center gap-1">
+          <button
+            type="button"
+            class="flex h-9 w-9 items-center justify-center rounded-full opacity-80 active:bg-[var(--cw-panel-2)]"
+            title="Search chats"
+            aria-label="Search"
+            @click="(e) => { openSearch(); (e.currentTarget as HTMLElement).blur(); }"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="h-[22px] w-[22px]">
+              <circle cx="11" cy="11" r="7" />
+              <line x1="21" y1="21" x2="16.65" y2="16.65" />
+            </svg>
+          </button>
+          <button
+            type="button"
+            class="flex h-9 w-9 items-center justify-center rounded-full opacity-80 active:bg-[var(--cw-panel-2)]"
+            :aria-expanded="mobileHeaderMenuOpen"
+            aria-controls="cw-mobile-header-menu"
+            title="More actions"
+            aria-label="More actions"
+            @click="mobileHeaderMenuOpen = !mobileHeaderMenuOpen"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" class="h-6 w-6">
+              <line x1="12" y1="5" x2="12" y2="19" />
+              <line x1="5" y1="12" x2="19" y2="12" />
+            </svg>
+          </button>
+        </div>
+        <button
+          v-if="mobileHeaderMenuOpen"
+          type="button"
+          class="fixed inset-0 z-[60] cursor-default bg-transparent"
+          aria-label="Close home actions"
+          @click="mobileHeaderMenuOpen = false"
+        />
+        <div
+          v-if="mobileHeaderMenuOpen"
+          id="cw-mobile-header-menu"
+          class="absolute right-0 top-[calc(100%_-_0.25rem)] z-[61] min-w-44 overflow-hidden rounded-lg border border-[var(--cw-border)] bg-[var(--cw-panel-bg)] py-1 text-sm shadow-xl"
+          role="menu"
+        >
+          <button
+            type="button"
+            class="flex w-full items-center gap-3 px-4 py-3 text-left active:bg-[var(--cw-panel-2)]"
+            role="menuitem"
+            @click="showNew = true; mobileHeaderMenuOpen = false"
+          >新建会话</button>
+          <button
+            type="button"
+            class="flex w-full items-center gap-3 px-4 py-3 text-left active:bg-[var(--cw-panel-2)]"
+            role="menuitem"
+            @click="flatMode = !flatMode; mobileHeaderMenuOpen = false"
+          >{{ flatMode ? "按文件夹分组" : "按最近排序" }}</button>
+          <button
+            type="button"
+            class="flex w-full items-center gap-3 px-4 py-3 text-left active:bg-[var(--cw-panel-2)]"
+            role="menuitem"
+            @click="showSettings = true; mobileHeaderMenuOpen = false"
+          >设置</button>
+        </div>
+      </div>
       <div v-if="prefs.messageDisplayStyle !== 'wechat'" class="min-w-0">
         <h1 class="text-lg font-bold leading-tight">Chats</h1>
         <div class="text-[11px] opacity-60 leading-tight whitespace-nowrap overflow-hidden text-ellipsis">
@@ -950,7 +1070,7 @@ function runningInIds(ids: string[]): boolean {
       </div>
       <div
         class="flex items-center gap-1"
-        :class="prefs.messageDisplayStyle === 'wechat' ? 'flex-1 min-w-0' : ''"
+        :class="prefs.messageDisplayStyle === 'wechat' ? 'hidden flex-1 min-w-0 md:flex' : ''"
       >
         <button
           @click="(e) => { toggleSearch(); (e.currentTarget as HTMLElement).blur(); }"

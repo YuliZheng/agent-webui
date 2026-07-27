@@ -4,6 +4,7 @@ export type CodexContextContributorSource =
   | "agents"
   | "skills"
   | "instructions"
+  | "base"
   | "images"
   | "shell"
   | "browser"
@@ -23,6 +24,7 @@ export interface CodexContextContributor {
 export interface CodexContextUsageSummary {
   tokens: number;
   limit: number | null;
+  compactionCount: number;
   reportedTokens?: number;
   contributors?: readonly CodexContextContributor[];
 }
@@ -33,6 +35,7 @@ const CONTRIBUTOR_LABELS: Record<CodexContextContributorSource, string> = {
   agents: "AGENTS.md",
   skills: "skills",
   instructions: "system / context",
+  base: "Codex base context",
   images: "images",
   shell: "shell",
   browser: "browser",
@@ -312,8 +315,14 @@ function jsonStringField(prefix: string, key: string): string {
 export class CodexContextUsageAccumulator {
   private readonly totals = new Map<CodexContextContributorSource, number>();
   private readonly tools = new Map<string, { name: string; source: CodexContextContributorSource }>();
-  private latest: CodexContextUsageSummary = { tokens: 0, limit: null };
+  private latest: CodexContextUsageSummary = { tokens: 0, limit: null, compactionCount: 0 };
   private latestWindow: number | null = null;
+  private compactionCount = 0;
+  // Codex includes a stable hidden floor (base prompt + tool schemas) in every
+  // authoritative token_count, but does not persist those bytes as rollout
+  // rows. Calibrate that floor from the smallest positive pre-compaction
+  // residual instead of leaving it permanently "unattributed".
+  private baseContextTokens: number | null = null;
 
   constructor(private readonly configuredAutoCompactLimit: number | null = null) {}
 
@@ -321,10 +330,12 @@ export class CodexContextUsageAccumulator {
     const record = parsedRecord(raw);
     if (!record) return;
     if (this.isCompaction(record)) {
+      this.compactionCount++;
       this.resetSegment();
       this.latest = {
         tokens: 0,
         limit: compactLimit(this.latestWindow, this.configuredAutoCompactLimit),
+        compactionCount: this.compactionCount,
       };
       return;
     }
@@ -444,10 +455,21 @@ export class CodexContextUsageAccumulator {
 
     const tokens = Number.isFinite(reported) ? Math.max(0, reported) : 0;
     if (Number.isFinite(window) && window > 0) this.latestWindow = window;
-    const contributors = reconcile(this.totals, tokens);
+    const attributionTotals = new Map(this.totals);
+    const visibleTotal = [...attributionTotals.values()].reduce((sum, value) => sum + value, 0);
+    const residual = Math.max(0, tokens - visibleTotal);
+    if (this.compactionCount === 0 && residual > 0) {
+      this.baseContextTokens = this.baseContextTokens === null
+        ? residual
+        : Math.min(this.baseContextTokens, residual);
+    }
+    const baseTokens = Math.min(this.baseContextTokens ?? 0, residual);
+    if (baseTokens > 0) attributionTotals.set("base", baseTokens);
+    const contributors = reconcile(attributionTotals, tokens);
     this.latest = {
       tokens,
       limit: compactLimit(this.latestWindow, this.configuredAutoCompactLimit),
+      compactionCount: this.compactionCount,
       reportedTokens: tokens,
       ...(contributors.length ? { contributors } : {}),
     };

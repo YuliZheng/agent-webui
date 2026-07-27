@@ -223,7 +223,7 @@ async function copyCwd() {
            only ever one title row, aligned with the sidebar (px-4 py-3). -->
       <header
         v-if="!previewActive"
-        class="cw-main-header shrink-0 flex items-center justify-between gap-2 px-4 py-3 border-b border-[var(--cw-border)] "
+        class="cw-main-header cw-session-header shrink-0 grid min-h-14 grid-cols-[2.25rem_minmax(0,1fr)_2.25rem] items-center gap-2 border-b border-[var(--cw-border)] px-3 py-2 md:flex md:min-h-0 md:px-4 md:py-3"
       >
         <!-- Mobile: ← back to chat list. Desktop: hidden (sidebar is
              always visible to the left). Hover styles gated behind
@@ -231,7 +231,7 @@ async function copyCwd() {
              after a tap. -->
         <button
           @click="(e) => { ui.select(null); (e.currentTarget as HTMLElement).blur(); }"
-          class="md:hidden w-9 h-9 -ml-2 rounded-full flex items-center justify-center opacity-80 [@media(hover:hover)]:hover:opacity-100 [@media(hover:hover)]:hover:bg-[var(--cw-panel-2)]  active:opacity-75  transition"
+          class="md:hidden w-9 h-9 rounded-full flex items-center justify-center justify-self-start opacity-80 [@media(hover:hover)]:hover:opacity-100 [@media(hover:hover)]:hover:bg-[var(--cw-panel-2)] active:opacity-75 transition"
           title="Back to chats"
           aria-label="Back to chats"
         >
@@ -240,9 +240,9 @@ async function copyCwd() {
             <polyline points="11 5 4 12 11 19" />
           </svg>
         </button>
-        <div class="truncate flex-1 min-w-0">
+        <div class="cw-main-header-copy min-w-0 text-center md:flex-1 md:text-left">
           <div
-            class="text-base font-semibold truncate leading-tight"
+            class="truncate text-[17px] font-semibold leading-tight md:text-base"
             :title="displayTitle || `Session ${sessionId}`"
           >
             <span class="md:hidden" :class="{ 'opacity-70 italic': isDraft }">{{ mobileHeaderTitle }}</span>
@@ -252,7 +252,7 @@ async function copyCwd() {
               <template v-else><span class="font-mono">{{ shortId }}…</span></template>
             </span>
           </div>
-          <div class="text-[11px] opacity-60 leading-tight truncate flex items-center gap-2">
+          <div class="flex items-center justify-center gap-2 truncate text-[11px] leading-tight opacity-60 md:justify-start cw-main-header-meta font-sans font-normal tracking-normal">
             <AgentBadge :agent="agent" :size="15" label class="shrink-0" />
             <button
               class="truncate min-w-0 text-left hover:opacity-100 hover:underline"
@@ -261,7 +261,7 @@ async function copyCwd() {
             >{{ cwdDisplay }}</button>
             <button
               v-if="!isDraft"
-              class="font-mono opacity-70 shrink-0 hover:opacity-100 hover:underline"
+              class="shrink-0 hover:opacity-100 hover:underline"
               :title="`Click to copy full session id: ${sessionId}`"
               @click="copySessionId"
             >· {{ shortId }}…</button>
@@ -269,7 +269,7 @@ async function copyCwd() {
           </div>
           <div
             v-if="goal && !isDraft"
-            class="mt-1 flex items-center gap-1.5 text-[11px] leading-tight min-w-0"
+            class="mt-1 hidden items-center gap-1.5 text-[11px] leading-tight min-w-0 md:flex"
             :title="goalTitle"
           >
             <span :class="['shrink-0 px-1.5 py-0.5 rounded capitalize', goalClass]">{{ goal.status }}</span>
@@ -329,7 +329,7 @@ async function copyCwd() {
         <button
           v-if="!isDraft"
           type="button"
-          class="md:hidden -mr-2 flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-[var(--cw-text)] active:bg-[var(--cw-panel-2)]"
+          class="flex h-9 w-9 shrink-0 items-center justify-center justify-self-end rounded-full text-[var(--cw-text)] [@media(hover:hover)]:hover:bg-[var(--cw-panel-2)] active:bg-[var(--cw-panel-2)] md:-mr-2"
           :aria-expanded="statusSheetOpen"
           aria-label="会话状态与操作"
           title="会话状态与操作"
@@ -341,6 +341,7 @@ async function copyCwd() {
             <circle cx="19" cy="12" r="1.7" />
           </svg>
         </button>
+        <span v-else class="h-9 w-9 justify-self-end md:hidden" aria-hidden="true" />
       </header>
       <SessionStatusPage
         v-if="!isDraft"
