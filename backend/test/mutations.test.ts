@@ -260,6 +260,48 @@ describe("session mutations/search/export", () => {
     expect(rollback).not.toHaveBeenCalled();
   });
 
+  it("forks a line-addressed Codex prompt without scanning a huge suffix", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-webui-codex-fast-fork-"));
+    const claudeRoot = join(root, "claude");
+    const codexRoot = join(root, "codex");
+    await mkdir(claudeRoot);
+    await mkdir(codexRoot);
+    const sourcePath = join(codexRoot, "rollout-large-suffix.jsonl");
+    const suffix = Array.from(
+      { length: 20_100 },
+      (_, index) => JSON.stringify({
+        type: "event_msg",
+        payload: { type: "user_message", message: `irrelevant-${index}` },
+      }),
+    );
+    await writeFile(sourcePath, [
+      JSON.stringify({ type: "session_meta", payload: { id: "fast-source", cwd: root } }),
+      JSON.stringify({ type: "turn_context", payload: { turn_id: "target-turn", cwd: root } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "target prompt" } }),
+      ...suffix,
+      "",
+    ].join("\n"));
+    const forkPath = join(codexRoot, "rollout-fast-fork.jsonl");
+    await writeFile(forkPath, [
+      JSON.stringify({
+        type: "session_meta",
+        payload: { id: "fast-fork", cwd: root, parent_thread_id: "fast-source" },
+      }),
+      "",
+    ].join("\n"));
+    const index = new SessionIndex({ claudeRoot, codexRoot });
+    await index.scan();
+    const fork = vi.fn(async () => ({
+      thread: { id: "fast-fork", path: forkPath, cwd: root },
+    }));
+    const codex = { isActive: () => false, fork } as unknown as CodexDriver;
+
+    await expect(
+      forkSession(index, {} as ClaudeDriver, codex, "fast-source", "codex-line-2"),
+    ).resolves.toEqual({ newSessionId: "fast-fork", prefillText: "target prompt" });
+    expect(fork).toHaveBeenCalledWith("fast-source", { beforeTurnId: "target-turn" });
+  });
+
   it("writes an automatic title from the observed prompt without reading the transcript", async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-webui-title-"));
     const claudeRoot = join(root, "claude");

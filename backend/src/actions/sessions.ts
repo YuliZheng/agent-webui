@@ -11,7 +11,7 @@ import { searchableRecordPrefix, searchableRecordText } from "../services/search
 import type { ClaudeDriver } from "../services/claude-driver.js";
 import type { CodexDriver, CodexThreadTurn } from "../services/codex-driver.js";
 import type { AppState } from "../services/state.js";
-import { streamJsonlLines } from "../services/jsonl.js";
+import { readRecordAt, streamJsonlLines } from "../services/jsonl.js";
 import {
   fallbackTitleEmoji,
   fallbackTopicSummary,
@@ -463,6 +463,73 @@ async function codexMutationPoint(
   return { message, turnId: turn.id, turnIndex, turnCount: turns.length };
 }
 
+const CODEX_LINE_MESSAGE_ID = /^codex-line-(\d+)$/u;
+const CODEX_FORK_TURN_LOOKBACK_LINES = 256;
+
+/**
+ * Visible Codex bubbles carry their physical rollout line as `codex-line-N`.
+ * The transcript line index is already hot for an opened conversation, so a
+ * fork can recover the prompt and preceding turn_context with a handful of
+ * direct reads instead of parsing the entire (potentially huge) rollout.
+ */
+async function indexedCodexForkPoint(
+  path: string,
+  messageUuid: string,
+): Promise<{ message: CodexUserMessagePoint; turnId: string } | null> {
+  const match = CODEX_LINE_MESSAGE_ID.exec(messageUuid);
+  if (!match) return null;
+  const lineIndex = Number(match[1]);
+  if (!Number.isSafeInteger(lineIndex) || lineIndex < 0) return null;
+
+  const targetLine = await readRecordAt(path, lineIndex, MAX_TRANSCRIPT_ACTION_RECORD_BYTES);
+  if (!targetLine) return null;
+  let targetRecord: Record<string, unknown> | null = null;
+  try {
+    targetRecord = asRecord(JSON.parse(targetLine.raw));
+  } catch {
+    return null;
+  }
+  if (!targetRecord) return null;
+  const message = codexUserMessage(targetRecord, lineIndex);
+  if (!message || !message.aliases.includes(messageUuid)) return null;
+
+  const lowerBound = Math.max(0, lineIndex - CODEX_FORK_TURN_LOOKBACK_LINES);
+  for (let index = lineIndex - 1; index >= lowerBound; index--) {
+    const line = await readRecordAt(path, index, MAX_TRANSCRIPT_ACTION_RECORD_BYTES);
+    if (!line) return null;
+    let record: Record<string, unknown> | null = null;
+    try {
+      record = asRecord(JSON.parse(line.raw));
+    } catch {
+      continue;
+    }
+    if (!record) continue;
+    if (record.type === "turn_context") {
+      const payload = asRecord(record.payload);
+      const turnId = asString(payload?.turn_id) ?? asString(payload?.turnId);
+      if (turnId) {
+        return {
+          message: {
+            text: message.text,
+            uuid: message.aliases[0]!,
+            parentUuid: null,
+            type: "user",
+            aliases: new Set(message.aliases),
+            sourceIndexes: [lineIndex],
+            sourceKinds: new Set([message.sourceKind]),
+            turnId,
+            turnIndex: null,
+          },
+          turnId,
+        };
+      }
+    }
+    const earlierMessage = codexUserMessage(record, index);
+    if (earlierMessage && !sameCodexUserMessage(earlierMessage.text, message.text)) return null;
+  }
+  return null;
+}
+
 export async function rewindSession(
   index: SessionIndex,
   claude: ClaudeDriver,
@@ -502,7 +569,8 @@ export async function forkSession(
   const session = await index.resolve(sessionId);
   if (!session) throw new RpcError(404, "Session not found");
   if (session.agent === "claude") return forkClaude(index, claude, sessionId, messageUuid);
-  const point = await codexMutationPoint(index, codex, sessionId, messageUuid, true);
+  const point = await indexedCodexForkPoint(session.path, messageUuid)
+    ?? await codexMutationPoint(index, codex, sessionId, messageUuid, true);
   // The WebUI action means "branch immediately before this prompt and put the
   // prompt back in the composer". `beforeTurnId` expresses that boundary
   // directly and, unlike `lastTurnId`, also accepts an in-progress turn.
