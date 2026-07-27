@@ -171,9 +171,29 @@ async function fork() {
   busy.value = true;
   try {
     const r = await forkSession(props.sessionId, uuid.value);
-    await sessions.fetchAll();
+    // The backend indexes the fork before resolving and normally pushes a
+    // session-added event first. Cover the inverse network ordering with a
+    // minimal provisional row, then navigate immediately; a full list refresh
+    // is reconciliation work and must not sit on the user's critical path.
+    if (!sessions.byId[r.newSessionId]) {
+      const source = sessions.byId[props.sessionId];
+      if (source) {
+        const now = new Date().toISOString();
+        sessions.addOrTouch({
+          id: r.newSessionId,
+          cwd: source.cwd,
+          mtime: now,
+          size: 0,
+          ...(source.agent ? { agent: source.agent } : {}),
+          parentSessionId: props.sessionId,
+          preview: null,
+          lastTurnAt: now,
+        });
+      }
+    }
     drafts.set(r.newSessionId, r.prefillText);
     ui.select(r.newSessionId);
+    void sessions.fetchAll();
   } catch (err) {
     notifications.pushError(err instanceof Error ? err.message : String(err), { title: "Fork failed" });
   } finally {
