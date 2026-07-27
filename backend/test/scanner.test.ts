@@ -204,7 +204,50 @@ describe("session scanning", () => {
     const codex = join(root, "rollout-test.jsonl");
     await writeFile(codex, `${JSON.stringify({ timestamp: "2026-01-01T00:00:00Z", type: "session_meta", payload: { id: "current-id", session_id: "parent-id", cwd: join(root, "codex") } })}\n`);
     const item = await scanCodexFile(codex);
-    expect(item?.id).toBe("current-id"); expect(item?.parentSessionId).toBe("parent-id");
+    expect(item?.id).toBe("current-id");
+    expect(item?.parentSessionId).toBe("parent-id");
+    expect(item?.subagent).toBe(false);
+  });
+
+  it("distinguishes Codex subagent workers from ordinary forks", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-webui-codex-source-"));
+    const subagentPath = join(root, "rollout-subagent.jsonl");
+    await writeFile(subagentPath, `${JSON.stringify({
+      timestamp: "2026-07-26T00:00:00Z",
+      type: "session_meta",
+      payload: {
+        id: "worker-id",
+        cwd: root,
+        thread_source: "subagent",
+        source: {
+          subagent: {
+            thread_spawn: {
+              parent_thread_id: "root-id",
+              depth: 1,
+              agent_nickname: "scanner",
+            },
+          },
+        },
+      },
+    })}\n`);
+
+    const worker = await scanCodexFile(subagentPath);
+    expect(worker?.subagent).toBe(true);
+    expect(worker?.parentSessionId).toBe("root-id");
+
+    const forkPath = join(root, "rollout-fork.jsonl");
+    await writeFile(forkPath, `${JSON.stringify({
+      timestamp: "2026-07-26T00:00:01Z",
+      type: "session_meta",
+      payload: {
+        id: "fork-id",
+        cwd: root,
+        parent_thread_id: "root-id",
+      },
+    })}\n`);
+    const fork = await scanCodexFile(forkPath);
+    expect(fork?.subagent).toBe(false);
+    expect(fork?.parentSessionId).toBe("root-id");
   });
 
   it("excludes subagents and does not follow symlink directories", async () => {
@@ -295,6 +338,33 @@ describe("session scanning", () => {
 
     const opened = await index.resolve("lazy_preview");
     expect(opened?.preview).toBe("older meaningful answer");
+  });
+
+  it("validates an interactive session path without deepening its cold preview", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-webui-light-resolve-"));
+    const claudeRoot = join(root, "claude");
+    const codexRoot = join(root, "codex");
+    await mkdir(claudeRoot);
+    await mkdir(codexRoot);
+    const session = join(claudeRoot, "light_resolve.jsonl");
+    await writeFile(session, [
+      JSON.stringify({ type: "system", cwd: root }),
+      JSON.stringify({ type: "assistant", cwd: root, message: { content: [{ type: "text", text: "hidden in the cold tail" }] } }),
+      "x".repeat(SESSION_INITIAL_PREVIEW_BYTES + 8_192),
+      "",
+    ].join("\n"));
+    const index = new SessionIndex({ claudeRoot, codexRoot });
+    await index.scan();
+    expect(index.get("light_resolve")?.preview).toBeNull();
+
+    const light = await index.resolveLight("light_resolve");
+    expect(light).toMatchObject({
+      id: "light_resolve",
+      path: session,
+      cwd: root,
+      preview: null,
+    });
+    expect((await index.resolve("light_resolve"))?.preview).toBe("hidden in the cold tail");
   });
 
   it("coalesces concurrent full scans", async () => {

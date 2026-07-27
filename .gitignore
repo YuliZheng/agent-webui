@@ -32,3 +32,4 @@ progress.md
 # Accidental TypeScript config emit
 frontend/vite.config.js
 frontend/vite.config.js.map
+frontend/.build-staging/

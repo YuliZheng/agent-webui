@@ -1,0 +1,95 @@
+apply plugin: "com.android.application"
+
+import java.util.Properties
+
+def signingProperties = new Properties()
+def signingPropertiesFile = rootProject.file("keystore.properties")
+def hasReleaseSigning = signingPropertiesFile.exists()
+if (hasReleaseSigning) {
+    signingPropertiesFile.withInputStream { signingProperties.load(it) }
+}
+
+android {
+    namespace "com.lggram.agentwebui"
+    compileSdkVersion 33
+
+    defaultConfig {
+        applicationId "com.lggram.agentwebui"
+        minSdkVersion 26
+        targetSdkVersion 33
+        versionCode 2
+        versionName "1.0.1"
+
+        buildConfigField(
+            "String",
+            "WEB_APP_URL",
+            "\"https://lggram.tail6c8b6c.ts.net/\"",
+        )
+        testInstrumentationRunner "android.app.Instrumentation"
+    }
+
+    if (hasReleaseSigning) {
+        signingConfigs {
+            release {
+                storeFile rootProject.file(signingProperties.getProperty("storeFile"))
+                storePassword signingProperties.getProperty("storePassword")
+                keyAlias signingProperties.getProperty("keyAlias")
+                keyPassword signingProperties.getProperty("keyPassword")
+                enableV1Signing true
+                enableV2Signing true
+            }
+        }
+    }
+
+    buildTypes {
+        debug {
+            applicationIdSuffix ".debug"
+            versionNameSuffix "-debug"
+        }
+        release {
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
+            if (hasReleaseSigning) {
+                signingConfig signingConfigs.release
+            }
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+
+    testOptions {
+        unitTests.returnDefaultValues = true
+    }
+
+    lintOptions {
+        abortOnError true
+        checkReleaseBuilds true
+        htmlReport true
+        xmlReport true
+    }
+
+    sourceSets {
+        main.res.srcDir("$buildDir/generated/res/appIcon")
+    }
+}
+
+def prepareAppIcon = tasks.register("prepareAppIcon", Copy) {
+    from(rootProject.file("../frontend/public/favicon-1780988963583-transparent.png"))
+    into("$buildDir/generated/res/appIcon/drawable-nodpi")
+    rename { "ic_launcher.png" }
+}
+
+tasks.named("preBuild").configure {
+    dependsOn(prepareAppIcon)
+}
+
+dependencies {
+    testImplementation("junit:junit:4.13.2")
+}

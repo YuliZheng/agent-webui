@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Agent</string>
+    <string name="notification_channel_name">Agent 回复</string>
+    <string name="notification_channel_description">会话在后台收到新回复时提醒</string>
+    <string name="connection_error_title">暂时连接不上 Agent</string>
+    <string name="connection_error_default">请确认手机已经连接 Tailscale，然后重试。</string>
+    <string name="connection_error_with_code">请确认手机已经连接 Tailscale，然后重试。\n\n网络错误：%1$d</string>
+    <string name="connection_error_http">WebUI 暂时不可用（HTTP %1$d）。</string>
+    <string name="connection_error_tls">证书校验失败，App 已安全停止连接。</string>
+    <string name="retry">重试</string>
+    <string name="open_tailscale">打开 Tailscale</string>
+    <string name="tailscale_not_found">未找到 Tailscale，已打开网络设置。</string>
+    <string name="choose_file">选择附件</string>
+    <string name="no_file_picker">手机上没有可用的文件选择器。</string>
+    <string name="download_blocked">为保护登录信息，只允许下载 Agent WebUI 自己的文件。</string>
+    <string name="downloading">正在从 Agent WebUI 下载</string>
+    <string name="download_started">正在下载：%1$s</string>
+    <string name="download_failed">下载启动失败，请稍后重试。</string>
+    <string name="link_blocked">这个链接类型未获允许。</string>
+    <string name="no_link_handler">手机上没有能打开这个链接的应用。</string>
+</resources>

@@ -351,6 +351,7 @@ export async function scanCodexFile(path: string, previewBytes = BACK_SCAN_MAX):
   let id: string | undefined;
   let cwd: string | undefined;
   let parentSessionId: string | null = null;
+  let subagent = false;
   await scanJsonlHead(path, fileStat.size, line => {
     try {
       const record = asRecord(JSON.parse(line));
@@ -358,7 +359,13 @@ export async function scanCodexFile(path: string, previewBytes = BACK_SCAN_MAX):
       const payload = asRecord(record.payload);
       id = asString(payload?.id) ?? asString(payload?.thread_id) ?? asString(payload?.session_id);
       cwd = asString(payload?.cwd);
-      const parent = asString(payload?.parent_thread_id) ?? asString(payload?.session_id);
+      const source = asRecord(payload?.source);
+      const sourceSubagent = asRecord(source?.subagent);
+      const threadSpawn = asRecord(sourceSubagent?.thread_spawn);
+      subagent = asString(payload?.thread_source) === "subagent" || sourceSubagent !== null;
+      const parent = asString(payload?.parent_thread_id)
+        ?? asString(threadSpawn?.parent_thread_id)
+        ?? asString(payload?.session_id);
       parentSessionId = parent && parent !== id ? parent : null;
       return true;
     } catch { /* continue */ }
@@ -366,7 +373,17 @@ export async function scanCodexFile(path: string, previewBytes = BACK_SCAN_MAX):
   });
   if (!id || !cwd || !/^[0-9A-Za-z_-]+$/.test(id)) return null;
   const latest = latestMeaning(await readBackLines(path, fileStat.size, previewBytes), "codex");
-  return { id, path, cwd, agent: "codex", mtime: fileStat.mtime.toISOString(), size: fileStat.size, parentSessionId, ...latest };
+  return {
+    id,
+    path,
+    cwd,
+    agent: "codex",
+    mtime: fileStat.mtime.toISOString(),
+    size: fileStat.size,
+    parentSessionId,
+    subagent,
+    ...latest,
+  };
 }
 
 interface PersistedSessionIndex {
@@ -400,6 +417,10 @@ function normalizeCachedSession(value: unknown): SessionRecord | null {
     ? Math.floor(record.size)
     : undefined;
   if (!id || !/^[0-9A-Za-z_-]+$/.test(id) || !path || !cwd || !mtime || !agent || size === undefined) return null;
+  // Older persisted indexes predate Codex subagent classification. Reject
+  // those Codex rows once so startup reparses their small session_meta head;
+  // otherwise unchanged files would remain misclassified forever.
+  if (agent === "codex" && typeof record.subagent !== "boolean") return null;
   return {
     id,
     path,
@@ -407,6 +428,7 @@ function normalizeCachedSession(value: unknown): SessionRecord | null {
     mtime,
     size,
     agent,
+    ...(agent === "codex" ? { subagent: record.subagent === true } : {}),
     preview: optionalString(record, "preview"),
     lastTurnAt: optionalString(record, "lastTurnAt"),
     parentSessionId: optionalString(record, "parentSessionId"),
@@ -746,6 +768,46 @@ export class SessionIndex extends EventEmitter {
     } catch { /* stale cache entry */ }
     this.deleteRecord(id);
     return undefined;
+  }
+  /**
+   * Validate a cached session path without rescanning transcript content.
+   *
+   * Interactive prompt/tail/subscribe calls only need a trustworthy path,
+   * cwd, and agent. Rebuilding an up-to-16-MiB preview here made opening or
+   * resuming a cold session contend with historical archive discovery.
+   * Watchers continue to hydrate preview/lastTurnAt in the background.
+   */
+  async resolveLight(id: string): Promise<SessionRecord | undefined> {
+    const cached = this.records.get(id);
+    if (!cached) return undefined;
+    try {
+      const validated = await this.validatedPath(cached.path, cached.agent);
+      const info = await stat(validated.path);
+      const mtime = info.mtime.toISOString();
+      if (
+        validated.path === cached.path
+        && info.size === cached.size
+        && mtime === cached.mtime
+      ) return cached;
+
+      const refreshed: SessionRecord = {
+        ...cached,
+        path: validated.path,
+        size: info.size,
+        mtime,
+      };
+      if (
+        cached.path !== refreshed.path
+        && this.recordsByPath.get(cached.path)?.id === id
+      ) this.recordsByPath.delete(cached.path);
+      this.records.set(id, refreshed);
+      this.recordsByPath.set(refreshed.path, refreshed);
+      this.scheduleCacheWrite();
+      return refreshed;
+    } catch {
+      this.deleteRecord(id);
+      return undefined;
+    }
   }
   async indexPath(
     path: string,

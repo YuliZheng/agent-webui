@@ -24,6 +24,7 @@ import {
   readTail,
   resetJsonlIndexIoCounters,
   snapshotJsonl,
+  streamJsonlLines,
 } from "../src/services/jsonl.js";
 
 describe("JSONL indexing and tails", () => {
@@ -51,6 +52,30 @@ describe("JSONL indexing and tails", () => {
     await appendFile(path, `${JSON.stringify({ type: "file-history-snapshot" })}\n${JSON.stringify({ type: "system" })}\n`);
     await tailer.check();
     expect(events.at(-1)).toEqual({ type: "stream-line", index: 6, data: JSON.stringify({ type: "system" }) });
+    // A filtered physical record still has to advance the browser's source
+    // cursor (and prove the tail is alive). Without this signal the frontend
+    // mistakes every hidden Claude bookkeeping append for a stalled tail and
+    // tears down/rebuilds the subscription after three seconds.
+    await appendFile(path, `${JSON.stringify({ type: "file-history-snapshot", snapshot: "next" })}\n`);
+    await tailer.check();
+    expect(events.at(-1)).toEqual({ type: "stream-cursor", nextIndex: 8 });
+    await tailer.stop();
+  });
+
+  it("emits a liveness cursor while an appended physical record is still partial", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-webui-tail-partial-cursor-"));
+    const path = join(root, "a.jsonl");
+    await writeFile(path, `${JSON.stringify({ type: "user", message: { content: "hello" } })}\n`);
+    const events: any[] = [];
+    const tailer = new JsonlTailer(path, {
+      from: 0,
+      pollMs: 60_000,
+      filter: isRenderableClaudeLine,
+    }, event => events.push(event));
+    await tailer.start();
+    await appendFile(path, "{\"type\":\"file-history-snapshot\"");
+    await tailer.check();
+    expect(events.at(-1)).toEqual({ type: "stream-cursor", nextIndex: 1 });
     await tailer.stop();
   });
 
@@ -258,6 +283,37 @@ describe("JSONL indexing and tails", () => {
     await writeFile(path, `${raw}\n`);
     const snapshot = await snapshotJsonl(path);
     expect(snapshot.lines).toEqual([{ index: 0, raw }]);
+  });
+
+  it("streams exact byte offsets while omitting records above a finite cap", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-webui-bounded-stream-"));
+    const path = join(root, "a.jsonl");
+    const first = JSON.stringify({ type: "user", message: { content: "你好" } });
+    const oversized = JSON.stringify({ type: "file-history-snapshot", data: "x".repeat(512) });
+    const complete = `${first}\r\n${oversized}\n`;
+    await writeFile(path, `${complete}unfinished`);
+
+    const lines = [];
+    for await (const line of streamJsonlLines(path, { maxRecordBytes: 128, prefixBytes: 64 })) {
+      lines.push(line);
+    }
+
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toMatchObject({
+      index: 0,
+      startByte: 0,
+      endByte: Buffer.byteLength(`${first}\r\n`),
+      bytes: Buffer.byteLength(`${first}\r`),
+      raw: first,
+    });
+    expect(lines[1]).toMatchObject({
+      index: 1,
+      startByte: Buffer.byteLength(`${first}\r\n`),
+      endByte: Buffer.byteLength(complete),
+      bytes: Buffer.byteLength(oversized),
+      raw: undefined,
+    });
+    expect(lines[1]?.prefix).toContain('"type":"file-history-snapshot"');
   });
 
   it("resumes from from, completes partial bytes, and emits confirmed truncation", async () => {

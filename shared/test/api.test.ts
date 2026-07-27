@@ -29,6 +29,7 @@ describe("shared API runtime guards", () => {
       mtime: "2026-07-23T00:00:00.000Z",
       size: 123,
       agent: "codex",
+      subagent: true,
       title: null,
       status: "running",
     };
@@ -36,6 +37,7 @@ describe("shared API runtime guards", () => {
     expect(isSessionListItem({ ...valid, id: "../x" })).toBe(false);
     expect(isSessionListItem({ ...valid, size: Number.NaN })).toBe(false);
     expect(isSessionListItem({ ...valid, agent: "other-agent" })).toBe(false);
+    expect(isSessionListItem({ ...valid, subagent: "yes" })).toBe(false);
     expect(isAgentKind("claude")).toBe(true);
     expect(isAgentKind("other-agent")).toBe(false);
   });

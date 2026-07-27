@@ -1,0 +1,13 @@
+{
+  "name": "@claude-webui/shared",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./discriminate": "./claude-code-discriminate.ts",
+    "./sse": "./sse.ts",
+    "./api": "./api.ts",
+    "./prefs": "./prefs.ts"
+  },
+  "files": ["*.ts"]
+}

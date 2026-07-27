@@ -1,12 +1,9 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <g fill="#d97757">
-    <path d="M21 26c0-5 5-9 11-9s11 4 11 9v11c0 8-5 13-11 13s-11-5-11-13V26Z"/>
-    <path d="M20 28c-7 0-12-4-12-10 0-3 2-6 5-7l4 8 7 2-4 7Zm24 0c7 0 12-4 12-10 0-3-2-6-5-7l-4 8-7 2 4 7Z"/>
-    <path d="M23 36 9 32l-2 4 15 7 1-7Zm18 0 14-4 2 4-15 7-1-7ZM24 43 12 51l3 3 12-6-3-5Zm16 0 12 8-3 3-12-6 3-5Z"/>
-  </g>
-  <g fill="#fff">
-    <circle cx="27" cy="29" r="2.4"/>
-    <circle cx="37" cy="29" r="2.4"/>
-    <path d="M27 38c3 2 7 2 10 0v3c-3 2-7 2-10 0v-3Z"/>
-  </g>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" shape-rendering="crispEdges">
+  <!-- Pixel-art "Clawd" — terracotta body, white outline, two black eyes,
+       four chunky legs. Drawn as a single white silhouette path with the
+       orange fill nested one pixel inside, then eye squares on top. -->
+  <path fill="#ffffff" d="M1 2h14v10h-1v3h-2v-3h-2v3h-2v-3H6v3H4v-3H1z"/>
+  <path fill="#d97757" d="M2 3h12v9h-1v2h-1v-2h-3v2H8v-2H5v2H4v-2H2z"/>
+  <rect x="4" y="5" width="2" height="3" fill="#000000"/>
+  <rect x="10" y="5" width="2" height="3" fill="#000000"/>
 </svg>

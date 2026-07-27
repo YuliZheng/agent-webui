@@ -8,6 +8,7 @@ export interface SessionListItem {
   size: number;
   agent: AgentKind;
   peer?: boolean;
+  subagent?: boolean;
   title?: string | null;
   titleSource?: "auto" | "manual" | null;
   titleEmoji?: string | null;

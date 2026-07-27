@@ -16,6 +16,10 @@ interface OwnedClaude {
   initResolve?: (id: string) => void;
   initReject?: (error: Error) => void;
   interactions: Set<string>;
+  terminating?: boolean;
+  cleaned?: boolean;
+  cleanupDone: Promise<void>;
+  cleanupResolve: () => void;
 }
 
 export interface ClaudePromptOptions { model?: string; effort?: string; permissionMode?: string; images?: unknown[] }
@@ -42,18 +46,72 @@ export function claudeExitStatus(
     : "failed";
 }
 
+export function claudeInteractionResponse(
+  interaction: Interaction | undefined,
+  answer: unknown,
+): Record<string, unknown> {
+  const object = asRecord(answer);
+  const kind = asString(object?.kind);
+
+  if (kind === "deny" || object?.behavior === "deny" || answer === "deny" || answer === false) {
+    return {
+      behavior: "deny",
+      message: asString(object?.message) ?? "Denied by user",
+    };
+  }
+
+  if (kind === "ask-answers") {
+    const input = asRecord(interaction?.input) ?? {};
+    const questions = interaction?.questions ?? (Array.isArray(input.questions) ? input.questions : []);
+    const supplied = Array.isArray(object?.answers) ? object.answers : [];
+    const answers: Record<string, string> = {};
+    questions.forEach((rawQuestion, index) => {
+      const question = asRecord(rawQuestion);
+      const suppliedAnswer = asRecord(supplied[index]);
+      const key = asString(question?.question) ?? asString(question?.header) ?? `question-${index + 1}`;
+      const otherText = asString(suppliedAnswer?.otherText)?.trim();
+      const selectedLabel = asString(suppliedAnswer?.selectedLabel);
+      answers[key] = otherText || selectedLabel || "";
+    });
+    return {
+      behavior: "allow",
+      updatedInput: { ...input, answers },
+    };
+  }
+
+  const updatedInput =
+    object?.updatedInput ??
+    object?.answers ??
+    (interaction?.kind === "permission" ? interaction.input : answer);
+  return { behavior: "allow", updatedInput };
+}
+
 export class ClaudeDriver extends EventEmitter {
   private owned = new Map<string, OwnedClaude>();
   private all = new Set<OwnedClaude>();
   private clientIds = new Map<string, string>();
   private clientRequests = new Map<string, Promise<{ sessionId: string; queued: boolean }>>();
   private startingSessions = new Map<string, Promise<{ process: OwnedClaude; sessionId: Promise<string> }>>();
-  constructor(private binary: string, private sessionsDir: string, private state: AppState) { super(); }
+  private foreignAttachmentLookup?: (sessionId: string) => boolean | undefined;
+  constructor(
+    private binary: string,
+    private sessionsDir: string,
+    private state: AppState,
+    private spawnProcess: typeof spawn = spawn,
+    private initializationTimeoutMs = 15_000,
+  ) { super(); }
 
   isOwned(id: string): boolean { return this.owned.has(id); }
   isActive(id: string): boolean { return this.owned.get(id)?.active === true; }
+  setForeignAttachmentLookup(
+    lookup: (sessionId: string) => boolean | undefined,
+  ): void {
+    this.foreignAttachmentLookup = lookup;
+  }
 
   private async foreignAttachment(sessionId: string): Promise<boolean> {
+    const observed = this.foreignAttachmentLookup?.(sessionId);
+    if (observed !== undefined) return observed;
     let files: string[];
     try { files = await readdir(this.sessionsDir); } catch { return false; }
     for (const name of files) {
@@ -106,11 +164,16 @@ export class ClaudeDriver extends EventEmitter {
     const model = this.effective(options.model) ?? this.effective(settings?.model) ?? this.effective(prefs.defaultClaudeModel as string | undefined);
     const permission = this.effective(options.permissionMode) ?? this.effective(settings?.permissionMode) ?? this.effective(prefs.defaultClaudePermissionMode as string | undefined);
     const args = claudeSpawnArgs(resumeId, model, permission);
-    const child = spawn(this.binary, args, {
+    const child = this.spawnProcess(this.binary, args, {
       cwd, shell: false, stdio: ["pipe", "pipe", "pipe"], windowsHide: true,
       env: { ...process.env, AGENT_WEBUI: "1", ...(resumeId ? { AGENT_WEBUI_RESUME_SESSION_ID: resumeId } : {}) },
     });
-    const processState: OwnedClaude = { child, sessionId: resumeId, cwd, buffer: "", active: false, compacting: false, interactions: new Set() };
+    let cleanupResolve!: () => void;
+    const cleanupDone = new Promise<void>(resolve => { cleanupResolve = resolve; });
+    const processState: OwnedClaude = {
+      child, sessionId: resumeId, cwd, buffer: "", active: false, compacting: false,
+      interactions: new Set(), cleanupDone, cleanupResolve,
+    };
     this.all.add(processState);
     if (resumeId) this.owned.set(resumeId, processState);
     const sessionId = new Promise<string>((resolve, reject) => {
@@ -119,8 +182,9 @@ export class ClaudeDriver extends EventEmitter {
     });
     child.stdout.on("data", chunk => this.stdout(processState, String(chunk)));
     child.stderr.on("data", chunk => this.emit("stderr", { sessionId: processState.sessionId, text: String(chunk).slice(-4096) }));
-    child.on("error", error => processState.initReject?.(error));
-    child.on("exit", (code, signal) => this.exited(processState, code, signal));
+    child.on("error", error => this.cleanup(processState, null, null, error));
+    child.on("exit", (code, signal) => this.cleanup(processState, code, signal));
+    child.on("close", (code, signal) => this.cleanup(processState, code, signal));
     return { process: processState, sessionId };
   }
 
@@ -148,11 +212,16 @@ export class ClaudeDriver extends EventEmitter {
   }
 
   private handle(proc: OwnedClaude, event: Record<string, unknown>): void {
+    if (proc.terminating || proc.cleaned) return;
     const subtype = asString(event.subtype);
     if (event.type === "system" && subtype === "init") {
       const id = asString(event.session_id) ?? asString(event.sessionId);
       if (id && /^[0-9A-Za-z_-]+$/.test(id)) {
-        proc.sessionId = id; this.owned.set(id, proc); proc.initResolve?.(id); proc.initResolve = undefined;
+        proc.sessionId = id;
+        this.owned.set(id, proc);
+        proc.initResolve?.(id);
+        proc.initResolve = undefined;
+        proc.initReject = undefined;
         this.emit("init", { id, model: event.model, permissionMode: event.permissionMode ?? event.permission_mode });
       }
       this.setActive(proc, true);
@@ -211,12 +280,22 @@ export class ClaudeDriver extends EventEmitter {
 
   async newSession(cwd: string, prompt: string, options: ClaudePromptOptions = {}): Promise<{ sessionId: string }> {
     const started = await this.start(cwd, undefined, options);
-    this.write(started.process, this.input(prompt, options.images));
-    const sessionId = await Promise.race([
-      started.sessionId,
-      new Promise<never>((_, reject) => setTimeout(() => reject(new RpcError(504, "Claude did not initialize in time")), 15_000)),
-    ]);
-    return { sessionId };
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      this.write(started.process, this.input(prompt, options.images));
+      const sessionId = await Promise.race([
+        started.sessionId,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new RpcError(504, "Claude did not initialize in time")), this.initializationTimeoutMs);
+        }),
+      ]);
+      return { sessionId };
+    } catch (error) {
+      await this.terminate(started.process, error instanceof Error ? error : new Error(String(error)));
+      throw error;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   async prompt(sessionId: string, cwd: string, prompt: string, options: ClaudePromptOptions & { clientUuid?: string } = {}): Promise<{ sessionId: string; queued: boolean }> {
@@ -276,23 +355,47 @@ export class ClaudeDriver extends EventEmitter {
     const interaction = this.state.interactions.get(this.state.interactionKey(sessionId, requestId));
     proc.interactions.delete(requestId);
     this.state.interactions.delete(this.state.interactionKey(sessionId, requestId));
-    const object = asRecord(answer);
-    const behavior = object?.behavior === "deny" || answer === "deny" || answer === false ? "deny" : "allow";
-    const updatedInput = object?.updatedInput ?? object?.answers ?? (interaction?.kind === "permission" ? interaction.input : answer);
-    this.write(proc, { type: "control_response", response: { subtype: "success", request_id: requestId, response: { behavior, updatedInput } } });
+    const response = claudeInteractionResponse(interaction, answer);
+    this.write(proc, { type: "control_response", response: { subtype: "success", request_id: requestId, response } });
     this.emit("interaction-removed", { sessionId, requestId });
   }
 
-  private exited(proc: OwnedClaude, code: number | null, signal: NodeJS.Signals | null): void {
-    this.all.delete(proc); if (proc.sessionId) this.owned.delete(proc.sessionId);
-    proc.initReject?.(new RpcError(502, `Claude exited before initialization (${code ?? signal ?? "unknown"})`));
+  private async terminate(proc: OwnedClaude, error: Error): Promise<void> {
+    if (proc.cleaned) return;
+    proc.terminating = true;
+    proc.normalSignal = true;
+    proc.initReject?.(error);
+    proc.initResolve = undefined;
+    proc.initReject = undefined;
+    let signalled = false;
+    try { signalled = proc.child.kill("SIGTERM"); }
+    catch (killError) {
+      this.cleanup(proc, null, null, killError instanceof Error ? killError : error);
+    }
+    if (!signalled && proc.child.exitCode !== null) this.cleanup(proc, proc.child.exitCode, null, error);
+    await proc.cleanupDone;
+  }
+
+  private cleanup(proc: OwnedClaude, code: number | null, signal: NodeJS.Signals | null, error?: Error): void {
+    if (proc.cleaned) return;
+    proc.cleaned = true;
+    this.all.delete(proc);
+    if (proc.sessionId && this.owned.get(proc.sessionId) === proc) this.owned.delete(proc.sessionId);
+    proc.initReject?.(error ?? new RpcError(502, `Claude exited before initialization (${code ?? signal ?? "unknown"})`));
+    proc.initResolve = undefined;
+    proc.initReject = undefined;
     for (const requestId of proc.interactions) {
       if (proc.sessionId) {
         this.state.interactions.delete(this.state.interactionKey(proc.sessionId, requestId));
         this.emit("interaction-removed", { sessionId: proc.sessionId, requestId });
       }
     }
-    if (proc.sessionId) this.emit("status", { id: proc.sessionId, status: claudeExitStatus(code, signal, proc.normalSignal), webuiAlive: false });
+    if (proc.sessionId) this.emit("status", {
+      id: proc.sessionId,
+      status: error && !proc.normalSignal ? "failed" : claudeExitStatus(code, signal, proc.normalSignal),
+      webuiAlive: false,
+    });
+    proc.cleanupResolve();
   }
 
   close(): void { for (const proc of this.all) { proc.normalSignal = true; proc.child.kill("SIGTERM"); } }

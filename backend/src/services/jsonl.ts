@@ -89,7 +89,9 @@ let fullIndexBytesRead = 0;
 let appendedIndexBytesRead = 0;
 let activeColdIndexBuilds = 0;
 let peakColdIndexBuilds = 0;
-const coldIndexWaiters: Array<() => void> = [];
+const interactiveColdIndexWaiters: Array<() => void> = [];
+const backgroundColdIndexWaiters: Array<() => void> = [];
+type LineIndexPriority = "background" | "interactive";
 
 export function jsonlIndexIoCounters(): { fullBytes: number; appendedBytes: number } {
   return { fullBytes: fullIndexBytesRead, appendedBytes: appendedIndexBytesRead };
@@ -105,13 +107,23 @@ export function jsonlColdIndexConcurrency(): { active: number; peak: number } {
   return { active: activeColdIndexBuilds, peak: peakColdIndexBuilds };
 }
 
-async function withColdIndexPermit<T>(work: () => Promise<T>): Promise<T> {
+async function withColdIndexPermit<T>(
+  work: () => Promise<T>,
+  priority: LineIndexPriority = "background",
+): Promise<T> {
   if (activeColdIndexBuilds > 0) {
-    await new Promise<void>(resolve => coldIndexWaiters.push(() => {
+    await new Promise<void>(resolve => {
+      const waiter = () => {
       // Ownership is handed directly to this waiter. Keep the active count at
       // one throughout the handoff so a newly arriving build cannot slip in.
-      resolve();
-    }));
+        resolve();
+      };
+      // A selected/live session must not sit behind an archive-prefetch queue.
+      // It still waits for the one build already reading disk, then jumps ahead
+      // of queued background HTTP tails and preview work.
+      if (priority === "interactive") interactiveColdIndexWaiters.push(waiter);
+      else backgroundColdIndexWaiters.push(waiter);
+    });
   } else {
     activeColdIndexBuilds = 1;
   }
@@ -119,7 +131,7 @@ async function withColdIndexPermit<T>(work: () => Promise<T>): Promise<T> {
   try {
     return await work();
   } finally {
-    const next = coldIndexWaiters.shift();
+    const next = interactiveColdIndexWaiters.shift() ?? backgroundColdIndexWaiters.shift();
     if (next) next();
     else activeColdIndexBuilds = 0;
   }
@@ -435,11 +447,15 @@ async function buildLineIndexUnthrottled(path: string, info: { size: number; mti
   return touchLineIndex(path, index);
 }
 
-async function buildLineIndex(path: string, info: { size: number; mtimeMs: number }): Promise<LineIndex> {
+async function buildLineIndex(
+  path: string,
+  info: { size: number; mtimeMs: number },
+  priority: LineIndexPriority = "background",
+): Promise<LineIndex> {
   // Different sessions may be opened/prefetched at once. Serialize only cold
   // full-file indexing; same-session callers are also deduplicated by
   // lineIndexBuilds below. Incremental append indexing stays concurrent.
-  return withColdIndexPermit(() => buildLineIndexUnthrottled(path, info));
+  return withColdIndexPermit(() => buildLineIndexUnthrottled(path, info), priority);
 }
 
 async function extendLineIndex(
@@ -497,7 +513,10 @@ async function extendLineIndex(
   });
 }
 
-async function getLineIndex(path: string): Promise<LineIndex> {
+async function getLineIndex(
+  path: string,
+  priority: LineIndexPriority = "background",
+): Promise<LineIndex> {
   const info = await stat(path);
   const cached = lineIndexes.get(path);
   if (cached?.size === info.size && cached.mtimeMs === info.mtimeMs) return touchLineIndex(path, cached);
@@ -506,14 +525,14 @@ async function getLineIndex(path: string): Promise<LineIndex> {
   if (inFlight) {
     const built = await inFlight;
     if (built.size === info.size && built.mtimeMs === info.mtimeMs) return touchLineIndex(path, built);
-    return getLineIndex(path);
+    return getLineIndex(path, priority);
   }
 
   const build = cached && info.size > cached.size
     ? signaturesStillMatch(path, cached).then(matches => (
-      matches ? extendLineIndex(path, cached, info) : buildLineIndex(path, info)
+      matches ? extendLineIndex(path, cached, info) : buildLineIndex(path, info, priority)
     ))
-    : buildLineIndex(path, info);
+    : buildLineIndex(path, info, priority);
   lineIndexBuilds.set(path, build);
   try {
     return await build;
@@ -743,11 +762,159 @@ export async function countJsonlLines(path: string): Promise<number> {
   return (await getLineIndex(path)).lineCount;
 }
 
+export interface StreamedJsonlLine {
+  /** Zero-based physical line index. */
+  index: number;
+  /** Exact byte range in the source, including the terminating LF. */
+  startByte: number;
+  endByte: number;
+  /** Source bytes before the terminating LF (and including a possible CR). */
+  bytes: number;
+  /**
+   * Present only when the record fits within maxRecordBytes. Consumers must
+   * handle an omitted raw value explicitly instead of accidentally buffering
+   * an unbounded base64/file-history record.
+   */
+  raw?: string;
+  /** A small ASCII-safe diagnostic prefix used to classify omitted records. */
+  prefix: string;
+}
+
+export interface StreamJsonlOptions {
+  maxRecordBytes?: number;
+  prefixBytes?: number;
+}
+
+/**
+ * Iterate complete physical JSONL records from a fixed stat snapshot.
+ *
+ * Unlike readline and snapshotJsonl, this scanner never retains an unbounded
+ * physical line. Byte offsets are calculated from the source buffers, not
+ * from decoded strings, so callers can safely use them for exact truncation
+ * and prefix-copy mutations even when the file contains multi-byte UTF-8.
+ */
+export async function* streamJsonlLines(
+  path: string,
+  options: StreamJsonlOptions = {},
+): AsyncGenerator<StreamedJsonlLine> {
+  const maxRecordBytes = Math.floor(options.maxRecordBytes ?? MAX_JSONL_RECORD_BYTES);
+  const prefixLimit = Math.floor(options.prefixBytes ?? 64 * 1024);
+  if (!Number.isSafeInteger(maxRecordBytes) || maxRecordBytes < 1) {
+    throw new TypeError("maxRecordBytes must be a positive, finite safe integer");
+  }
+  if (!Number.isSafeInteger(prefixLimit) || prefixLimit < 0) {
+    throw new TypeError("prefixBytes must be a non-negative, finite safe integer");
+  }
+
+  const snapshotSize = (await stat(path)).size;
+  const handle = await open(path, "r");
+  let fileOffset = 0;
+  let lineStart = 0;
+  let lineIndex = 0;
+  let lineBytes = 0;
+  let retainedBytes = 0;
+  let prefixBytes = 0;
+  let oversized = false;
+  let parts: Buffer[] = [];
+  const prefixBuffer = Buffer.allocUnsafe(prefixLimit);
+
+  const append = (value: Buffer): void => {
+    if (!value.length) return;
+    lineBytes += value.length;
+    if (prefixBytes < prefixLimit) {
+      const keep = Math.min(value.length, prefixLimit - prefixBytes);
+      if (keep) {
+        value.copy(prefixBuffer, prefixBytes, 0, keep);
+        prefixBytes += keep;
+      }
+    }
+    if (oversized) return;
+    if (retainedBytes + value.length > maxRecordBytes) {
+      oversized = true;
+      retainedBytes = 0;
+      parts = [];
+      return;
+    }
+    parts.push(Buffer.from(value));
+    retainedBytes += value.length;
+  };
+
+  try {
+    while (fileOffset < snapshotSize) {
+      const requested = Math.min(LINE_INDEX_READ_CHUNK_BYTES, snapshotSize - fileOffset);
+      const chunk = Buffer.allocUnsafe(requested);
+      const result = await handle.read(chunk, 0, requested, fileOffset);
+      if (!result.bytesRead) break;
+      const actual = chunk.subarray(0, result.bytesRead);
+      let cursor = 0;
+      while (cursor < actual.length) {
+        const newline = actual.indexOf(0x0a, cursor);
+        if (newline < 0) {
+          append(actual.subarray(cursor));
+          break;
+        }
+        append(actual.subarray(cursor, newline));
+        let raw: string | undefined;
+        if (!oversized) {
+          raw = retainedBytes ? Buffer.concat(parts, retainedBytes).toString("utf8") : "";
+          if (raw.endsWith("\r")) raw = raw.slice(0, -1);
+        }
+        const endByte = fileOffset + newline + 1;
+        yield {
+          index: lineIndex,
+          startByte: lineStart,
+          endByte,
+          bytes: lineBytes,
+          raw,
+          prefix: raw === undefined && prefixBytes
+            ? prefixBuffer.subarray(0, prefixBytes).toString("utf8")
+            : "",
+        };
+        lineIndex++;
+        lineStart = endByte;
+        lineBytes = 0;
+        retainedBytes = 0;
+        prefixBytes = 0;
+        oversized = false;
+        parts = [];
+        cursor = newline + 1;
+      }
+      fileOffset += result.bytesRead;
+      if (result.bytesRead < requested) break;
+    }
+  } finally {
+    await handle.close();
+  }
+}
+
 export async function readRange(path: string, from: number, to?: number): Promise<IndexedRawLine[]> {
   const start = Math.max(0, Math.floor(from));
   const requestedEnd = to === undefined ? Number.MAX_SAFE_INTEGER : Math.max(start, Math.floor(to));
   const end = Math.min(requestedEnd, start + MAX_READ_RANGE_LINES);
   return (await indexedSnapshot(path, { from: start, to: end, maxBytes: MAX_READ_RESPONSE_BYTES })).lines;
+}
+
+/**
+ * Read one exact physical record with a caller-selected record cap.
+ *
+ * Transcript image records can legitimately exceed the normal 4 MiB display
+ * limit because they contain base64 bytes. The ordinary tail/range APIs keep
+ * that defensive cap; the authenticated image endpoint uses this narrow
+ * accessor and immediately decodes at most one bounded image.
+ */
+export async function readRecordAt(
+  path: string,
+  index: number,
+  maxRecordBytes: number,
+): Promise<IndexedRawLine | undefined> {
+  if (!Number.isSafeInteger(index) || index < 0) return undefined;
+  const boundedMax = Math.max(1, Math.floor(maxRecordBytes));
+  return (await indexedSnapshot(path, {
+    from: index,
+    to: index + 1,
+    maxBytes: boundedMax,
+    maxRecordBytes: boundedMax,
+  })).lines[0];
 }
 
 export async function readTail(path: string, n = 200): Promise<IndexedRawLine[]> {
@@ -787,6 +954,12 @@ export type TailEvent =
   | { type: "stream-reset" }
   | { type: "stream-batch"; lines: IndexedRawLine[] }
   | { type: "stream-line"; index: number; data: string }
+  // Advances the physical source high-water mark without sending a record.
+  // Claude transcripts contain large bookkeeping records that the backend
+  // intentionally filters out. The cursor prevents clients from repeatedly
+  // requesting those hidden lines and also acts as a cheap tail-liveness
+  // signal while an appended record is still incomplete.
+  | { type: "stream-cursor"; nextIndex: number }
   | { type: "error"; code: number; message: string };
 
 export interface TailOptions {
@@ -816,7 +989,7 @@ export class JsonlTailer {
   constructor(private path: string, private options: TailOptions, private emit: (event: TailEvent) => void) {}
 
   async start(): Promise<void> {
-    const index = await getLineIndex(this.path);
+    const index = await getLineIndex(this.path, "interactive");
     const snapshot = await snapshotFromIndex(this.path, index, { from: 0, to: 0 });
     this.positionBytes = snapshot.size;
     this.lastSize = snapshot.size;
@@ -1002,7 +1175,7 @@ export class JsonlTailer {
   }
 
   private async rescan(): Promise<void> {
-    const index = await getLineIndex(this.path);
+    const index = await getLineIndex(this.path, "interactive");
     const snapshot = await snapshotFromIndex(this.path, index, { from: 0, to: 0 });
     const oldCount = this.nextIndex;
     this.positionBytes = snapshot.size;
@@ -1086,6 +1259,18 @@ export class JsonlTailer {
       );
       if (visible.length === 1) this.emit({ type: "stream-line", index: visible[0]!.index, data: visible[0]!.raw });
       else if (visible.length) this.emit({ type: "stream-batch", lines: visible });
+      // If the last consumed physical line was hidden (or no newline has
+      // completed yet), no visible stream event represents the current source
+      // position. Emit a cursor-only event so the browser advances over
+      // filtered records and its desync watchdog sees that this tail is alive.
+      // When the last physical line is visible, stream-line/stream-batch
+      // already carries the same high-water mark and this extra event is
+      // unnecessary.
+      const lastPhysical = lines.at(-1);
+      const lastVisible = visible.at(-1);
+      if (!lastPhysical || lastVisible?.index !== lastPhysical.index) {
+        this.emit({ type: "stream-cursor", nextIndex: this.nextIndex });
+      }
       await this.updateCheckpoints();
       if (this.positionBytes < info.size) this.checkQueued = true;
     } catch (error) {

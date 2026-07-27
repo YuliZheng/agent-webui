@@ -17,6 +17,15 @@ async function fixture(options: ConstructorParameters<typeof ClaudeProcessObserv
 }
 
 describe("Claude process registration observer", () => {
+  it("exposes cached ownership only after its initial scan", async () => {
+    const { directory, observer } = await fixture();
+    await writeFile(join(directory, "peer.json"), JSON.stringify({ sessionId: "peer_session", pid: process.pid }));
+    expect(observer.foreignAttachment("peer_session")).toBeUndefined();
+    await observer.start();
+    expect(observer.foreignAttachment("peer_session")).toBe(true);
+    expect(observer.foreignAttachment("absent_session")).toBe(false);
+  });
+
   it("reports a live peer on registration add and clears it after deletion", async () => {
     const { directory, observer } = await fixture();
     const events: ForeignClaudeObservation[] = [];

@@ -1,4 +1,5 @@
 import { isRecord } from "../api.js";
+export * from "./context-usage.js";
 
 export interface CodexRolloutLine {
   timestamp: string;

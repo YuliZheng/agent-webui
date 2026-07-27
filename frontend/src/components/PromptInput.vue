@@ -1,0 +1,876 @@
+<script setup lang="ts">
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { isForwardedSlashCommand, newSession, sendPrompt, type OutgoingImage } from "../api/sessions.js";
+import { useSessionsStore } from "../stores/sessions.js";
+import { useDraftsStore } from "../stores/drafts.js";
+import { useImageDraftsStore, type PendingImage } from "../stores/image-drafts.js";
+import { usePrefsStore } from "../stores/prefs.js";
+import { useNotificationsStore } from "../stores/notifications.js";
+import { useUiStore } from "../stores/ui.js";
+import { usePromptPendingStore } from "../stores/prompt-pending.js";
+import { useSessionCacheStore } from "../stores/session-cache.js";
+import { useSessionSkillsStore } from "../stores/session-skills.js";
+import PillRow from "./PillRow.vue";
+import { useSlashMenu } from "../composables/useSlashMenu.js";
+import SlashCommandMenu from "./SlashCommandMenu.vue";
+import { useSessionSettingsStore } from "../stores/session-settings.js";
+import { promotePendingDraft } from "../stores/live.js";
+import { parseLocalCommand, runLocalCommand, latestContextUsage, HIDDEN_CLI_COMMANDS } from "../util/local-commands.js";
+
+const props = defineProps<{ sessionId: string; running: boolean }>();
+const emit = defineEmits<{ "mobile-composer-focus": [] }>();
+
+const drafts = useDraftsStore();
+const imageDrafts = useImageDraftsStore();
+const prefs = usePrefsStore();
+const sessions = useSessionsStore();
+
+// Returns the trigger keyword IF it should be appended to the outgoing
+// message, or "" if not (off, or already present in the typed text).
+function pendingThinkingTrigger(text: string): string {
+  const t = prefs.thinkingTrigger;
+  if (!t) return "";
+  if (text && text.toLowerCase().includes(t)) return "";
+  return t;
+}
+
+// Text-only convenience: returns the prompt with the trigger appended at
+// the end.
+function applyThinkingTrigger(text: string): string {
+  const trimmed = text.trim();
+  if (!trimmed) return text;
+  const trig = pendingThinkingTrigger(trimmed);
+  return trig ? `${trimmed} ${trig}` : text;
+}
+
+function idempotencyFingerprint(value: string): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < value.length; index++) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return `${value.length}:${(hash >>> 0).toString(36)}`;
+}
+const notifications = useNotificationsStore();
+const ui = useUiStore();
+const promptPending = usePromptPendingStore();
+const sessionCache = useSessionCacheStore();
+const sessionSettings = useSessionSettingsStore();
+const sessionSkills = useSessionSkillsStore();
+
+const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+const ACCEPTED_ATTACHMENT_MIME = /^(?:image\/(?:png|jpe?g|gif|webp|bmp)|application\/pdf)$/i;
+const PDF_MIME = "application/pdf";
+
+const pendingImages = computed(() => imageDrafts.list(props.sessionId));
+const hasPendingImages = computed(() => pendingImages.value.length > 0);
+
+function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error ?? new Error("FileReader error"));
+    reader.onload = () => {
+      const result = reader.result as string;
+      const comma = result.indexOf(",");
+      resolve(comma >= 0 ? result.slice(comma + 1) : result);
+    };
+    reader.readAsDataURL(blob);
+  });
+}
+
+function blobToDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error ?? new Error("FileReader error"));
+    reader.onload = () => resolve(reader.result as string);
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function ingestAttachmentBlob(blob: Blob, name?: string) {
+  if (!ACCEPTED_ATTACHMENT_MIME.test(blob.type)) {
+    notifications.pushError(`Unsupported file type: ${blob.type || "unknown"}`);
+    return;
+  }
+  if (blob.size > MAX_ATTACHMENT_BYTES) {
+    notifications.pushError(`File too large (max ${MAX_ATTACHMENT_BYTES / 1024 / 1024}MB)`);
+    return;
+  }
+  try {
+    const [base64, dataUrl] = await Promise.all([blobToBase64(blob), blobToDataUrl(blob)]);
+    imageDrafts.add(props.sessionId, {
+      mime: blob.type,
+      base64,
+      dataUrl,
+      bytes: blob.size,
+      ...(name ? { name } : {}),
+    });
+  } catch (err) {
+    notifications.pushError(err instanceof Error ? err.message : String(err), { title: "File read failed" });
+  }
+}
+
+function isPdfDraft(mime: string): boolean {
+  return mime.toLowerCase() === PDF_MIME;
+}
+
+async function onPaste(e: ClipboardEvent) {
+  const items = e.clipboardData?.items;
+  if (!items || items.length === 0) return;
+  const blobs: { blob: Blob; name?: string }[] = [];
+  for (const item of items) {
+    if (item.kind === "file") {
+      const f = item.getAsFile();
+      if (f && ACCEPTED_ATTACHMENT_MIME.test(f.type)) blobs.push({ blob: f, name: f.name });
+    }
+  }
+  if (blobs.length === 0) return;
+  e.preventDefault();
+  for (const { blob, name } of blobs) {
+    await ingestAttachmentBlob(blob, name);
+  }
+}
+
+// Desktop keeps the combined picker. Mobile uses separate inputs behind our
+// own WeChat-style tray so tapping + does not first show Android's unstyleable
+// "Camera / Photos" chooser.
+const fileInputRef = ref<HTMLInputElement | null>(null);
+const galleryInputRef = ref<HTMLInputElement | null>(null);
+const cameraInputRef = ref<HTMLInputElement | null>(null);
+const browseInputRef = ref<HTMLInputElement | null>(null);
+const attachmentTrayOpen = ref(false);
+
+function openFilePicker() { fileInputRef.value?.click(); }
+
+function toggleAttachmentTray() {
+  if (isDesktopViewport.value) {
+    attachmentTrayOpen.value = false;
+    openFilePicker();
+    return;
+  }
+  attachmentTrayOpen.value = !attachmentTrayOpen.value;
+  if (attachmentTrayOpen.value) {
+    textareaRef.value?.blur();
+    stopWechatComposerResize();
+  }
+}
+
+function openGalleryPicker() {
+  attachmentTrayOpen.value = false;
+  galleryInputRef.value?.click();
+}
+
+function openCameraPicker() {
+  attachmentTrayOpen.value = false;
+  cameraInputRef.value?.click();
+}
+
+function openFileBrowser() {
+  attachmentTrayOpen.value = false;
+  browseInputRef.value?.click();
+}
+
+async function onFileInput(e: Event) {
+  const input = e.target as HTMLInputElement;
+  const files = input.files;
+  if (files) {
+    for (const f of files) await ingestAttachmentBlob(f, f.name);
+  }
+  // Reset so picking the same file twice still fires `change`.
+  input.value = "";
+}
+
+function removeImage(imgId: string) {
+  imageDrafts.remove(props.sessionId, imgId);
+}
+
+function imagePayload(): OutgoingImage[] {
+  return pendingImages.value.map((p) => ({ mime: p.mime, data: p.base64 }));
+}
+
+const text = computed<string>({
+  get: () => drafts.text(props.sessionId),
+  set: (v) => drafts.set(props.sessionId, v),
+});
+
+const caret = ref(0);
+const sessionIdRef = computed(() => props.sessionId);
+const slash = useSlashMenu({ text, caret, sessionId: sessionIdRef });
+
+// Recompute the menu whenever the caret might have moved or content changed.
+function syncSlash() {
+  caret.value = textareaRef.value?.selectionStart ?? text.value.length;
+  void slash.refresh();
+}
+
+async function providerSlashCommandsFor(raw: string, sid: string): Promise<string[]> {
+  if (!raw.startsWith("/")) return [];
+  const s = sessions.byId[sid];
+  await sessionSkills.ensureLoaded(sid, {
+    ...(s?.cwd ? { cwd: s.cwd } : {}),
+    ...(s?.agent ? { agent: s.agent } : {}),
+  });
+  // Drop the hidden terminal-only built-ins so escapeSlashCommand treats them
+  // as unknown (space-prepend) — they must never reach the CLI.
+  return sessionSkills.list(sid).map((s) => s.name)
+    .filter((n) => !HIDDEN_CLI_COMMANDS.has(n.toLowerCase()));
+}
+
+// Apply a slash-menu selection: write the new text to the drafts store and
+// restore the caret after the inserted "/name ".
+async function applySlashAccept(index?: number) {
+  const res = index === undefined ? slash.accept() : slash.accept(index);
+  if (!res) return;
+  drafts.set(props.sessionId, res.text);
+  slash.close();
+  await nextTick();
+  const ta = textareaRef.value;
+  if (ta) {
+    ta.focus();
+    ta.setSelectionRange(res.caret, res.caret);
+  }
+  caret.value = res.caret;
+  autoResizeTextarea();
+}
+
+const textareaRef = ref<HTMLTextAreaElement | null>(null);
+const WECHAT_COMPOSER_DEFAULT_PX = 142;
+const WECHAT_COMPOSER_MIN_PX = 96;
+// Floor for the drag ceiling. The real ceiling is viewport-relative (see
+// wechatComposerMaxPx) so a tall window lets the composer be pulled tall; this
+// static value only applies when window height is unavailable (SSR/tests).
+const WECHAT_COMPOSER_MAX_FLOOR_PX = 320;
+// Composer height is a per-device ergonomic pref, not per-session. Persist it
+// to localStorage so a remount (new session from the empty state, refresh, or
+// a fresh PWA window) reloads the user's last height instead of snapping back
+// to the default.
+const WECHAT_COMPOSER_HEIGHT_KEY = "cw:wechat-composer-height";
+function loadComposerHeight(): number {
+  try {
+    const raw = localStorage.getItem(WECHAT_COMPOSER_HEIGHT_KEY);
+    if (raw) return clampComposerHeight(Number(raw));
+  } catch { /* ignore */ }
+  return WECHAT_COMPOSER_DEFAULT_PX;
+}
+function saveComposerHeight(v: number) {
+  try { localStorage.setItem(WECHAT_COMPOSER_HEIGHT_KEY, String(v)); } catch { /* ignore */ }
+}
+const wechatComposerHeight = ref(loadComposerHeight());
+const wechatResizing = ref(false);
+let wechatResizeStartY = 0;
+let wechatResizeStartHeight = WECHAT_COMPOSER_DEFAULT_PX;
+
+const isWechatComposer = computed(() => prefs.messageDisplayStyle === "wechat");
+const isDesktopViewport = ref(false);
+let desktopViewportQuery: MediaQueryList | null = null;
+const composerStyle = computed(() =>
+  isWechatComposer.value
+    ? { "--cw-wechat-composer-height": `${wechatComposerHeight.value}px` }
+    : undefined,
+);
+const showSendButton = computed(() =>
+  hasComposerContent.value || (isWechatComposer.value && isDesktopViewport.value),
+);
+const sendLabel = computed(() => (isWechatComposer.value && isDesktopViewport.value ? "发送(S)" : "Send"));
+
+function updateDesktopViewport(e?: MediaQueryList | MediaQueryListEvent) {
+  isDesktopViewport.value = !!e?.matches;
+  if (isDesktopViewport.value) attachmentTrayOpen.value = false;
+}
+
+function onTextareaFocus() {
+  attachmentTrayOpen.value = false;
+  if (!isDesktopViewport.value) emit("mobile-composer-focus");
+}
+
+// Drag ceiling scales with the window: up to 72% of viewport height (matching
+// the CSS `max-height` on .cw-prompt-input), never below the static floor. This
+// is what lets the composer be pulled much taller on a big screen.
+function wechatComposerMaxPx(): number {
+  const vh = typeof window !== "undefined" ? window.innerHeight : 0;
+  return vh > 0 ? Math.max(WECHAT_COMPOSER_MAX_FLOOR_PX, Math.round(vh * 0.72)) : WECHAT_COMPOSER_MAX_FLOOR_PX;
+}
+
+function clampComposerHeight(v: number): number {
+  return Math.max(WECHAT_COMPOSER_MIN_PX, Math.min(wechatComposerMaxPx(), Math.round(v)));
+}
+
+function onWechatComposerResizeMove(e: PointerEvent) {
+  if (!wechatResizing.value) return;
+  const dy = wechatResizeStartY - e.clientY;
+  wechatComposerHeight.value = clampComposerHeight(wechatResizeStartHeight + dy);
+}
+
+function stopWechatComposerResize() {
+  if (!wechatResizing.value) return;
+  wechatResizing.value = false;
+  window.removeEventListener("pointermove", onWechatComposerResizeMove);
+  window.removeEventListener("pointerup", stopWechatComposerResize);
+  window.removeEventListener("pointercancel", stopWechatComposerResize);
+  saveComposerHeight(wechatComposerHeight.value);
+}
+
+function startWechatComposerResize(e: PointerEvent) {
+  if (!isWechatComposer.value) return;
+  e.preventDefault();
+  wechatResizing.value = true;
+  wechatResizeStartY = e.clientY;
+  wechatResizeStartHeight = wechatComposerHeight.value;
+  window.addEventListener("pointermove", onWechatComposerResizeMove);
+  window.addEventListener("pointerup", stopWechatComposerResize);
+  window.addEventListener("pointercancel", stopWechatComposerResize);
+}
+
+function resetWechatComposerHeight() {
+  wechatComposerHeight.value = WECHAT_COMPOSER_DEFAULT_PX;
+  saveComposerHeight(WECHAT_COMPOSER_DEFAULT_PX);
+}
+
+// Per-session derived predicates
+const isInflightHere = computed(() => drafts.isInflight(props.sessionId));
+const canSend = computed(
+  () => text.value.trim().length > 0 || hasPendingImages.value,
+);
+const hasComposerContent = computed(
+  () => text.value.trim().length > 0 || hasPendingImages.value,
+);
+
+function friendlySendError(err: unknown): string {
+  if (err && typeof err === "object" && (err as { name?: string }).name === "AbortError") {
+    return "Send timed out — refresh the page if SSO needs re-auth, then try again. Your text is kept.";
+  }
+  return err instanceof Error ? err.message : String(err);
+}
+
+async function send() {
+  if (!canSend.value) return;
+  attachmentTrayOpen.value = false;
+  const sid = props.sessionId;
+  // Webui-local control commands (/model, /context) branch off here: handled
+  // in the browser, never sent to the agent. Only on a real session —
+  // pending drafts have no id to control.
+  if (!sessions.isPending(sid)) {
+    const isCodex = sessions.byId[sid]?.agent === "codex";
+    const cmd = parseLocalCommand(text.value, isCodex);
+    if (cmd) {
+      const model = isCodex
+        ? sessionSettings.effectiveCodex(sid).model
+        : sessionSettings.effective(sid).model;
+      const contextUsage = latestContextUsage(
+        sessionCache.bySession[sid]?.lines ?? [],
+        isCodex,
+        model,
+        prefs.autoCompactWindow,
+        prefs.codexAutoCompactWindow,
+      );
+      await runLocalCommand(cmd, {
+        sessionId: sid,
+        isCodex,
+        model,
+        ctxTokens: contextUsage.tokens,
+        ctxLimit: contextUsage.limit,
+        ctxReportedTokens: contextUsage.reportedTokens,
+        ctxEstimatedTokens: contextUsage.estimatedTokens,
+        ctxContributors: contextUsage.contributors,
+        lines: sessionCache.bySession[sid]?.lines ?? [],
+      });
+      drafts.clearIfMatches(sid, text.value);
+      return;
+    }
+  }
+  const snapText = text.value;
+  const snapImages = imagePayload();
+  const snapImageIds = pendingImages.value.map((image) => image.id);
+  // Pending draft → spawn a new session via newSession instead of POSTing
+  // a prompt to a (non-existent) session id. live.ts will swap selection
+  // to the real id when the file watcher fires session-added.
+  const draftCwd = sessions.isPending(sid) ? sessions.byId[sid]?.cwd : null;
+  // Paint before any provider metadata lookup or backend round trip. Pending
+  // drafts keep the same immediate feedback; live.ts transfers the chip to
+  // the real session id when session-added reconciles the draft.
+  const showOptimistic = snapText.trim().length > 0 || snapImages.length > 0;
+  let pendId: string | null = null;
+  if (showOptimistic) {
+    const sessionState = sessionCache.bySession[sid];
+    // `nextLineIndex` is the physical source high-water mark. `lines` is a
+    // sparse render cache and can lag it when the backend filters non-rendered
+    // records, so lines.length is not a safe send boundary.
+    const startLineIndex = sessionState?.nextLineIndex ?? sessionState?.lines.length ?? 0;
+    const agent = sessions.byId[sid]?.agent ?? "claude";
+    pendId = promptPending.add(sid, {
+      text: snapText,
+      imageCount: pendingImages.value.length,
+      startedAtLineCount: startLineIndex,
+      agent,
+      // codex mid-turn = backend routes through turn/steer (injected into the
+      // live turn immediately, not queued). Label the bubble honestly.
+      ...(agent === "codex" && props.running ? { steered: true } : {}),
+    });
+    // Give Vue a render turn before provider metadata lookup or network I/O.
+    // This makes the full user bubble visible in the same interaction frame;
+    // the durable JSONL/rollout record replaces it when it arrives.
+    await nextTick();
+  }
+  const slashCommands = await providerSlashCommandsFor(snapText, sid);
+  const providerSlash = isForwardedSlashCommand(snapText, slashCommands);
+  drafts.beginInflight(sid);
+  let dispatched = false;
+  let clearedTextOnDispatch = false;
+  let removedImagesOnDispatch: PendingImage[] = [];
+  const markDispatched = () => {
+    if (dispatched) return;
+    dispatched = true;
+    if (pendId) promptPending.markDispatched(sid, pendId);
+    // The message has left the browser. Reflect that immediately instead of
+    // leaving a duplicate copy in the composer while a new Codex thread boots
+    // MCP servers. The optimistic user bubble remains visible above.
+    clearedTextOnDispatch = drafts.clearIfMatches(sid, snapText);
+    removedImagesOnDispatch = imageDrafts.take(sid, snapImageIds);
+  };
+  try {
+    if (draftCwd) {
+      // Pending draft path: spawn the session via newSession. Model /
+      // permission / effort picks made on the draft's pill row ride along
+      // too, so they apply from the very first turn.
+      const draftSettings = sessions.pendingDrafts[sid];
+      const clientFingerprint = idempotencyFingerprint(JSON.stringify([
+        snapText,
+        snapImageIds,
+        sessions.byId[sid]?.agent ?? "claude",
+        draftSettings?.model ?? "",
+        draftSettings?.permissionMode ?? "",
+        draftSettings?.effort ?? "",
+        draftSettings?.serviceTier ?? "",
+      ]));
+      const clientUuid = sessions.newSessionClientUuid(
+        sid,
+        clientFingerprint,
+        pendId ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      );
+      const created = await newSession(
+        {
+          cwd: draftCwd,
+          prompt: providerSlash ? snapText : applyThinkingTrigger(snapText),
+          clientUuid,
+          ...(snapImages.length ? { images: snapImages } : {}),
+          ...(slashCommands.length ? { slashCommands } : {}),
+          ...(sessions.byId[sid]?.agent ? { agent: sessions.byId[sid]!.agent } : {}),
+          ...(draftSettings?.model ? { model: draftSettings.model } : {}),
+          ...(draftSettings?.permissionMode ? { permissionMode: draftSettings.permissionMode } : {}),
+          ...(draftSettings?.effort ? { effort: draftSettings.effort } : {}),
+          ...(draftSettings?.serviceTier !== undefined ? { serviceTier: draftSettings.serviceTier } : {}),
+        },
+        markDispatched,
+      );
+      promotePendingDraft(sid, created.sessionId);
+    } else {
+      await sendPrompt(
+        sid,
+        providerSlash ? snapText : applyThinkingTrigger(snapText),
+        snapImages.length ? snapImages : undefined,
+        pendId ?? undefined,
+        slashCommands,
+        markDispatched,
+      );
+    }
+    // onSent normally calls this synchronously with WebSocket.send(). Keep an
+    // idempotent success fallback so a future transport cannot resolve a
+    // request without committing the dispatched composer state.
+    markDispatched();
+    const settledSid = sessions.resolvePromoted(sid);
+    if (pendId) promptPending.markAccepted(settledSid, pendId);
+  } catch (err) {
+    // Before dispatch, the original composer state is still intact. After
+    // dispatch it was cleared for responsive feedback, so restore exactly
+    // what this attempt removed. restoreBefore preserves any newer draft.
+    const settledSid = sessions.resolvePromoted(sid);
+    if (dispatched) {
+      if (clearedTextOnDispatch) drafts.restoreBefore(settledSid, snapText);
+      imageDrafts.restore(settledSid, removedImagesOnDispatch);
+    }
+    // Drop the optimistic bubble so it doesn't linger pretending success.
+    if (pendId) promptPending.remove(settledSid, pendId);
+    notifications.pushError(friendlySendError(err), { title: "Send failed" });
+  } finally {
+    drafts.endInflight(sessions.resolvePromoted(sid));
+    // Re-enabling the textarea after the in-flight window does NOT restore
+    // focus on its own — disabling a focused element blurs it, so the caret
+    // is lost and the user can't fire off a second message without clicking
+    // back in. Restore focus on desktop. Skip touch (would pop the on-screen
+    // keyboard), and bail if the user switched sessions mid-send.
+    if (isDesktopLike && sid === props.sessionId) {
+      await nextTick();
+      textareaRef.value?.focus();
+    }
+  }
+}
+
+// Desktop-like = either hover-capable OR has a fine pointer. The earlier
+// AND-version was too strict — some hybrid laptops (touch screens with a
+// connected mouse, certain Chromium/Edge builds, browsing through corporate
+// proxies) report only one of the two even when there's clearly a real
+// keyboard + mouse. Pure touch phones report neither, so the OR keeps them
+// in "Send-button only" mode. Evaluated once at mount; we don't expect users
+// to plug in a mouse mid-session.
+const isDesktopLike = typeof window !== "undefined"
+  && typeof window.matchMedia === "function"
+  && (window.matchMedia("(hover: hover)").matches
+    || window.matchMedia("(pointer: fine)").matches);
+
+// Desktop + Claude-Code skin → render the unified single-box composer
+// (textarea on top, model/approval pills + send in a bottom toolbar) that
+// mirrors the real Claude Code input. Everything else — mobile (any skin) and
+// the other desktop skins — keeps the WeChat-style row below (v-else).
+const isCcDesktop = computed(() => isDesktopViewport.value && prefs.messageDisplayStyle === "claude-code");
+
+function onTextareaKey(e: KeyboardEvent) {
+  if (slash.open.value && !e.isComposing) {
+    if (e.key === "ArrowDown") { e.preventDefault(); slash.moveDown(); return; }
+    if (e.key === "ArrowUp") { e.preventDefault(); slash.moveUp(); return; }
+    if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); void applySlashAccept(); return; }
+    if (e.key === "Escape") { e.preventDefault(); slash.close(); return; }
+  }
+  // A real character keystroke (not Ctrl/Cmd/Alt shortcut) re-enables the menu
+  // after it was suppressed by a paste or closed with Escape. Generic input/
+  // keyup/click events must NOT clear suppression, or a pasted path would pop
+  // the menu open on the input event that follows the paste.
+  if (!e.metaKey && !e.ctrlKey && !e.altKey &&
+      (e.key.length === 1 || e.key === "Backspace" || e.key === "Delete")) {
+    slash.noteInput();
+  }
+  if (e.key !== "Enter" || e.isComposing) return;
+  // Cmd/Ctrl+Enter = send everywhere (escape hatch on mobile, redundant on desktop).
+  if (e.metaKey || e.ctrlKey) {
+    e.preventDefault();
+    void send();
+    return;
+  }
+  // Plain Enter on desktop: behavior depends on user setting (default: send).
+  // Shift+Enter always inserts a newline. Mobile always inserts a newline.
+  if (isDesktopLike && !e.shiftKey && ui.enterBehavior === "send") {
+    e.preventDefault();
+    void send();
+  }
+}
+
+// Auto-grow the textarea from a single-line baseline up to a cap, so the
+// composer stays compact by default and only takes vertical space when the
+// user actually types a long prompt. WeChat / Doubao behave the same way.
+const TEXTAREA_MAX_PX = 192; // ~8 lines at text-sm
+function autoResizeTextarea() {
+  const el = textareaRef.value;
+  if (!el) return;
+  // Reset height before measuring so scrollHeight can shrink as well as grow.
+  el.style.height = "auto";
+  // Empty textarea: don't trust scrollHeight. After a v-if remount or a
+  // session switch, the watcher fires on `nextTick` which doesn't always
+  // wait for the browser's layout pass to settle — scrollHeight then
+  // returns a value that's effectively 2 rows worth of content + padding,
+  // and the textarea gets pinned at 2 rows even though it's empty.
+  // The rows="1" attribute paired with height:"auto" already gives the
+  // correct 1-row baseline, so explicit measurement is just noise here.
+  if (!el.value) return;
+  el.style.height = Math.min(el.scrollHeight, TEXTAREA_MAX_PX) + "px";
+}
+
+// Refit on every change that can affect content height: typing into the
+// composer, and switching sessions (text snaps to the new session's draft).
+watch(
+  [text, () => props.sessionId],
+  async () => {
+    await nextTick();
+    autoResizeTextarea();
+  },
+  { immediate: true },
+);
+
+// Auto-focus the composer when switching INTO a session so the user can type
+// straight away without an extra click. Desktop/keyboard only — on touch
+// devices focusing would pop the on-screen keyboard, which WeChat deliberately
+// does NOT do when you open a chat. Skip when nothing is selected.
+watch(
+  () => props.sessionId,
+  async (id) => {
+    attachmentTrayOpen.value = false;
+    if (!id || !isDesktopLike) return;
+    await nextTick();
+    textareaRef.value?.focus();
+  },
+  { immediate: true },
+);
+
+onMounted(() => {
+  if (typeof window.matchMedia === "function") {
+    desktopViewportQuery = window.matchMedia("(min-width: 768px)");
+    updateDesktopViewport(desktopViewportQuery);
+    desktopViewportQuery.addEventListener("change", updateDesktopViewport);
+  }
+});
+onBeforeUnmount(() => {
+  desktopViewportQuery?.removeEventListener("change", updateDesktopViewport);
+  desktopViewportQuery = null;
+  stopWechatComposerResize();
+});
+</script>
+
+<template>
+  <div
+    class="cw-prompt-input shrink-0 border-t border-[var(--cw-border)]  px-3 pt-2 pb-3"
+    :class="{ 'cw-wechat-composer-resizing': wechatResizing }"
+    :style="composerStyle"
+  >
+    <button
+      v-if="isWechatComposer"
+      type="button"
+      class="cw-wechat-resize-handle"
+      title="Drag to resize input area"
+      aria-label="Resize input area"
+      @pointerdown="startWechatComposerResize"
+      @dblclick="resetWechatComposerHeight"
+    ><span /></button>
+    <!-- Desktop's combined picker plus dedicated mobile actions. Splitting the
+         mobile inputs lets 相册 and 拍摄 go straight to the requested surface
+         instead of Android's generic two-choice intermediary. -->
+    <input
+      ref="fileInputRef"
+      type="file"
+      accept="image/*,application/pdf"
+      multiple
+      class="hidden"
+      @change="onFileInput"
+    />
+    <input
+      ref="galleryInputRef"
+      type="file"
+      accept="image/*"
+      multiple
+      class="hidden"
+      @change="onFileInput"
+    />
+    <input
+      ref="cameraInputRef"
+      type="file"
+      accept="image/*"
+      capture="environment"
+      class="hidden"
+      @change="onFileInput"
+    />
+    <!-- HyperOS 3 intercepts image-MIME document intents with its limited
+         privacy picker. Keep this action generic so Android can offer SAF;
+         ingestAttachmentBlob still rejects everything except images/PDFs. -->
+    <input
+      ref="browseInputRef"
+      type="file"
+      accept="*/*"
+      multiple
+      class="hidden"
+      @change="onFileInput"
+    />
+
+    <!-- ===== Desktop · Claude-Code skin: single unified composer box =====
+         Textarea on top, a slim toolbar (model/approval pills + attach + send)
+         below — one border, mirroring the real Claude Code input. Mobile and
+         every other skin fall through to the WeChat-style row (v-else). -->
+    <template v-if="isCcDesktop">
+      <div v-if="hasPendingImages" class="cw-image-draft-strip flex flex-wrap gap-2 mb-2">
+        <div
+          v-for="img in pendingImages"
+          :key="img.id"
+          class="relative group border border-[var(--cw-border)]  rounded overflow-hidden"
+          :title="`${img.name ?? img.mime} · ${(img.bytes / 1024).toFixed(0)} KB`"
+        >
+          <img v-if="!isPdfDraft(img.mime)" :src="img.dataUrl" alt="" class="block h-16 w-16 object-cover" />
+          <div v-else class="cw-pdf-draft-chip flex items-center gap-1.5 h-16 px-2 max-w-40 text-xs text-[var(--cw-text)]  bg-[var(--cw-panel-2)] ">
+            <span aria-hidden="true">📄</span>
+            <span class="truncate pr-4">{{ img.name ?? "PDF" }}</span>
+          </div>
+          <button
+            class="cw-image-remove-button absolute top-0 right-0 bg-black/60 text-white text-xs leading-none px-1.5 py-0.5 rounded-bl opacity-80 hover:opacity-100"
+            @click="removeImage(img.id)"
+            title="Remove"
+          >×</button>
+        </div>
+      </div>
+      <SlashCommandMenu
+        v-if="slash.open.value"
+        :items="slash.items.value"
+        :active-index="slash.activeIndex.value"
+        @select="(i) => applySlashAccept(i)"
+        @hover="(i) => slash.setActive(i)"
+      />
+      <div class="cw-cc-composer">
+        <textarea
+          ref="textareaRef"
+          v-model="text"
+          rows="1"
+          name="message"
+          autocomplete="off"
+          autocorrect="off"
+          autocapitalize="sentences"
+          spellcheck="true"
+          inputmode="text"
+          :disabled="isInflightHere"
+          class="cw-cc-textarea"
+          :placeholder="running ? 'Running… (Send to queue)' : 'Type a message…'"
+          @paste="(e) => { slash.notePaste(); onPaste(e); }"
+          @keydown="onTextareaKey"
+          @keyup="syncSlash"
+          @focus="onTextareaFocus"
+          @click="syncSlash"
+          @input="syncSlash"
+        />
+        <div class="cw-cc-toolbar">
+          <PillRow :session-id="sessionId" />
+          <span class="cw-cc-spacer" />
+          <button
+            type="button"
+            class="cw-cc-tool-btn"
+            :disabled="isInflightHere"
+            @click="(e) => { openFilePicker(); (e.currentTarget as HTMLElement).blur(); }"
+            title="Attach file"
+            aria-label="Attach file"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-[18px] h-[18px]">
+              <line x1="12" y1="5" x2="12" y2="19" />
+              <line x1="5" y1="12" x2="19" y2="12" />
+            </svg>
+          </button>
+          <button
+            type="button"
+            class="cw-cc-send"
+            :disabled="!canSend"
+            @click="() => void send()"
+            :title="running ? 'Send to queue' : 'Send'"
+            aria-label="Send"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" class="w-[18px] h-[18px]">
+              <line x1="12" y1="19" x2="12" y2="5" />
+              <polyline points="6 11 12 5 18 11" />
+            </svg>
+          </button>
+        </div>
+      </div>
+    </template>
+
+    <!-- ===== Mobile (any skin) + other desktop skins: WeChat-style row ===== -->
+    <template v-else>
+    <!-- Pill row: model / permissionMode / interrupt. Rendered for drafts
+         too — picks are stashed on the pending draft and ride along with
+         the first newSession call (interrupt pill hides itself). -->
+    <PillRow :session-id="sessionId" />
+    <div v-if="hasPendingImages" class="cw-image-draft-strip flex flex-wrap gap-2 mb-2">
+      <div
+        v-for="img in pendingImages"
+        :key="img.id"
+        class="relative group border border-[var(--cw-border)]  rounded overflow-hidden"
+        :title="`${img.name ?? img.mime} · ${(img.bytes / 1024).toFixed(0)} KB`"
+      >
+        <img v-if="!isPdfDraft(img.mime)" :src="img.dataUrl" alt="" class="block h-16 w-16 object-cover" />
+        <div v-else class="cw-pdf-draft-chip flex items-center gap-1.5 h-16 px-2 max-w-40 text-xs text-[var(--cw-text)]  bg-[var(--cw-panel-2)] ">
+          <span aria-hidden="true">📄</span>
+          <span class="truncate pr-4">{{ img.name ?? "PDF" }}</span>
+        </div>
+        <button
+          class="cw-image-remove-button absolute top-0 right-0 bg-black/60 text-white text-xs leading-none px-1.5 py-0.5 rounded-bl opacity-80 hover:opacity-100"
+          @click="removeImage(img.id)"
+          title="Remove"
+        >×</button>
+      </div>
+    </div>
+    <SlashCommandMenu
+      v-if="slash.open.value"
+      :items="slash.items.value"
+      :active-index="slash.activeIndex.value"
+      @select="(i) => applySlashAccept(i)"
+      @hover="(i) => slash.setActive(i)"
+    />
+    <div class="cw-composer-row flex items-end gap-2">
+      <!-- Middle: textarea pinned to the h-9 baseline (36 px). Single-line by
+           default; grows from there as you type, capped at max-h-48 (~8 lines). -->
+      <textarea
+        ref="textareaRef"
+        v-model="text"
+        rows="1"
+        name="message"
+        autocomplete="off"
+        autocorrect="off"
+        autocapitalize="sentences"
+        spellcheck="true"
+        inputmode="text"
+        :disabled="isInflightHere"
+        class="cw-composer-textarea flex-1 resize-none overflow-y-auto rounded-lg bg-[var(--cw-panel-2)]  border-0 px-3 py-2 text-sm leading-5 max-h-48 focus:outline-none focus:ring-2 focus:ring-[var(--cw-focus-ring)]"
+        :placeholder="running ? 'Running… (Send to queue)' : 'Type a message…'"
+        @paste="(e) => { slash.notePaste(); onPaste(e); }"
+        @keydown="onTextareaKey"
+        @keyup="syncSlash"
+        @focus="onTextareaFocus"
+        @click="syncSlash"
+        @input="syncSlash"
+      />
+
+      <!-- Right slot, SAME on desktop and mobile (WeChat-style): + attach
+           by default, Send (filled blue) appears when there's text /
+           image content to send. -->
+      <button
+        v-if="showSendButton"
+        type="button"
+        @click="() => void send()"
+        :disabled="!canSend"
+        class="cw-send-button shrink-0 h-9 px-4 rounded-lg bg-[var(--cw-accent)] text-[var(--cw-accent-text)] text-sm font-semibold hover:opacity-100 active:scale-95 transition disabled:opacity-50 disabled:cursor-not-allowed"
+      >{{ sendLabel }}</button>
+      <button
+        v-else
+        type="button"
+        class="cw-attach-button shrink-0 w-9 h-9 rounded-full border border-[var(--cw-border)]  bg-transparent opacity-80 hover:opacity-100 hover:bg-[var(--cw-panel-2)]  active:opacity-75  transition disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center text-[var(--cw-text)] "
+        :class="{ 'cw-attach-button-open': attachmentTrayOpen }"
+        :disabled="isInflightHere"
+        :aria-expanded="attachmentTrayOpen"
+        aria-controls="cw-attachment-tray"
+        @click="(e) => { toggleAttachmentTray(); (e.currentTarget as HTMLElement).blur(); }"
+        title="Attach file"
+        aria-label="Attach file"
+      >
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-5 h-5">
+          <line x1="12" y1="5" x2="12" y2="19" />
+          <line x1="5" y1="12" x2="19" y2="12" />
+        </svg>
+      </button>
+    </div>
+    <div
+      v-if="!isDesktopViewport && attachmentTrayOpen"
+      id="cw-attachment-tray"
+      class="cw-attachment-tray"
+      aria-label="附件"
+    >
+      <button type="button" class="cw-attachment-action" @click="openGalleryPicker">
+        <span class="cw-attachment-action-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3.5" y="4" width="17" height="16" rx="2" />
+            <circle cx="9" cy="9" r="1.5" />
+            <path d="m5.5 17 4.2-4.2 3.1 3 2.2-2.2 3.5 3.4" />
+          </svg>
+        </span>
+        <span>相册</span>
+      </button>
+      <button type="button" class="cw-attachment-action" @click="openCameraPicker">
+        <span class="cw-attachment-action-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M8.5 6 10 4h4l1.5 2H19a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2z" />
+            <circle cx="12" cy="12.5" r="4" />
+          </svg>
+        </span>
+        <span>拍摄</span>
+      </button>
+      <button type="button" class="cw-attachment-action" @click="openFileBrowser">
+        <span class="cw-attachment-action-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M6 3.5h8l4 4V20H6z" />
+            <path d="M14 3.5V8h4M9 12h6M9 15.5h6" />
+          </svg>
+        </span>
+        <span>文件</span>
+      </button>
+    </div>
+    </template>
+  </div>
+</template>

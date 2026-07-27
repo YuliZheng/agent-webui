@@ -1,160 +1,88 @@
-import { createHighlighter, type Highlighter } from "shiki";
+import { highlightToHtml } from "./shiki.js";
+import { copyText } from "../util/clipboard.js";
 
-const LIGHT_THEME = "github-light";
-const DARK_THEME = "github-dark";
-const COMMON_LANGUAGES = [
-  "text",
-  "plaintext",
-  "javascript",
-  "typescript",
-  "jsx",
-  "tsx",
-  "json",
-  "bash",
-  "shell",
-  "powershell",
-  "python",
-  "html",
-  "css",
-  "vue",
-  "markdown",
-  "yaml",
-  "sql",
-  "diff",
-] as const;
+interface ObserveOpts { dark: boolean }
 
-let highlighterPromise: Promise<Highlighter> | null = null;
-let intersectionObserver: IntersectionObserver | null = null;
-const observed = new WeakSet<HTMLElement>();
-
-function highlighter(): Promise<Highlighter> {
-  highlighterPromise ??= createHighlighter({
-    themes: [LIGHT_THEME, DARK_THEME],
-    langs: [...COMMON_LANGUAGES],
-  });
-  return highlighterPromise;
-}
-
-function languageFor(code: HTMLElement): string {
-  const className = [...code.classList].find((name) => name.startsWith("language-"));
-  return className?.slice("language-".length).trim() || "text";
-}
-
-function copyText(pre: HTMLElement): string {
-  return pre.querySelector("code")?.textContent ?? pre.textContent ?? "";
-}
-
-async function writeClipboard(text: string): Promise<void> {
-  if (navigator.clipboard?.writeText) {
-    await navigator.clipboard.writeText(text);
-    return;
-  }
-  const textarea = document.createElement("textarea");
-  textarea.value = text;
-  textarea.style.position = "fixed";
-  textarea.style.opacity = "0";
-  document.body.append(textarea);
-  textarea.select();
-  const ok = document.execCommand("copy");
-  textarea.remove();
-  if (!ok) throw new Error("Copy failed");
-}
-
-export function ensureCopyButton(pre: HTMLElement): HTMLButtonElement {
-  let wrapper = pre.parentElement;
-  if (!wrapper?.classList.contains("cw-code-wrap")) {
-    wrapper = document.createElement("div");
-    wrapper.className = "cw-code-wrap";
-    pre.before(wrapper);
-    wrapper.append(pre);
-  }
-  const existing = wrapper.querySelector<HTMLButtonElement>(":scope > .cw-copy-btn");
-  if (existing) return existing;
-
-  const button = document.createElement("button");
-  button.type = "button";
-  button.className = "cw-copy-btn";
-  button.textContent = "Copy";
-  button.setAttribute("aria-label", "Copy code");
-  button.addEventListener("click", async () => {
+// Wrap a <pre> with a relative container + a "copy" button in the top-right
+// corner. Safe to call multiple times: an already-wrapped pre is skipped.
+// We wrap BEFORE Shiki's `pre.outerHTML = html` swap so the wrap survives the
+// rewrite (only the inner pre is replaced; the wrapper stays put). The click
+// handler re-reads `wrap.querySelector("pre")` each fire so it copies the
+// post-highlight text, not a stale reference.
+function ensureCopyButton(pre: HTMLElement): void {
+  const parent = pre.parentElement;
+  if (!parent) return;
+  if (parent.classList.contains("cw-code-wrap")) return;
+  const wrap = document.createElement("div");
+  wrap.className = "cw-code-wrap";
+  parent.insertBefore(wrap, pre);
+  wrap.appendChild(pre);
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "cw-copy-btn";
+  btn.title = "Copy code";
+  btn.setAttribute("aria-label", "Copy code");
+  btn.textContent = "Copy";
+  btn.addEventListener("click", async (e) => {
+    e.stopPropagation();
+    e.preventDefault();
+    const text = wrap.querySelector("pre")?.textContent ?? "";
     try {
-      await writeClipboard(copyText(wrapper!.querySelector<HTMLElement>("pre")!));
-      button.dataset.state = "ok";
-      button.textContent = "✓";
+      await copyText(text);
+      btn.textContent = "Copied";
+      btn.dataset.state = "ok";
     } catch {
-      button.dataset.state = "err";
-      button.textContent = "!";
+      btn.textContent = "Failed";
+      btn.dataset.state = "err";
     }
-    window.setTimeout(() => {
-      button.removeAttribute("data-state");
-      button.textContent = "Copy";
-    }, 1_500);
+    setTimeout(() => {
+      btn.textContent = "Copy";
+      delete btn.dataset.state;
+    }, 1500);
   });
-  wrapper.append(button);
-  return button;
+  wrap.appendChild(btn);
 }
 
-async function highlight(pre: HTMLElement): Promise<void> {
-  if (pre.dataset.cwCodeState === "ready" || pre.dataset.cwCodeState === "loading") return;
-  const code = pre.querySelector<HTMLElement>("code");
-  if (!code) return;
-  pre.dataset.cwCodeState = "loading";
-  const source = code.textContent ?? "";
-  const requestedLanguage = languageFor(code);
-  try {
-    const engine = await highlighter();
-    const loaded = new Set(engine.getLoadedLanguages());
-    const lang = loaded.has(requestedLanguage) ? requestedLanguage : "text";
-    const rendered = engine.codeToHtml(source, {
-      lang,
-      themes: {
-        light: LIGHT_THEME,
-        dark: DARK_THEME,
-      },
-      defaultColor: false,
-    });
-    const template = document.createElement("template");
-    template.innerHTML = rendered.trim();
-    const replacement = template.content.firstElementChild as HTMLElement | null;
-    if (!replacement) throw new Error("Shiki returned no code block");
-    replacement.dataset.cwCodeState = "ready";
-    pre.replaceWith(replacement);
-    ensureCopyButton(replacement);
-  } catch {
-    pre.dataset.cwCodeState = "ready";
-  }
-}
+export function observeCodeFences(root: HTMLElement, opts: ObserveOpts) {
+  // Wrap every fenced block with a copy button — including the ones that
+  // never get a language- class (plain ``` ``` blocks), which Shiki skips.
+  root.querySelectorAll<HTMLElement>("pre").forEach(ensureCopyButton);
 
-function observer(): IntersectionObserver | null {
-  if (typeof IntersectionObserver === "undefined") return null;
-  intersectionObserver ??= new IntersectionObserver((entries) => {
-    for (const entry of entries) {
-      if (!entry.isIntersecting) continue;
-      const pre = entry.target as HTMLElement;
-      intersectionObserver?.unobserve(pre);
-      void highlight(pre);
+  // Shiki replaces the original <pre><code class="language-*"> tree. Persist
+  // the language on the generated <pre> so a light/dark theme change can find
+  // and re-render blocks that have already been highlighted.
+  const blocks = root.querySelectorAll<HTMLElement>(
+    "pre > code[class*=language-], pre[data-cw-language]",
+  );
+  if (!("IntersectionObserver" in window) || blocks.length === 0) return;
+  const io = new IntersectionObserver(async (entries) => {
+    for (const e of entries) {
+      if (!e.isIntersecting) continue;
+      const target = e.target as HTMLElement;
+      io.unobserve(target);
+      const pre = target.matches("pre") ? target : target.closest("pre");
+      if (!pre) continue;
+      const theme = opts.dark ? "dark" : "light";
+      if (pre.dataset.cwTheme === theme) continue;
+      const code = target.matches("code") ? target : pre.querySelector("code");
+      const lang = pre.dataset.cwLanguage
+        ?? (Array.from(code?.classList ?? []).find((c) => c.startsWith("language-")) ?? "language-text").slice(9);
+      try {
+        const html = await highlightToHtml(pre.textContent ?? "", lang, opts.dark);
+        const container = pre.parentElement;
+        pre.outerHTML = html;
+        const replacement = container?.querySelector<HTMLElement>("pre");
+        if (replacement) {
+          replacement.dataset.cwLanguage = lang;
+          replacement.dataset.cwTheme = theme;
+        }
+      } catch (error) {
+        // Highlighting is progressive enhancement. Keep the original escaped
+        // code block usable if a grammar chunk or highlighter initialization
+        // fails, and avoid an unhandled IntersectionObserver rejection.
+        console.warn("[code-highlight] failed", error);
+      }
     }
-  }, {
-    rootMargin: "240px 0px",
-  });
-  return intersectionObserver;
-}
-
-export function observeCodeFences(root: ParentNode): void {
-  for (const pre of root.querySelectorAll<HTMLElement>("pre")) {
-    if (!pre.querySelector("code")) continue;
-    ensureCopyButton(pre);
-    if (observed.has(pre) || pre.dataset.cwCodeState === "ready") continue;
-    observed.add(pre);
-    const lazyObserver = observer();
-    if (lazyObserver) lazyObserver.observe(pre);
-    else void highlight(pre);
-  }
-}
-
-export function stopObservingCodeFences(root: ParentNode): void {
-  if (!intersectionObserver) return;
-  for (const pre of root.querySelectorAll<HTMLElement>("pre")) {
-    intersectionObserver.unobserve(pre);
-  }
+  }, { rootMargin: "200px" });
+  blocks.forEach((b) => io.observe(b));
 }
