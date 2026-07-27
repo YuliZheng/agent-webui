@@ -131,12 +131,44 @@ async function onPaste(e: ClipboardEvent) {
   }
 }
 
-// Single hidden <input type="file"> for image/PDF attach. On iOS the native
-// picker already shows "Take Photo or Video / Photo Library / Choose Files",
-// so a separate camera button would be redundant clutter in the composer.
+// Desktop keeps the combined picker. Mobile uses separate inputs behind our
+// own WeChat-style tray so tapping + does not first show Android's unstyleable
+// "Camera / Photos" chooser.
 const fileInputRef = ref<HTMLInputElement | null>(null);
+const galleryInputRef = ref<HTMLInputElement | null>(null);
+const cameraInputRef = ref<HTMLInputElement | null>(null);
+const browseInputRef = ref<HTMLInputElement | null>(null);
+const attachmentTrayOpen = ref(false);
 
 function openFilePicker() { fileInputRef.value?.click(); }
+
+function toggleAttachmentTray() {
+  if (isDesktopViewport.value) {
+    attachmentTrayOpen.value = false;
+    openFilePicker();
+    return;
+  }
+  attachmentTrayOpen.value = !attachmentTrayOpen.value;
+  if (attachmentTrayOpen.value) {
+    textareaRef.value?.blur();
+    stopWechatComposerResize();
+  }
+}
+
+function openGalleryPicker() {
+  attachmentTrayOpen.value = false;
+  galleryInputRef.value?.click();
+}
+
+function openCameraPicker() {
+  attachmentTrayOpen.value = false;
+  cameraInputRef.value?.click();
+}
+
+function openFileBrowser() {
+  attachmentTrayOpen.value = false;
+  browseInputRef.value?.click();
+}
 
 async function onFileInput(e: Event) {
   const input = e.target as HTMLInputElement;
@@ -243,9 +275,11 @@ const sendLabel = computed(() => (isWechatComposer.value && isDesktopViewport.va
 
 function updateDesktopViewport(e?: MediaQueryList | MediaQueryListEvent) {
   isDesktopViewport.value = !!e?.matches;
+  if (isDesktopViewport.value) attachmentTrayOpen.value = false;
 }
 
 function onTextareaFocus() {
+  attachmentTrayOpen.value = false;
   if (!isDesktopViewport.value) emit("mobile-composer-focus");
 }
 
@@ -310,6 +344,7 @@ function friendlySendError(err: unknown): string {
 
 async function send() {
   if (!canSend.value) return;
+  attachmentTrayOpen.value = false;
   const sid = props.sessionId;
   // Webui-local control commands (/model, /context) branch off here: handled
   // in the browser, never sent to the agent. Only on a real session —
@@ -556,6 +591,7 @@ watch(
 watch(
   () => props.sessionId,
   async (id) => {
+    attachmentTrayOpen.value = false;
     if (!id || !isDesktopLike) return;
     await nextTick();
     textareaRef.value?.focus();
@@ -592,13 +628,40 @@ onBeforeUnmount(() => {
       @pointerdown="startWechatComposerResize"
       @dblclick="resetWechatComposerHeight"
     ><span /></button>
-    <!-- Hidden file input — shared by both composer layouts. openFilePicker()
-         (the + attach button) clicks it. On iOS the native picker already
-         offers Take Photo / Photo Library / Choose Files. -->
+    <!-- Desktop's combined picker plus dedicated mobile actions. Splitting the
+         mobile inputs lets 相册 and 拍摄 go straight to the requested surface
+         instead of Android's generic two-choice intermediary. -->
     <input
       ref="fileInputRef"
       type="file"
       accept="image/*,application/pdf"
+      multiple
+      class="hidden"
+      @change="onFileInput"
+    />
+    <input
+      ref="galleryInputRef"
+      type="file"
+      accept="image/*"
+      multiple
+      class="hidden"
+      @change="onFileInput"
+    />
+    <input
+      ref="cameraInputRef"
+      type="file"
+      accept="image/*"
+      capture="environment"
+      class="hidden"
+      @change="onFileInput"
+    />
+    <!-- HyperOS 3 intercepts image-MIME document intents with its limited
+         privacy picker. Keep this action generic so Android can offer SAF;
+         ingestAttachmentBlob still rejects everything except images/PDFs. -->
+    <input
+      ref="browseInputRef"
+      type="file"
+      accept="*/*"
       multiple
       class="hidden"
       @change="onFileInput"
@@ -759,8 +822,11 @@ onBeforeUnmount(() => {
         v-else
         type="button"
         class="cw-attach-button shrink-0 w-9 h-9 rounded-full border border-[var(--cw-border)]  bg-transparent opacity-80 hover:opacity-100 hover:bg-[var(--cw-panel-2)]  active:opacity-75  transition disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center text-[var(--cw-text)] "
+        :class="{ 'cw-attach-button-open': attachmentTrayOpen }"
         :disabled="isInflightHere"
-        @click="(e) => { openFilePicker(); (e.currentTarget as HTMLElement).blur(); }"
+        :aria-expanded="attachmentTrayOpen"
+        aria-controls="cw-attachment-tray"
+        @click="(e) => { toggleAttachmentTray(); (e.currentTarget as HTMLElement).blur(); }"
         title="Attach file"
         aria-label="Attach file"
       >
@@ -768,6 +834,41 @@ onBeforeUnmount(() => {
           <line x1="12" y1="5" x2="12" y2="19" />
           <line x1="5" y1="12" x2="19" y2="12" />
         </svg>
+      </button>
+    </div>
+    <div
+      v-if="!isDesktopViewport && attachmentTrayOpen"
+      id="cw-attachment-tray"
+      class="cw-attachment-tray"
+      aria-label="附件"
+    >
+      <button type="button" class="cw-attachment-action" @click="openGalleryPicker">
+        <span class="cw-attachment-action-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3.5" y="4" width="17" height="16" rx="2" />
+            <circle cx="9" cy="9" r="1.5" />
+            <path d="m5.5 17 4.2-4.2 3.1 3 2.2-2.2 3.5 3.4" />
+          </svg>
+        </span>
+        <span>相册</span>
+      </button>
+      <button type="button" class="cw-attachment-action" @click="openCameraPicker">
+        <span class="cw-attachment-action-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M8.5 6 10 4h4l1.5 2H19a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2z" />
+            <circle cx="12" cy="12.5" r="4" />
+          </svg>
+        </span>
+        <span>拍摄</span>
+      </button>
+      <button type="button" class="cw-attachment-action" @click="openFileBrowser">
+        <span class="cw-attachment-action-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M6 3.5h8l4 4V20H6z" />
+            <path d="M14 3.5V8h4M9 12h6M9 15.5h6" />
+          </svg>
+        </span>
+        <span>文件</span>
       </button>
     </div>
     </template>
