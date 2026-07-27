@@ -1,0 +1,26 @@
+{
+  "id": "/",
+  "name": "Agent WebUI",
+  "short_name": "Agent",
+  "description": "Mobile-friendly WebUI for Claude and Codex sessions.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#18181b",
+  "theme_color": "#18181b",
+  "icons": [
+    {
+      "src": "/assets/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/favicon-1780988963583-transparent.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}

@@ -39,6 +39,7 @@ export type SessionRenamedPush = PushBase<"session-renamed"> & {
   id: string;
   title: string | null;
   titleSource?: "auto" | "manual" | null;
+  emoji?: string | null;
 };
 
 export type SessionStatusPush = PushBase<"session-status"> & {
@@ -67,8 +68,17 @@ export type SessionSettingsPush = PushBase<"session-settings"> & {
   id: string;
   model: string | null;
   effort: string | null;
+  serviceTier: string | null;
   permissionMode: string | null;
   sandboxMode: string | null;
+};
+
+export type SessionErrorPush = PushBase<"session-error"> & {
+  sessionId: string;
+  turnId: string | null;
+  agent: "claude" | "codex";
+  message: string;
+  details: string | null;
 };
 
 export type InteractionAddedPush = PushBase<"interaction-added"> & {
@@ -97,6 +107,7 @@ export type GlobalPushEvent =
   | SessionReadPush
   | SessionRetitlingPush
   | SessionSettingsPush
+  | SessionErrorPush
   | InteractionAddedPush
   | InteractionRemovedPush
   | BackgroundTasksPush;
@@ -142,6 +153,7 @@ const GLOBAL_PUSH_TYPES: ReadonlySet<string> = new Set([
   "session-read",
   "session-retitling",
   "session-settings",
+  "session-error",
   "interaction-added",
   "interaction-removed",
   "background-tasks",

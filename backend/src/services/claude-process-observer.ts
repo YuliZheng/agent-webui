@@ -78,6 +78,7 @@ export class ClaudeProcessObserver extends EventEmitter {
   private pending = new Map<string, NodeJS.Timeout>();
   private refreshWork?: Promise<void>;
   private refreshAgain = false;
+  private ready = false;
   private readonly directory: string;
   private readonly maxUnverifiedAgeMs: number;
   private readonly revalidateMs: number;
@@ -93,17 +94,22 @@ export class ClaudeProcessObserver extends EventEmitter {
   }
 
   async start(): Promise<void> {
-    if (this.watcher) return;
+    if (this.watcher) {
+      if (this.refreshWork) await this.refreshWork;
+      return;
+    }
     this.watcher = watch(this.directory, { ignoreInitial: true, followSymlinks: false, depth: 0 });
     this.watcher.on("add", path => this.schedule(path));
     this.watcher.on("change", path => this.schedule(path));
     this.watcher.on("unlink", path => this.remove(path));
     await this.refreshNow();
+    this.ready = true;
     this.timer = setInterval(() => void this.refreshNow(), this.revalidateMs);
     this.timer.unref?.();
   }
 
   async stop(): Promise<void> {
+    this.ready = false;
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
     for (const timeout of this.pending.values()) clearTimeout(timeout);
@@ -111,6 +117,15 @@ export class ClaudeProcessObserver extends EventEmitter {
     const watcher = this.watcher;
     this.watcher = undefined;
     if (watcher) await watcher.close();
+  }
+
+  /**
+   * Returns watcher-backed ownership truth once the initial registration scan
+   * has completed. Undefined means the caller should use its conservative
+   * filesystem fallback (primarily during startup and deterministic tests).
+   */
+  foreignAttachment(sessionId: string): boolean | undefined {
+    return this.ready ? this.published.has(sessionId) : undefined;
   }
 
   async refreshNow(): Promise<void> {

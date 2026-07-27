@@ -18,6 +18,8 @@ export interface SessionListItem {
   size: number;
   agent: AgentKind;
   peer?: boolean;
+  /** True for Codex worker threads spawned as subagents, not ordinary forks. */
+  subagent?: boolean;
   title?: string | null;
   titleSource?: "auto" | "manual" | null;
   titleEmoji?: string | null;
@@ -108,6 +110,7 @@ export interface SessionSettings {
   sessionId: string;
   model: string | null;
   effort: string | null;
+  serviceTier: string | null;
   permissionMode: string | null;
   sandboxMode: string | null;
 }
@@ -252,8 +255,10 @@ export interface RpcRequestPayloads {
     agent: AgentKind;
     model?: string;
     effort?: string;
+    serviceTier?: string;
     permissionMode?: string;
     sandboxMode?: string;
+    clientUuid?: string;
   };
   prompt: {
     sessionId: string;
@@ -272,6 +277,7 @@ export interface RpcRequestPayloads {
   "get-agent-capabilities": { agent: AgentKind; cwd?: string };
   "set-model": { sessionId: string; model: string };
   "set-effort": { sessionId: string; effort: string };
+  "set-service-tier": { sessionId: string; serviceTier: string };
   "set-permission-mode": { sessionId: string; mode: string };
   "set-sandbox-mode": { sessionId: string; mode: string };
   "interaction-respond": {
@@ -333,14 +339,15 @@ export interface RpcResponsePayloads {
   "get-agent-capabilities": AgentCapabilities;
   "set-model": { applies: "immediately" | "next-process" };
   "set-effort": { applies: "immediately" | "next-process" };
+  "set-service-tier": { applies: "immediately" };
   "set-permission-mode": { applies: "immediately" | "next-process" };
   "set-sandbox-mode": { applies: "immediately" | "next-process" };
   "interaction-respond": Record<string, never>;
   "delete-sessions": DeleteSessionsResult;
-  "set-title": { title: string | null };
-  "get-title": { title: string | null };
+  "set-title": { title: string | null; titleSource: "auto" | "manual" | null; emoji: string | null };
+  "get-title": { title: string | null; titleSource: "auto" | "manual" | null; emoji: string | null };
   "mark-read": { ok: true };
-  "retitle-session": { title: string };
+  "retitle-session": { title: string | null; titleSource: "auto" | "manual" | null; emoji: string | null };
   "retitle-all": { queued: number; skippedManual: number };
   "get-user-messages": UserMessageInfo[];
   rewind: RewindResponse;
@@ -399,6 +406,7 @@ const RPC_METHODS: ReadonlySet<string> = new Set<RpcMethod>([
   "get-agent-capabilities",
   "set-model",
   "set-effort",
+  "set-service-tier",
   "set-permission-mode",
   "set-sandbox-mode",
   "interaction-respond",
@@ -477,6 +485,7 @@ export function isSessionListItem(value: unknown): value is SessionListItem {
     return false;
   }
   if (value.peer !== undefined && typeof value.peer !== "boolean") return false;
+  if (value.subagent !== undefined && typeof value.subagent !== "boolean") return false;
   if (!isNullableString(value.title)) return false;
   if (
     value.titleSource !== undefined &&

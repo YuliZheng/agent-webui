@@ -1,52 +1,80 @@
-import { reactive, ref } from "vue";
 import { defineStore } from "pinia";
-import type { Interaction } from "@/types";
+import { useSessionsStore } from "./sessions.js";
+import { useNotificationsStore } from "./notifications.js";
 
-export interface UiToast {
-  id: string;
-  message: string;
-  kind?: "error" | "info";
-  sticky?: boolean;
-  sessionId?: string;
-  requestId?: string;
+export type ThemeMode = "auto" | "dark" | "light";
+export type EnterBehavior = "send" | "newline";
+
+const ENTER_BEHAVIOR_KEY = "cw:enterBehavior";
+
+function loadEnterBehavior(): EnterBehavior {
+  if (typeof localStorage === "undefined") return "send";
+  try {
+    const v = localStorage.getItem(ENTER_BEHAVIOR_KEY);
+    if (v === "newline" || v === "send") return v;
+  } catch { /* ignore */ }
+  return "send";
 }
 
-export const useUiStore = defineStore("ui", () => {
-  const mobileListVisible = ref(true);
-  const sidebarOpen = ref(true);
-  const searchTarget = ref<{ sessionId: string; uuid?: string; index?: number } | null>(null);
-  const lightboxUrl = ref<string | null>(null);
-  const localFile = ref<{ path: string; content: string; line?: number } | null>(null);
-  const previewUrl = ref<string | null>(null);
-  const openSessionRequest = ref<{ sessionId: string; nonce: string } | null>(null);
-  const toasts = reactive<UiToast[]>([]);
-  function dismissToast(id: string): void { const index = toasts.findIndex((item) => item.id === id); if (index >= 0) toasts.splice(index, 1); }
-  function toast(message: string, kind: "error" | "info" = "info", options: Omit<UiToast, "id" | "message" | "kind"> = {}): string {
-    const id = crypto.randomUUID(); toasts.push({ id, message, kind, ...options });
-    if (!options.sticky) setTimeout(() => dismissToast(id), 5000);
-    return id;
-  }
-  function showInteractionToast(item: Interaction): void {
-    if (toasts.some((toast) => toast.requestId === item.requestId && toast.sessionId === item.sessionId)) return;
-    const label = item.title || (item.kind === "permission" ? "Permission required" : "Question waiting");
-    toast(`${label} in a background session${item.toolName ? `: ${item.toolName}` : ""}`, "info", { sticky: true, sessionId: item.sessionId, requestId: item.requestId });
-  }
-  function dismissInteractionToast(sessionId: string, requestId: string): void {
-    for (const item of [...toasts]) if (item.sessionId === sessionId && item.requestId === requestId) dismissToast(item.id);
-  }
-  function syncInteractionToasts(items: readonly Interaction[]): void {
-    const pending = new Set(items.map((item) => `${item.sessionId}\u0000${item.requestId}`));
-    for (const item of [...toasts]) {
-      if (item.sessionId && item.requestId && !pending.has(`${item.sessionId}\u0000${item.requestId}`)) dismissToast(item.id);
-    }
-    for (const item of items) showInteractionToast(item);
-  }
-  function requestSessionOpen(sessionId: string): void { openSessionRequest.value = { sessionId, nonce: crypto.randomUUID() }; }
-  return { mobileListVisible, sidebarOpen, searchTarget, lightboxUrl, localFile, previewUrl, openSessionRequest, toasts, toast, dismissToast, showInteractionToast, dismissInteractionToast, syncInteractionToasts, requestSessionOpen };
-});
+function pushHistoryFor(id: string | null): void {
+  if (typeof window === "undefined") return;
+  const url = new URL(window.location.href);
+  if (id) url.searchParams.set("session", id);
+  else url.searchParams.delete("session");
+  window.history.pushState({ sessionId: id }, "", url.toString());
+}
 
-// Focused names for independent UI concerns while retaining a compact implementation.
-export const useNotificationsStore = useUiStore;
-export const useLightboxStore = useUiStore;
-export const useLocalFileViewerStore = useUiStore;
-export const usePreviewStore = useUiStore;
+// Drafts are deliberately NOT dropped on switch-away anymore (WeChat-style:
+// a parked draft stays in the sidebar until the first send promotes it or
+// the user deletes the row). The old dropIfEmptyDraft behavior silently ate
+// drafts the user intended to come back to.
+
+export const useUiStore = defineStore("ui", {
+  state: () => ({
+    selectedSessionId: null as string | null,
+    sidebarOpen: false,
+    theme: "auto" as ThemeMode,
+    enterBehavior: loadEnterBehavior(),
+    home: "" as string,
+  }),
+  actions: {
+    // Intentional selection: push a browser-history entry. All user-initiated
+    // session changes (sidebar click, fork, new-session created, +Here, etc.)
+    // go through here. Browser back / Mouse4 / iOS edge-swipe-back fire
+    // popstate, which the app routes to selectFromHistory.
+    select(id: string | null) {
+      if (id === this.selectedSessionId) return;
+      this.selectedSessionId = id;
+      if (id) {
+        useSessionsStore().markRead(id);
+        useNotificationsStore().dismissForSession(id);
+      }
+      // Auto-dismiss the mobile slide-in when the user picks a session.
+      this.sidebarOpen = false;
+      pushHistoryFor(id);
+    },
+
+    // Apply a selection coming from popstate (browser back/forward, mouse
+    // back/forward, mobile edge-swipe). Don't pushState — popstate is
+    // already a history transition.
+    selectFromHistory(id: string | null) {
+      if (id === this.selectedSessionId) return;
+      this.selectedSessionId = id;
+      if (id) {
+        useSessionsStore().markRead(id);
+        useNotificationsStore().dismissForSession(id);
+      }
+      this.sidebarOpen = false;
+    },
+
+    toggleSidebar() { this.sidebarOpen = !this.sidebarOpen; },
+    setTheme(t: ThemeMode) { this.theme = t; },
+    setEnterBehavior(v: EnterBehavior) {
+      this.enterBehavior = v;
+      if (typeof localStorage !== "undefined") {
+        try { localStorage.setItem(ENTER_BEHAVIOR_KEY, v); } catch { /* ignore */ }
+      }
+    },
+    setHome(h: string) { this.home = h; },
+  },
+});

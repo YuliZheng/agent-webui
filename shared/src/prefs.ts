@@ -41,10 +41,12 @@ export interface PrefsBlob {
   defaultClaudePermissionMode: string;
   defaultCodexModel: string;
   defaultCodexEffort: string;
+  defaultCodexServiceTier: string;
   defaultCodexApprovalPreset: string;
   defaultCodexSandboxMode: string;
   showActiveSection: boolean;
   showPeerSessions: boolean;
+  showSubagentSessions: boolean;
   messageDisplayStyle: MessageDisplayStyle;
   colorPreference: ColorPreference;
 }
@@ -65,15 +67,17 @@ export function createDefaultPrefs(): PrefsBlob {
     autoTitleLanguage: "auto",
     scratchSessionEnabled: false,
     scratchSessionPath: "",
-    defaultClaudeModel: "",
+    defaultClaudeModel: "deepseek-v4-pro",
     defaultClaudeEffort: "",
     defaultClaudePermissionMode: "",
     defaultCodexModel: "",
     defaultCodexEffort: "",
+    defaultCodexServiceTier: "",
     defaultCodexApprovalPreset: "",
     defaultCodexSandboxMode: "",
     showActiveSection: true,
     showPeerSessions: true,
+    showSubagentSessions: false,
     messageDisplayStyle: "claude-code",
     colorPreference: "system",
   };
@@ -225,6 +229,10 @@ export function normalizePrefs(value: unknown): PrefsBlob {
       defaults.defaultCodexEffort,
       40,
     ),
+    defaultCodexServiceTier: enumString(
+      source.defaultCodexServiceTier,
+      ["", "priority"],
+    ),
     defaultCodexApprovalPreset: enumString(
       source.defaultCodexApprovalPreset === "on-failure" ? "on-request" : source.defaultCodexApprovalPreset,
       ["", "untrusted", "on-request", "never"],
@@ -240,6 +248,10 @@ export function normalizePrefs(value: unknown): PrefsBlob {
     showPeerSessions: asBoolean(
       source.showPeerSessions,
       defaults.showPeerSessions,
+    ),
+    showSubagentSessions: asBoolean(
+      source.showSubagentSessions,
+      defaults.showSubagentSessions,
     ),
     messageDisplayStyle: normalizeMessageDisplayStyle(
       source.messageDisplayStyle,

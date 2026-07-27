@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SessionIndex } from "../src/services/session-index.js";
 import {
+  autoTitle,
   autoTitleFromText,
   forkClaude,
   forkSession,
@@ -46,9 +47,115 @@ describe("session mutations/search/export", () => {
     });
     expect((await searchSessions(index, "first beta")).matches).toEqual([]);
     expect(await markdownExport(index, "session")).toContain("## Assistant\n\nanswer needle");
+    expect(await markdownExport(index, "session", "  UI resolved title  ")).toMatch(/^# UI resolved title\n/);
     const rewind = await rewindClaude(index, driver, "session", "u2"); expect(rewind.prefillText).toBe("second prompt needle beta");
     expect(await readFile(path, "utf8")).not.toContain("second prompt");
   });
+
+  it("streams past oversized bookkeeping records for export, fork, and rewind", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-webui-large-mutate-"));
+    const claudeRoot = join(root, "claude");
+    const codexRoot = join(root, "codex");
+    await mkdir(claudeRoot);
+    await mkdir(codexRoot);
+    const path = join(claudeRoot, "large.jsonl");
+    const largePayload = `nested text may contain {"type":"user"} ${"x".repeat((16 * 1024 * 1024) + 1_024)}`;
+    await writeFile(path, [
+      JSON.stringify({ type: "user", cwd: root, uuid: "u1", message: { content: "first 你好" } }),
+      JSON.stringify({ type: "file-history-snapshot", snapshot: largePayload }),
+      JSON.stringify({ type: "user", cwd: root, uuid: "u2", message: { content: "second prompt" } }),
+      JSON.stringify({ type: "assistant", cwd: root, uuid: "a2", message: { content: "second answer" } }),
+      "",
+    ].join("\n"));
+    const index = new SessionIndex({ claudeRoot, codexRoot });
+    await index.scan();
+    const driver = {
+      isActive: () => false,
+      isOwned: () => false,
+      assertMutable: async () => undefined,
+    } as unknown as ClaudeDriver;
+
+    expect(await getUserMessages(index, "large")).toEqual([
+      { uuid: "u1", parentUuid: null, type: "user", text: "first 你好" },
+      { uuid: "u2", parentUuid: null, type: "user", text: "second prompt" },
+    ]);
+    expect(await markdownExport(index, "large")).toContain("## Assistant\n\nsecond answer");
+    const fork = await forkClaude(index, driver, "large", "u2");
+    expect(index.get(fork.newSessionId)).toMatchObject({ parentSessionId: "large" });
+    await rewindClaude(index, driver, "large", "u2");
+    expect(await getUserMessages(index, "large")).toEqual([
+      { uuid: "u1", parentUuid: null, type: "user", text: "first 你好" },
+    ]);
+
+    await writeFile(path, [
+      JSON.stringify({ type: "user", cwd: root, uuid: "small", message: { content: "small" } }),
+      JSON.stringify({
+        type: "user",
+        cwd: root,
+        uuid: "too-large",
+        message: { content: largePayload },
+      }),
+      "",
+    ].join("\n"));
+    await expect(getUserMessages(index, "large")).rejects.toMatchObject({
+      code: 413,
+      message: expect.stringContaining("per-record limit"),
+    });
+  }, 30_000);
+
+  it("keeps record-level search semantics with rg candidates and its fallback", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-webui-rg-search-"));
+    const claudeRoot = join(root, "claude");
+    const codexRoot = join(root, "codex");
+    await mkdir(claudeRoot);
+    await mkdir(codexRoot);
+    await writeFile(join(claudeRoot, "together.jsonl"), [
+      JSON.stringify({ type: "user", cwd: root, uuid: "u1", message: { content: "unrelated" } }),
+      JSON.stringify({ type: "assistant", cwd: root, uuid: "a1", message: { content: "alpha and beta occur together" } }),
+      "",
+    ].join("\n"));
+    await writeFile(join(claudeRoot, "separate.jsonl"), [
+      JSON.stringify({ type: "user", cwd: root, uuid: "u2", message: { content: "alpha only" } }),
+      JSON.stringify({ type: "assistant", cwd: root, uuid: "a2", message: { content: "beta only" } }),
+      "",
+    ].join("\n"));
+    await writeFile(join(codexRoot, "rollout-search.jsonl"), [
+      JSON.stringify({ type: "session_meta", payload: { id: "codex-search", cwd: root } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "codex user target" } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "agent_message", message: "codex agent target" } }),
+      "",
+    ].join("\n"));
+    const index = new SessionIndex({ claudeRoot, codexRoot });
+    await index.scan();
+
+    const accelerated = await searchSessions(index, "alpha beta", { rgMinArchiveBytes: 0 });
+    expect(accelerated.matches).toEqual([expect.objectContaining({
+      id: "together",
+      lastMatchUuid: "a1",
+      lastMatchIndex: 1,
+    })]);
+    expect((await searchSessions(index, "message", { rgMinArchiveBytes: 0 })).matches).toEqual([]);
+    expect((await searchSessions(index, "codex user target", { rgMinArchiveBytes: 0 })).matches).toEqual([
+      expect.objectContaining({
+        id: "codex-search",
+        lastMatchUuid: "codex-line-1",
+        lastMatchIndex: 1,
+      }),
+    ]);
+    expect((await searchSessions(index, "codex agent target", { rgMinArchiveBytes: 0 })).matches).toEqual([
+      expect.objectContaining({
+        id: "codex-search",
+        lastMatchUuid: "a-2",
+        lastMatchIndex: 2,
+      }),
+    ]);
+
+    const fallback = await searchSessions(index, "alpha beta", {
+      rgBinary: "missing-rg-agent-webui-test",
+      rgMinArchiveBytes: 0,
+    });
+    expect(fallback).toEqual(accelerated);
+  }, 10_000);
 
   it("uses Codex turn_context for image prompts without loading thread history", async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-webui-codex-mutate-"));
@@ -102,17 +209,17 @@ describe("session mutations/search/export", () => {
       { uuid: "line-8", parentUuid: null, type: "user", text: "[Image #1]second prompt" },
     ]);
 
-    // The clean event_msg alias is what the second visible bubble used before
-    // frontend de-duplication, so it must resolve to the same Codex turn.
-    const rewind = await rewindSession(index, claude, codex, "codex-session", "line-9");
+    // The visible bubble comes from the clean event_msg and the frontend
+    // prefixes its fallback source ID with `codex-`.
+    const rewind = await rewindSession(index, claude, codex, "codex-session", "codex-line-9");
     expect(rewind).toMatchObject({ removedRecords: 1, truncatedBytes: 0, prefillText: "[Image #1]second prompt" });
     expect(rollback).toHaveBeenLastCalledWith("codex-session", 1);
 
     rollback.mockClear();
-    const forked = await forkSession(index, claude, codex, "codex-session", "line-9");
+    const forked = await forkSession(index, claude, codex, "codex-session", "codex-line-9");
     expect(forked).toEqual({ newSessionId: "codex-fork", prefillText: "[Image #1]second prompt" });
-    expect(fork).toHaveBeenCalledWith("codex-session", "turn-2");
-    expect(rollback).toHaveBeenCalledWith("codex-fork", 1);
+    expect(fork).toHaveBeenCalledWith("codex-session", { beforeTurnId: "turn-2" });
+    expect(rollback).not.toHaveBeenCalled();
     expect(threadTurns).not.toHaveBeenCalled();
     expect(index.get("codex-fork")).toMatchObject({
       id: "codex-fork",
@@ -122,7 +229,7 @@ describe("session mutations/search/export", () => {
     });
   });
 
-  it("rejects Codex history mutations while a turn is active", async () => {
+  it("rejects Codex rewind but allows a non-mutating fork while a turn is active", async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-webui-codex-active-"));
     const claudeRoot = join(root, "claude");
     const codexRoot = join(root, "codex");
@@ -130,17 +237,27 @@ describe("session mutations/search/export", () => {
     await mkdir(codexRoot);
     await writeFile(join(codexRoot, "rollout-active.jsonl"), [
       JSON.stringify({ type: "session_meta", payload: { id: "active-codex", cwd: root } }),
+      JSON.stringify({ type: "turn_context", payload: { turn_id: "active-turn", cwd: root } }),
       JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "do work" } }),
+      "",
+    ].join("\n"));
+    const forkPath = join(codexRoot, "rollout-active-fork.jsonl");
+    await writeFile(forkPath, [
+      JSON.stringify({ type: "session_meta", payload: { id: "active-fork", cwd: root, parent_thread_id: "active-codex" } }),
       "",
     ].join("\n"));
     const index = new SessionIndex({ claudeRoot, codexRoot });
     await index.scan();
     const claude = {} as ClaudeDriver;
-    const codex = { isActive: () => true } as unknown as CodexDriver;
-    await expect(rewindSession(index, claude, codex, "active-codex", "line-1"))
+    const fork = vi.fn(async () => ({ thread: { id: "active-fork", path: forkPath, cwd: root } }));
+    const rollback = vi.fn(async () => ({ thread: { id: "active-fork", path: forkPath } }));
+    const codex = { isActive: () => true, fork, rollback } as unknown as CodexDriver;
+    await expect(rewindSession(index, claude, codex, "active-codex", "line-2"))
       .rejects.toMatchObject({ code: 409 });
-    await expect(forkSession(index, claude, codex, "active-codex", "line-1"))
-      .rejects.toMatchObject({ code: 409 });
+    await expect(forkSession(index, claude, codex, "active-codex", "line-2"))
+      .resolves.toEqual({ newSessionId: "active-fork", prefillText: "do work" });
+    expect(fork).toHaveBeenCalledWith("active-codex", { beforeTurnId: "active-turn" });
+    expect(rollback).not.toHaveBeenCalled();
   });
 
   it("writes an automatic title from the observed prompt without reading the transcript", async () => {
@@ -158,8 +275,36 @@ describe("session mutations/search/export", () => {
     await index.scan();
     resetJsonlIndexIoCounters();
     const state = new AppState(stateDir);
-    expect(await autoTitleFromText(index, state, "session", "Fix the streaming watcher hot path")).toBe("Fix the streaming watcher hot path");
+    state.titleGenerator = vi.fn(async () => ({
+      title: "Fix streaming watcher",
+      emoji: "🛠️",
+      summary: "Improve the streaming watcher without reading full transcripts.",
+    }));
+    expect(await autoTitleFromText(index, state, "session", "Fix the streaming watcher hot path")).toBe("Fix streaming watcher");
     expect(jsonlIndexIoCounters()).toEqual({ fullBytes: 0, appendedBytes: 0 });
-    expect((await state.titles.get()).session).toMatchObject({ source: "auto", title: "Fix the streaming watcher hot path" });
+    expect(state.titleGenerator).toHaveBeenCalledWith({
+      text: "Fix the streaming watcher hot path",
+      language: "auto",
+    });
+    expect((await state.titles.get()).session).toMatchObject({
+      source: "auto",
+      title: "Fix streaming watcher",
+      emoji: "🛠️",
+      topicSummary: "Improve the streaming watcher without reading full transcripts.",
+    });
+    expect((await new AppState(stateDir).titles.get()).session?.topicSummary)
+      .toBe("Improve the streaming watcher without reading full transcripts.");
+
+    vi.mocked(state.titleGenerator).mockClear();
+    resetJsonlIndexIoCounters();
+    expect(await autoTitle(index, state, "session", true)).toBe("Fix streaming watcher");
+    expect(jsonlIndexIoCounters()).toEqual({ fullBytes: 0, appendedBytes: 0 });
+    expect(state.titleGenerator).toHaveBeenCalledWith({
+      text: expect.stringMatching(
+        /^CURRENT REQUEST \(highest priority\):\nlarge historical prompt/,
+      ),
+      language: "auto",
+      previousSummary: "Improve the streaming watcher without reading full transcripts.",
+    });
   });
 });

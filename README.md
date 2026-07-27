@@ -10,18 +10,30 @@ launches the installed CLIs; it does not maintain a second transcript database.
 - npm
 - `claude` and/or `codex` available on `PATH` for starting new sessions
 
-## Install and run
+## Install
 
 ```sh
 npm install
-npm run build
-npm start
 ```
 
-The production server binds to `0.0.0.0` by default. On first start it creates a
-random token at `~/.agent-webui/token` and prints a one-time token-binding URL.
-Open that URL once on each browser; the token is exchanged for an HttpOnly
-cookie and removed from subsequent URLs.
+## Run on Windows
+
+Always use the single `run.cmd` launcher, including after editing the source.
+Double-click it in Explorer, or run `.\run.cmd` from PowerShell. It safely
+builds only when the inputs changed, replaces the verified Agent WebUI process
+only after a successful build, and starts exactly one instance on port 3457.
+
+Open <http://127.0.0.1:3457/> afterward.
+
+When the Tailscale CLI is installed, `run.cmd` also idempotently configures
+Tailscale Serve for HTTPS. Tailnet devices can then open
+<https://lggram.tail6c8b6c.ts.net/>; do not append `:3457` to that HTTPS URL.
+If Tailscale is unavailable, local HTTP access still starts normally.
+
+The production server binds to `0.0.0.0:3457` by default. On first start it
+creates a random token at `~/.agent-webui/token`. Open the WebUI and paste that
+value into the sign-in form; it is exchanged for an HttpOnly cookie. The server
+does not print the bearer token into its logs.
 
 Use `npm run dev` for the Vite + Fastify development pair. The same token bind
 works through `/api/auth/bind?token=...` in development.
@@ -31,6 +43,13 @@ by the backend (`--host`, `--port`, `--token`, `AGENT_WEBUI_HOST`,
 `AGENT_WEBUI_PORT`). Small server preferences are stored under
 `~/.agent-webui/`; transcript data remains in the Claude and Codex session
 directories.
+
+For example, override the production port with:
+
+```powershell
+$env:AGENT_WEBUI_PORT = "4567"
+npm start
+```
 
 ## Security model
 

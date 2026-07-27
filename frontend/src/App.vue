@@ -1,63 +1,66 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import Sidebar from "@/components/Sidebar.vue";
-import SessionHeader from "@/components/SessionHeader.vue";
-import TranscriptPane from "@/components/TranscriptPane.vue";
-import ComposerBar from "@/components/ComposerBar.vue";
-import InteractionTray from "@/components/InteractionTray.vue";
-import NewSessionDialog from "@/components/NewSessionDialog.vue";
-import SettingsDialog from "@/components/SettingsDialog.vue";
-import OverlayHost from "@/components/OverlayHost.vue";
-import { useBackgroundTasksStore, useInteractionsStore, useSessionsStore } from "@/stores/sessions";
-import { usePreferencesStore } from "@/stores/preferences";
-import { useLiveStore } from "@/stores/live";
-import { attachmentPayloads, useComposerStore } from "@/stores/composer";
-import { useUiStore } from "@/stores/ui";
-import { useIdentityStore } from "@/stores/identity";
-import { mainSocket, installWakeHandlers } from "@/api/ws";
-import { installCacheFlushHandlers } from "@/persist/session-cache";
-import { drafts, pendingSessions } from "@/persist/drafts";
-import { parseLocalSlashCommand } from "@/util/slash-commands";
-import { exportUrl } from "@/api/http";
-import { reconstructTodos } from "@/parser";
-import type { AgentKind, PendingPromptChip, SessionListItem } from "@/types";
-import { parseCodexGoalFields } from "@/util/codex-goal";
-import {
-  SIDEBAR_MAX_WIDTH,
-  SIDEBAR_MIN_WIDTH,
-  SIDEBAR_DEFAULT_WIDTH,
-  SIDEBAR_WIDTH_STORAGE_KEY,
-  clampSidebarWidth,
-  storedSidebarWidth,
-} from "@/util/session-appearance";
+import { computed, onMounted, ref, watch } from "vue";
+import Sidebar from "./components/Sidebar.vue";
+import MainPane from "./components/MainPane.vue";
+import ToastStack from "./components/ToastStack.vue";
+import Lightbox from "./components/Lightbox.vue";
+import { useSessionsStore } from "./stores/sessions.js";
+import { usePrefsStore } from "./stores/prefs.js";
+import { useLiveStore } from "./stores/live.js";
+import { useUiStore } from "./stores/ui.js";
+import { useSessionCacheStore } from "./stores/session-cache.js";
+import { connect as wsConnect, connected as wsConnected, wake as wsWake } from "./api/ws.js";
+import { applyTheme, syncThemeColor } from "./util/theme.js";
+import { getMe } from "./api/me.js";
+import { adaptBackendPrefs } from "./api/prefs.js";
+import { isOrdinarySidebarSessionVisible } from "./util/session-visibility.js";
 
-const sessions = useSessionsStore(); const prefs = usePreferencesStore(); const live = useLiveStore(); const composer = useComposerStore(); const ui = useUiStore();
-const background = useBackgroundTasksStore();
-const interactions = useInteractionsStore();
-const identity = useIdentityStore();
+const sessions = useSessionsStore();
+const prefs = usePrefsStore();
+const live = useLiveStore();
+const ui = useUiStore();
+const cache = useSessionCacheStore();
+
+const fatalError = ref<string | null>(null);
 const appShellClass = computed(() => `cw-app-shell cw-shell-${prefs.messageDisplayStyle}`);
-const sidebarWidth = ref(SIDEBAR_DEFAULT_WIDTH);
-const sidebarResizing = ref(false);
-const appShellStyle = computed(() => ({ "--cw-sidebar-width": `${sidebarWidth.value}px` }));
-let sidebarResizePointer: number | null = null;
-let sidebarResizeStartX = 0;
-let sidebarResizeStartWidth = 0;
-let sidebarResizeHandle: HTMLElement | null = null;
+
+// Taskbar/dock unread badge for the installed PWA. The Badging API paints
+// navigator.setAppBadge(n) onto the app icon (a number on Windows, a dot on
+// some platforms); clearAppBadge() removes it. Foreground-only is enough here
+// — no service worker needed — we just mirror the total unread count whenever
+// it changes. Guarded with optional-call so plain browser tabs (no Badging
+// support) are a no-op.
+// Only count unread for sessions the user can actually see in the sidebar —
+// mirror visibleIds there: skip hidden sessions and (unless opted in) peer
+// sessions. Otherwise the badge counts archived/hidden chats the user has no
+// way to clear, and stays stuck high.
+const totalUnread = computed(() => {
+  let sum = 0;
+  for (const [id, n] of Object.entries(sessions.unreadBySession)) {
+    if (!n) continue;
+    // Only count sessions still in the list. unreadBySession is persisted in
+    // localStorage, so stale ids for deleted/vanished sessions would otherwise
+    // inflate the badge above what the sidebar shows (it sums over visibleIds
+    // only). Mirrors the sidebar's existence + hidden + peer filtering.
+    if (!isOrdinarySidebarSessionVisible(sessions.byId[id], prefs)) continue;
+    sum += n;
+  }
+  return sum;
+});
+watch(
+  totalUnread,
+  (n) => {
+    const nav = navigator as Navigator & {
+      setAppBadge?: (n?: number) => Promise<void>;
+      clearAppBadge?: () => Promise<void>;
+    };
+    if (n > 0) void nav.setAppBadge?.(n);
+    else void nav.clearAppBadge?.();
+  },
+  { immediate: true },
+);
+
 let lastStyleClass = "";
-function syncThemeColor() {
-  if (typeof document === "undefined") return;
-  requestAnimationFrame(() => {
-    const color = getComputedStyle(document.documentElement).getPropertyValue("--cw-shell-bg").trim();
-    if (!color) return;
-    let meta = document.querySelector<HTMLMetaElement>('meta[name="theme-color"]');
-    if (!meta) {
-      meta = document.createElement("meta");
-      meta.name = "theme-color";
-      document.head.append(meta);
-    }
-    meta.content = color;
-  });
-}
 watch(
   () => prefs.messageDisplayStyle,
   (style) => {
@@ -70,256 +73,279 @@ watch(
   },
   { immediate: true },
 );
-const showNew = ref(false); const newSessionCwd = ref(""); const showSettings = ref(false); const showTodos = ref(false); const pendingSelected = ref<string | null>(null); const pendingSending = ref(false);
-const recentCwds = computed(() => [...new Set(sessions.sorted.map((item) => item.cwd).filter(Boolean))].slice(0, 8));
-const pending = computed(() => pendingSessions.items.find((item) => item.id === pendingSelected.value));
-const session = computed<SessionListItem | null>(() => sessions.selected ?? (pending.value ? { id: pending.value.id, cwd: pending.value.cwd, agent: pending.value.agent, mtime: new Date(pending.value.createdAt).toISOString(), size: 0, title: "New session" } : null));
-const blocks = computed(() => sessions.selectedId ? live.blocks(sessions.selectedId) : []);
-const sourceLines = computed(() => sessions.selectedId ? live.linesBySession[sessions.selectedId] ?? [] : []);
-const firstSourceIndex = computed(() => sourceLines.value[0]?.index ?? 0);
-const nextSourceIndex = computed(() => sourceLines.value.length ? Math.max(...sourceLines.value.map(line => line.index)) + 1 : 0);
-const todos = computed(() => reconstructTodos(blocks.value));
-const inlineToolUseIds = computed(() => blocks.value.flatMap((block) => [block, ...(block.children ?? [])]).map((block) => block.toolUseId).filter((id): id is string => !!id));
-let removeWake: (() => void) | undefined; let removeFlush: (() => void) | undefined;
-const updateViewing = () => sessions.setViewingSelected(document.visibilityState === "visible" && !ui.mobileListVisible);
+
+function initialSessionFromUrl(): string | null {
+  const url = new URL(window.location.href);
+  const id = url.searchParams.get("session");
+  return id && id.length > 0 ? id : null;
+}
+
+function onPopState(e: PopStateEvent) {
+  const fromState = (e.state as { sessionId?: string | null } | null)?.sessionId;
+  const id = fromState ?? initialSessionFromUrl();
+  ui.selectFromHistory(id ?? null);
+}
 
 onMounted(async () => {
-  sidebarWidth.value = storedSidebarWidth(localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY), window.innerWidth);
-  live.install();
-  removeWake = installWakeHandlers(mainSocket, () => { void live.prefetch(sessions.sorted); });
-  removeFlush = installCacheFlushHandlers();
-  document.addEventListener("visibilitychange", updateViewing); updateViewing();
-  await Promise.allSettled([sessions.refresh(), prefs.load(), identity.load()]);
-  void live.prefetch(sessions.sorted);
-  const deepLink = new URL(location.href).searchParams.get("session");
-  const first = sessions.items.find((item) => item.id === deepLink)?.id ?? sessions.sorted[0]?.id;
-  if (first) await select(first);
-});
-onBeforeUnmount(() => {
-  endSidebarResize();
-  removeWake?.(); removeFlush?.(); document.removeEventListener("visibilitychange", updateViewing);
-});
-watch(() => ui.openSessionRequest, (request) => { if (request) void select(request.sessionId); });
-watch([() => sessions.selectedId, () => interactions.items.map((item) => `${item.sessionId}:${item.requestId}`).join("|")], () => {
-  // Keep an actionable global card even for the selected session: its matching
-  // tool row may be outside the rendered window or simply off-screen.
-  ui.syncInteractionToasts(interactions.items);
-}, { immediate: true });
-watch(() => session.value?.id, () => { showTodos.value = false; });
-watch(() => ui.mobileListVisible, updateViewing);
-
-function beginSidebarResize(event: PointerEvent) {
-  if (event.button !== 0 || sidebarResizePointer != null) return;
-  event.preventDefault();
-  sidebarResizePointer = event.pointerId;
-  sidebarResizeStartX = event.clientX;
-  sidebarResizeStartWidth = sidebarWidth.value;
-  sidebarResizeHandle = event.currentTarget as HTMLElement;
-  sidebarResizeHandle.setPointerCapture?.(event.pointerId);
-  sidebarResizing.value = true;
-  window.addEventListener("pointermove", resizeSidebar);
-  window.addEventListener("pointerup", endSidebarResize);
-  window.addEventListener("pointercancel", endSidebarResize);
-}
-function resizeSidebar(event: PointerEvent) {
-  if (event.pointerId !== sidebarResizePointer) return;
-  sidebarWidth.value = clampSidebarWidth(sidebarResizeStartWidth + event.clientX - sidebarResizeStartX);
-}
-function endSidebarResize(event?: PointerEvent) {
-  if (event && sidebarResizePointer != null && event.pointerId !== sidebarResizePointer) return;
-  if (sidebarResizePointer != null && sidebarResizeHandle?.hasPointerCapture?.(sidebarResizePointer)) sidebarResizeHandle.releasePointerCapture(sidebarResizePointer);
-  if (sidebarResizePointer != null) localStorage.setItem(SIDEBAR_WIDTH_STORAGE_KEY, String(sidebarWidth.value));
-  sidebarResizePointer = null;
-  sidebarResizeHandle = null;
-  sidebarResizing.value = false;
-  window.removeEventListener("pointermove", resizeSidebar);
-  window.removeEventListener("pointerup", endSidebarResize);
-  window.removeEventListener("pointercancel", endSidebarResize);
-}
-function resizeSidebarWithKeyboard(event: KeyboardEvent) {
-  const deltas: Record<string, number> = { ArrowLeft: -16, ArrowRight: 16 };
-  if (!(event.key in deltas) && event.key !== "Home" && event.key !== "End") return;
-  event.preventDefault();
-  if (event.key === "Home") sidebarWidth.value = SIDEBAR_MIN_WIDTH;
-  else if (event.key === "End") sidebarWidth.value = SIDEBAR_MAX_WIDTH;
-  else sidebarWidth.value = clampSidebarWidth(sidebarWidth.value + deltas[event.key]!);
-  localStorage.setItem(SIDEBAR_WIDTH_STORAGE_KEY, String(sidebarWidth.value));
-}
-
-async function select(id: string, targetUuid?: string, targetIndex?: number) {
-  if ("Notification" in window && Notification.permission === "default") void Notification.requestPermission().catch(() => undefined);
-  ui.mobileListVisible = false;
-  if (pendingSessions.items.some((item) => item.id === id)) {
-    sessions.handoffSelection(null); pendingSelected.value = id; composer.ensure(id); return;
-  }
-  pendingSelected.value = null;
   try {
-    await live.open(id);
-    if (Number.isSafeInteger(targetIndex) && (targetIndex ?? -1) >= 0) {
-      try {
-        await live.loadAround(id, targetIndex!);
-      } catch (error) {
-        ui.toast(error instanceof Error ? error.message : "Could not load the matching message", "error");
+    applyTheme(ui.theme);
+    wsConnect();
+    live.startGlobal();
+    // Inline-boot fast path: backend bakes sessions/prefs/me into the HTML
+    // as window.__BOOT__, so we skip the get-* RPCs on first load and save
+    // ~1 RTT. If any field is missing (boot build failed, older backend,
+    // etc.), fall back to RPC for that one only.
+    interface Boot { sessions?: import("@claude-webui/shared/api").SessionListItem[] | null; prefs?: unknown; me?: { home: string } | null }
+    const boot = (window as unknown as { __BOOT__?: Boot }).__BOOT__ ?? {};
+    const tasks: Promise<unknown>[] = [];
+    let me: { home: string };
+    if (boot.sessions) sessions.hydrateList(boot.sessions);
+    else tasks.push(sessions.fetchAll());
+    if (boot.prefs) prefs.hydrate(adaptBackendPrefs(boot.prefs));
+    else tasks.push(prefs.load());
+    if (boot.me) { me = boot.me; }
+    else { me = await getMe(); }
+    await Promise.all(tasks);
+    ui.setHome(me.home);
+    // Warm tails for the most-recent sessions so the first tap is instant.
+    void live.prefetchTails();
+
+    // History wiring: restore selection from URL on first load, replace the
+    // initial history entry so it carries a sessionId state, and listen for
+    // popstate (mouse-back / mobile back-gesture) to switch sessions.
+    const initialId = initialSessionFromUrl();
+    if (initialId) ui.selectFromHistory(initialId);
+    window.history.replaceState({ sessionId: initialId }, "", window.location.href);
+    window.addEventListener("popstate", onPopState);
+
+    // Re-pull the sessions list to re-anchor preview / lastTurnAt /
+    // lastBoundaryAt — only `notification` events have a replay buffer
+    // server-side, so any session-touched / session-renamed that fired
+    // while we were offline would otherwise be lost and the sidebar
+    // rows would stay frozen on stale previews until something writes
+    // again. Debounced 5s so rapid focus-toggle / unlock spam doesn't
+    // hammer the API.
+    let lastResyncAt = 0;
+    let resyncWork: Promise<void> | null = null;
+    const RESYNC_MIN_GAP_MS = 5000;
+    function resyncSessions(force = false) {
+      const now = Date.now();
+      if (resyncWork) return resyncWork;
+      if (!force && now - lastResyncAt < RESYNC_MIN_GAP_MS) return;
+      lastResyncAt = now;
+      resyncWork = sessions.fetchAll().finally(() => { resyncWork = null; });
+      return resyncWork;
+    }
+
+    // Mobile lock-screen / proxy recovery is not one clean event. iOS may
+    // fire focus/pageshow before the network tunnel is usable, or not fire a
+    // visibility event at all until the user touches the page. Treat a long
+    // sleep as a small recovery window: force a fresh WS once, then retry the
+    // cheap list + active-tail resync as the network comes back.
+    const LONG_SUSPEND_MS = 60_000;
+    const RESUME_RETRY_DELAYS_MS = [0, 500, 1_500, 5_000, 15_000] as const;
+    // Global WebSocket pushes keep the list current. This is only a quiet
+    // fallback for missed pushes, not a second real-time transport.
+    const HOME_SYNC_INTERVAL_MS = 30_000;
+    let hiddenAt: number | null = null;
+    let lastResumeSweepAt = Date.now();
+    let lastForceResumeAt = 0;
+    let lastUserGestureAt = Date.now();
+    let lastHomeSyncAt = 0;
+    let resumeSweepSeq = 0;
+
+    // Real-suspend detector. The old heuristics (tab hidden ≥60s, or no
+    // user gesture ≥60s) were treated as "device slept → force-reconnect".
+    // On DESKTOP that misfires constantly: reading a visible tab for a
+    // minute without clicking made the next click tear down a perfectly
+    // healthy WS (log signature: reconnect-supersede closes with gapAvg≈5s
+    // heartbeats), and each teardown + resubscribe burst is a fresh shot at
+    // the no-tail race documented in live.ts — the "stops updating until
+    // refresh" symptom. A GENUINE suspend (lock screen, lid close, OS
+    // sleep) freezes setInterval outright, so a tick gap far beyond the
+    // interval is the trustworthy signal. Background-tab throttling only
+    // stretches ticks to ~1/min, safely under the 90s threshold. (Chrome
+    // can also outright FREEZE a long-hidden tab — that trips the detector
+    // too, which is fine: a socket that sat through a page freeze is worth
+    // a force-reconnect anyway.)
+    const SUSPEND_TICK_MS = 5_000;
+    const SUSPEND_GAP_MS = 90_000;
+    let lastTickAt = Date.now();
+    // Latched (not a time window): a detected freeze stays pending until a
+    // long-suspend sweep actually consumes it. iOS can deliver the first
+    // user gesture arbitrarily late after wake with no focus/visibility
+    // event in between — a fixed "within 30s of the tick" window would
+    // expire and the gesture path would never recover the session.
+    let suspendPending = false;
+    window.setInterval(() => {
+      const now = Date.now();
+      if (now - lastTickAt >= SUSPEND_GAP_MS) suspendPending = true;
+      lastTickAt = now;
+    }, SUSPEND_TICK_MS);
+    function timersWereFrozen(now: number): boolean {
+      // Direct gap check covers resumeVisible running BEFORE the post-wake
+      // tick lands; suspendPending covers running any time after it did.
+      return now - lastTickAt >= SUSPEND_GAP_MS || suspendPending;
+    }
+
+    function resumePass(forceReconnect: boolean, tryRefreshTail: () => void) {
+      wsWake({ forceReconnect });
+      if (forceReconnect) sessions.clearAllStatus();
+      resyncSessions(true);
+      if (!forceReconnect) tryRefreshTail();
+      // Re-warm recent tails over HTTP — independent of the WS, so it refreshes
+      // the cache even while the socket is still healing from a zombie state.
+      void live.prefetchTails();
+      const sid = ui.selectedSessionId;
+      if (sid) sessions.markRead(sid);
+    }
+
+    // Reconnect → wipe stale per-session statuses (the backend snapshot that
+    // follows only re-asserts non-null statuses, so a session that finished
+    // while we were offline would otherwise stay stuck on a stale "running"),
+    // re-pull the sessions list, and refresh per-session tail subs so any
+    // missed jsonl lines are replayed.
+    watch(wsConnected, (now, prev) => {
+      if (now && !prev) {
+        sessions.clearAllStatus();
+        resyncSessions();
+        void live.prefetchTails();
+        // Force per-session re-subscribe with fresh nextLineIndex. ws.ts
+        // auto-re-subscribes after reconnect using the OLD captured `from`,
+        // which makes the backend replay the entire session every time. Cheap
+        // to fix here: tear down + re-engage anchors on what the cache already
+        // has, so backend only streams genuinely new lines.
+        void live.refreshEngaged();
+      }
+    });
+
+    // Persist any dirty cache when the page is hidden / unloaded.
+    // pagehide fires more reliably than beforeunload on mobile Safari.
+    const flush = () => { void cache.flushAll(); };
+    window.addEventListener("pagehide", flush);
+    window.addEventListener("beforeunload", flush);
+    function resumeVisible(forceLongSuspend = false) {
+      const now = Date.now();
+      const hiddenMs = hiddenAt === null ? 0 : now - hiddenAt;
+      // Long-suspend (→ force a brand-new WS) only when timers actually
+      // froze — i.e. the OS really suspended the page. Mere inactivity or
+      // a backgrounded-but-running tab keeps the existing socket; wake()'s
+      // immediate ping plus the ws.ts watchdog cover the zombie case.
+      const longSuspend = forceLongSuspend
+        || ((hiddenMs >= LONG_SUSPEND_MS || now - lastUserGestureAt >= LONG_SUSPEND_MS) && timersWereFrozen(now));
+      // pageshow + focus + visibilitychange often arrive as a burst. Avoid
+      // force-reconnecting several times for one unlock, but still allow a
+      // long-suspend pointer fallback to run if no lifecycle event fired.
+      if (now - lastResumeSweepAt < 2_000 && (!longSuspend || now - lastForceResumeAt < 2_000)) return;
+      lastResumeSweepAt = now;
+      if (longSuspend) { lastForceResumeAt = now; suspendPending = false; }
+      hiddenAt = null;
+      const seq = ++resumeSweepSeq;
+      // Lock-screen / tab-switch return path. Three things can be stale:
+      //   (1) the WebSocket is silently dead — mobile OSes freeze sockets
+      //       during suspend without firing close, so live updates would
+      //       hang for the next ping interval plus pong timeout before we
+      //       even noticed. wsWake() pings or force-reconnects immediately.
+      //   (2) the sessions list snapshot — only `notification` events have a
+      //       server-side replay buffer, so any session-touched /
+      //       session-renamed events that fired while we were hidden are lost.
+      //       resyncSessions() re-pulls the list (debounced 5s).
+      //   (3) the active chat content — even if (1) finds the socket alive,
+      //       events the backend pushed during the OS-frozen window may have
+      //       been silently dropped. Force a re-subscribe here so the backend
+      //       re-streams from the cache's current nextLineIndex.
+      // Tail re-subscribe (live.refreshEngaged) is disruptive — each call
+      // tears down + rebuilds the backend tail, and a reorder/drop among
+      // those frames can leave the session with NO tail (live.ts watchdog
+      // catches it 3s later, but mid-burst it's a real gap). Only do it
+      // once per sweep, and only when bytes could actually have been
+      // dropped: a genuine suspend froze the page, or the tab spent a long
+      // time hidden (mobile OSes drop in-flight WS bytes for backgrounded
+      // pages without freezing timers). A visible desktop tab that merely
+      // went unclicked gets neither — its socket never lost bytes.
+      const shouldRefreshTail = longSuspend || hiddenMs >= LONG_SUSPEND_MS;
+      let refreshedTail = false;
+      const tryRefreshTail = () => {
+        if (!shouldRefreshTail || refreshedTail || !wsConnected.value) return;
+        refreshedTail = true;
+        void live.refreshEngaged();
+      };
+      for (const [i, delay] of RESUME_RETRY_DELAYS_MS.entries()) {
+        setTimeout(() => {
+          if (seq !== resumeSweepSeq) return;
+          resumePass(i === 0 && longSuspend, tryRefreshTail);
+        }, delay);
       }
     }
-    ui.searchTarget = targetUuid || Number.isSafeInteger(targetIndex)
-      ? { sessionId: id, uuid: targetUuid, index: targetIndex }
-      : null;
-    const url = new URL(location.href); url.searchParams.set("session", id); history.replaceState(null, "", url);
-  } catch (error) { ui.toast(error instanceof Error ? error.message : "Could not open session", "error"); }
-}
-async function create(data: { cwd: string; agent: AgentKind; prompt: string }) {
-  const normalized = await mainSocket.request<{ cwd: string }>("normalize-cwd", { cwd: data.cwd });
-  showNew.value = false;
-  if (!data.prompt.trim()) { const item = pendingSessions.create(normalized.cwd, data.agent); await select(item.id); return; }
-  const result = await mainSocket.request<{ sessionId?: string; id?: string }>("new-session", { ...data, cwd: normalized.cwd }, 60_000);
-  await sessions.refresh(); const id = result.sessionId ?? result.id ?? sessions.items.find((item) => item.cwd === normalized.cwd && item.agent === data.agent)?.id; if (id) await select(id);
-}
-function openNew(cwd?: string) {
-  newSessionCwd.value = cwd ?? session.value?.cwd ?? "";
-  showNew.value = true;
-}
-async function sendPending(text: string) {
-  if (pendingSending.value || !pending.value || (!text.trim() && !(composer.attachments[pending.value.id]?.length))) return;
-  pendingSending.value = true;
-  const item = pending.value;
-  const fileSnapshot = [...(composer.attachments[item.id] ?? [])];
-  try {
-    const images = await attachmentPayloads(fileSnapshot);
-    const result = await mainSocket.request<{ sessionId?: string; id?: string }>("new-session", { cwd: item.cwd, agent: item.agent, prompt: text, images }, 60_000);
-    if (drafts.clearIfMatches(item.id, text) && composer.textBySession[item.id] === text) composer.textBySession[item.id] = "";
-    composer.clearAttachmentsIfMatches(item.id, fileSnapshot); pendingSessions.remove(item.id); pendingSelected.value = null;
-    await sessions.refresh(); const id = result.sessionId ?? result.id ?? sessions.items.find((session) => session.cwd === item.cwd && session.agent === item.agent)?.id; if (id) await select(id);
-  } catch (error) { ui.toast(error instanceof Error ? error.message : "Could not start session", "error"); }
-  finally { pendingSending.value = false; }
-}
-async function loadEarlierSession(id: string) {
-  try { await live.loadEarlier(id); }
-  catch (error) { ui.toast(error instanceof Error ? error.message : "Could not load earlier messages", "error"); }
-}
-async function compactSelectedSession() {
-  if (!session.value || pending.value) return;
-  try {
-    await mainSocket.request("compact-session", { sessionId: session.value.id }, 60_000);
-  } catch (error) {
-    ui.toast(error instanceof Error ? error.message : "Could not compact the session", "error");
-  }
-}
-async function startNewChatInCurrentDirectory() {
-  if (!session.value) return;
-  const item = pendingSessions.create(session.value.cwd, session.value.agent);
-  await select(item.id);
-}
-async function handleFork(data: { newSessionId: string; prefillText: string }) {
-  if (!session.value || !data.newSessionId) return;
-  try {
-    let found = false;
-    for (const waitMs of [0, 80, 160, 320] as const) {
-      if (waitMs) await new Promise<void>(resolve => setTimeout(resolve, waitMs));
-      await sessions.refresh();
-      if (sessions.items.some((item) => item.id === data.newSessionId)) {
-        found = true;
-        break;
+
+    function maybeResumeFromUserGesture() {
+      const now = Date.now();
+      const longGestureGap = now - lastUserGestureAt >= LONG_SUSPEND_MS;
+      lastUserGestureAt = now;
+      // Only treat the gesture as a wake-from-suspend when timers actually
+      // froze. "Read the page for a minute, then click" used to force a
+      // full WS teardown here — the dominant desktop disconnect source.
+      if (longGestureGap && timersWereFrozen(now)) resumeVisible(true);
+    }
+
+    function syncHomeIfVisible(force = false) {
+      if (document.visibilityState === "hidden") return;
+      // Mobile home view = chat list with no selected session. If a chat is
+      // open, live.refreshEngaged/resumeVisible owns the active transcript.
+      if (ui.selectedSessionId) return;
+      const now = Date.now();
+      if (!force && now - lastHomeSyncAt < HOME_SYNC_INTERVAL_MS) return;
+      lastHomeSyncAt = now;
+      resyncSessions(true);
+    }
+
+    // Network came back (iOS toggles this on cell↔wifi, lock-screen wake on a
+    // flaky link, transient blip recovery). Don't wait for reconnect backoff.
+    window.addEventListener("online", () => resumeVisible());
+    // iOS/Safari does not always fire visibilitychange on app-switch return;
+    // pageshow/focus cover BFCache restores and foregrounding paths where the
+    // page is visible but the WS module is stale.
+    window.addEventListener("pageshow", () => resumeVisible());
+    window.addEventListener("focus", () => resumeVisible());
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "hidden") {
+        hiddenAt = Date.now();
+        flush();
+      } else if (document.visibilityState === "visible") {
+        resumeVisible();
       }
-    }
-    if (!found) throw new Error(`Fork ${data.newSessionId} was created, but its rollout is not discoverable yet`);
-    composer.ensure(data.newSessionId); composer.setText(data.newSessionId, data.prefillText);
-    await select(data.newSessionId);
-  } catch (error) { ui.toast(error instanceof Error ? error.message : "Fork created, but the new session could not be opened", "error"); }
-}
-async function retryPromptChip(chip: PendingPromptChip) {
-  if (!session.value || pending.value) return;
-  try { await composer.retryChip(session.value.id, chip, sessions.statuses[session.value.id]?.status === "running"); }
-  catch (error) { ui.toast(error instanceof Error ? error.message : "Could not retry prompt", "error"); }
-}
-async function command(raw: string) {
-  if (!session.value) return; const parsed = parseLocalSlashCommand(raw);
-  if (!parsed) { if (pending.value) { await sendPending(raw); return; } await mainSocket.request("prompt", { sessionId: session.value.id, prompt: raw, clientUuid: crypto.randomUUID() }); composer.setText(session.value.id, ""); return; }
-  const id = session.value.id;
-  try {
-    if (parsed.command === "settings") showSettings.value = true;
-    else if (parsed.command === "theme") prefs.setDisplayStyle(parsed.args.toLowerCase().includes("wechat") ? "wechat" : "claude-code");
-    else if (parsed.command === "clear") composer.chips[id] = [];
-    else if (parsed.command === "compact") await mainSocket.request("compact-session", { sessionId: id });
-    else if (parsed.command === "export") location.assign(exportUrl(id));
-    else if (parsed.command === "model") await mainSocket.request("set-model", { sessionId: id, model: parsed.args });
-    else if (parsed.command === "permissions" || parsed.command === "approval") await mainSocket.request("set-permission-mode", { sessionId: id, mode: parsed.args });
-    else if (parsed.command === "goal") {
-      if (!parsed.args) await mainSocket.request("codex-goal-get", { sessionId: id });
-      else { const goal = parseCodexGoalFields(parsed.args); if (!goal) throw new Error("Use /goal <objective> or JSON with objective, status, and tokenBudget"); await mainSocket.request("codex-goal-set", { sessionId: id, ...goal }); }
-    }
-    else if (["mcp", "plugin", "hooks", "agents", "memory", "version", "doctor"].includes(parsed.command)) {
-      const info = await mainSocket.request<{ title: string; markdown: string }>("cli-info", { sessionId: id, topic: parsed.command }); ui.toast(`${info.title}: ${info.markdown.slice(0, 180)}`);
-    } else ui.toast(`Context: ${sourceLines.value.length} loaded source lines; status ${sessions.statuses[id]?.status ?? "idle"}`);
-    composer.setText(id, "");
-  } catch (error) { ui.toast(error instanceof Error ? error.message : "Command failed", "error"); }
-}
-type DeleteResult = { deleted: string[]; failed: Array<{ id: string; message: string }> };
-async function deleteSession(id: string) {
-  const pendingDraft = pendingSessions.items.find((item) => item.id === id);
-  if (pendingDraft) {
-    if (!confirm("Discard this unstarted session draft?")) return;
-    const files = [...(composer.attachments[id] ?? [])];
-    pendingSessions.remove(id); composer.setText(id, ""); composer.clearAttachmentsIfMatches(id, files);
-    if (pendingSelected.value === id) { pendingSelected.value = null; sessions.handoffSelection(null); }
-    return;
+    });
+    window.addEventListener("pagehide", () => { hiddenAt = Date.now(); });
+    window.addEventListener("pointerdown", maybeResumeFromUserGesture, { capture: true, passive: true });
+    window.addEventListener("touchstart", maybeResumeFromUserGesture, { capture: true, passive: true });
+    window.setInterval(() => syncHomeIfVisible(), HOME_SYNC_INTERVAL_MS);
+  } catch (err) {
+    fatalError.value = (err as Error).message;
   }
-  if (!confirm("Delete this session file?")) return;
-  const result = await mainSocket.request<DeleteResult>("delete-sessions", { sessionIds: [id] });
-  if (result.deleted.includes(sessions.selectedId ?? "")) sessions.handoffSelection(null);
-  if (result.failed.length) ui.toast(result.failed.map((item) => `${item.id}: ${item.message}`).join("; "), "error");
-  await sessions.refresh();
-}
-async function deleteManySessions(ids: string[]) {
-  if (!ids.length || !confirm(`Delete ${ids.length} selected sessions?`)) return;
-  const result = await mainSocket.request<DeleteResult>("delete-sessions", { sessionIds: ids });
-  if (result.deleted.includes(sessions.selectedId ?? "")) sessions.handoffSelection(null);
-  if (result.failed.length) ui.toast(`${result.failed.length} session(s) could not be deleted: ${result.failed.map((item) => item.message).join("; ")}`, "error");
-  else ui.toast(`Deleted ${result.deleted.length} sessions`);
-  await sessions.refresh();
-}
-async function renameSession(id: string, title: string) {
-  if (pendingSessions.items.some((item) => item.id === id)) { pendingSessions.update(id, { title }); return; }
-  await mainSocket.request("set-title", { sessionId: id, title }); sessions.touch(id, { title, titleSource: "manual" });
-}
+});
 </script>
 
 <template>
-  <div class="cw-app" data-shell-version="viewport-v1" :class="[appShellClass, { 'cw-show-list': ui.mobileListVisible, 'cw-sidebar-is-resizing': sidebarResizing }]" :style="appShellStyle">
-    <Sidebar @select="select" @new="openNew" @settings="showSettings = true" @refresh="sessions.refresh" @delete="deleteSession" @delete-many="deleteManySessions" @rename="renameSession" />
-    <div
-      class="cw-sidebar-resizer"
-      role="separator"
-      aria-label="Resize chats sidebar"
-      aria-orientation="vertical"
-      :aria-valuemin="SIDEBAR_MIN_WIDTH"
-      :aria-valuemax="SIDEBAR_MAX_WIDTH"
-      :aria-valuenow="sidebarWidth"
-      tabindex="0"
-      @pointerdown="beginSidebarResize"
-      @keydown="resizeSidebarWithKeyboard"
+  <div v-if="fatalError" class="m-6 text-[var(--cw-danger)]">
+    {{ fatalError }} — append <code>?token=&lt;your-token&gt;</code> to the URL and reload.
+  </div>
+  <!-- IM-style mobile layout: chat list IS the home view. The sidebar takes
+       the whole viewport when no session is selected; once a session opens
+       (real or pending draft), the main pane covers the sidebar entirely
+       and the in-pane back button returns to the list. On md+ both panels
+       coexist as before — Telegram Web style. -->
+  <div v-else class="flex h-full min-h-0 overflow-hidden" :class="appShellClass">
+    <Sidebar
+      :class="ui.selectedSessionId
+        ? 'hidden md:flex md:flex-col md:w-72 md:shrink-0'
+        : 'flex flex-col flex-1 md:flex-none md:w-72 md:shrink-0'"
     />
-    <main class="cw-main cw-main-pane">
-      <template v-if="session">
-        <SessionHeader
-          :session="session"
-          :status="sessions.statuses[session.id]"
-          :background-tasks="background.bySession[session.id] || []"
-          :connected="live.connected"
-          @back="ui.mobileListVisible = true"
-          @renamed="sessions.touch(session.id, { title: $event, titleSource: 'manual' })"
-        />
-        <ComposerBar :key="session.id" :session-id="session.id" :session="session" :agent="session.agent" :settings="sessions.settings[session.id]" :status="sessions.statuses[session.id]" :active="sessions.statuses[session.id]?.status === 'running'" :start-line="nextSourceIndex" :pending="!!pending" :disabled="pendingSending" @command="command" @send-pending="sendPending" />
-        <button v-if="todos.length" class="cw-todo-pill" @click="showTodos = true">{{ todos.filter(t => t.status === 'completed').length }}/{{ todos.length }} todos</button>
-        <TranscriptPane v-if="!pending" :session-id="session.id" :agent="session.agent" :blocks="blocks" :chips="composer.chips[session.id] || []" :style="prefs.messageDisplayStyle" :loading="live.restoring[session.id]" :loading-earlier="live.loadingEarlier[session.id]" :first-source-index="firstSourceIndex" :scroll-target-uuid="ui.searchTarget?.sessionId === session.id ? ui.searchTarget.uuid : undefined" :scroll-target-index="ui.searchTarget?.sessionId === session.id ? ui.searchTarget.index : undefined" @prefill="composer.setText(session.id, $event)" @forked="handleFork" @retry-chip="retryPromptChip" @dismiss-chip="composer.dismiss(session.id, $event)" @load-earlier="loadEarlierSession(session.id)" @compact="compactSelectedSession" @new-chat="startNewChatInCurrentDirectory" />
-        <div v-else class="cw-transcript-frame"><div class="cw-empty cw-pending-empty"><strong>New {{ session.agent }} session</strong><span>{{ session.cwd }}</span><span>Your session starts when you send the first prompt.</span></div></div>
-        <InteractionTray :session-id="session.id" :exclude-tool-use-ids="inlineToolUseIds" />
-      </template>
-      <div v-else class="cw-empty cw-no-selection"><strong>Select or start a session</strong><span>Claude Code and Codex histories appear here.</span></div>
-    </main>
-    <NewSessionDialog v-if="showNew" :initial-cwd="newSessionCwd" :recent-cwds="recentCwds" @close="showNew = false" @create="create" />
-    <SettingsDialog v-if="showSettings" @close="showSettings = false" />
-    <Teleport to="body"><div v-if="showTodos" class="cw-modal-scrim cw-modal-overlay" @click.self="showTodos = false"><section class="cw-modal cw-modal-card cw-todo-modal"><header><h2>Session tasks</h2><button @click="showTodos = false">Close</button></header><ol><li v-for="todo in todos" :key="todo.id" :class="`is-${todo.status}`"><span class="cw-todo-check">{{ todo.status === 'completed' ? '✓' : '' }}</span><div><strong>{{ todo.subject }}</strong><small>{{ todo.status.replaceAll('_', ' ') }}</small></div></li></ol></section></div></Teleport>
-    <OverlayHost />
+    <MainPane
+      :class="ui.selectedSessionId
+        ? 'flex-1 flex flex-col min-w-0'
+        : 'hidden md:flex md:flex-col md:flex-1 md:min-w-0'"
+    />
+    <ToastStack />
+    <Lightbox />
   </div>
 </template>

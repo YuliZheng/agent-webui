@@ -15,6 +15,7 @@ describe("preference normalization", () => {
     expect(second.hiddenSessionIds).toEqual([]);
     expect(second.messageDisplayStyle).toBe("claude-code");
     expect(second.colorPreference).toBe("system");
+    expect(second.showSubagentSessions).toBe(false);
   });
 
   it("allows exactly the two display styles", () => {
@@ -53,9 +54,11 @@ describe("preference normalization", () => {
       defaultClaudeModel: "opus",
       defaultClaudePermissionMode: "plan",
       defaultCodexModel: "gpt-5",
+      defaultCodexServiceTier: "priority",
       defaultCodexApprovalPreset: "on-request",
       showActiveSection: false,
       showPeerSessions: false,
+      showSubagentSessions: true,
       messageDisplayStyle: "wechat",
       colorPreference: "dark",
     });
@@ -71,6 +74,8 @@ describe("preference normalization", () => {
     ]);
     expect(prefs.pinnedSessionIds).toEqual(["two", "one"]);
     expect(prefs.autoTitleFrequency).toBe(12);
+    expect(prefs.defaultCodexServiceTier).toBe("priority");
+    expect(prefs.showSubagentSessions).toBe(true);
     expect(prefs.messageDisplayStyle).toBe("wechat");
     expect(prefs.colorPreference).toBe("dark");
   });
@@ -90,9 +95,16 @@ describe("preference normalization", () => {
     expect(prefs.messageDisplayStyle).toBe("wechat");
     expect(prefs.colorPreference).toBe("system");
     expect(prefs.autoTitleFrequency).toBe(5);
+    expect(prefs.defaultCodexServiceTier).toBe("");
     expect(Object.keys(prefs)).not.toContain("legacySecret");
     expect(Object.keys(prefs)).not.toContain("legacyDraft");
     expect(Object.keys(prefs)).not.toContain("legacyRemote");
+  });
+
+  it("accepts only the priority Codex service-tier default", () => {
+    expect(normalizePrefs({ defaultCodexServiceTier: "priority" }).defaultCodexServiceTier).toBe("priority");
+    expect(normalizePrefs({ defaultCodexServiceTier: "fast" }).defaultCodexServiceTier).toBe("");
+    expect(normalizePrefs({ defaultCodexServiceTier: "standard" }).defaultCodexServiceTier).toBe("");
   });
 
   it("validates canonical blobs", () => {

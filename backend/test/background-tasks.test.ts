@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { failRunningClaudeBackgroundTasks, mergeClaudeBackgroundTasks, mergeCodexBackgroundTask } from "../src/services/background-tasks.js";
+import {
+  failRunningClaudeBackgroundTasks,
+  mergeClaudeBackgroundTasks,
+  mergeCodexBackgroundTask,
+  settleRunningCodexBackgroundTasks,
+} from "../src/services/background-tasks.js";
 
 describe("Codex background task lifecycle", () => {
   it("updates one stable task from running to completed instead of leaving a stale spinner", () => {
@@ -12,6 +17,52 @@ describe("Codex background task lifecycle", () => {
   it("maps failed and cancelled lifecycle events explicitly", () => {
     expect(mergeCodexBackgroundTask([], "task/failed", { task: { id: "t1" }, error: "boom" })[0]).toMatchObject({ id: "t1", status: "failed", error: "boom" });
     expect(mergeCodexBackgroundTask([], "task/cancelled", { taskId: "t2" })[0]).toMatchObject({ id: "t2", status: "cancelled" });
+  });
+
+  it("labels Codex collaboration-agent items as subagent work", () => {
+    const running = mergeCodexBackgroundTask([], "item/started", {
+      item: {
+        id: "agent-call-1",
+        type: "collabAgentToolCall",
+        prompt: "Inspect search code",
+        receiverThreadIds: ["worker-1"],
+      },
+    });
+    expect(running[0]).toMatchObject({
+      id: "agent-call-1",
+      kind: "agent",
+      title: "Inspect search code",
+      relatedSessionIds: ["worker-1"],
+      status: "running",
+    });
+  });
+
+  it("settles unmatched running items at an authoritative Codex turn boundary", () => {
+    const existing = [
+      { id: "stale-shell", title: "item/started", status: "running", startedAt: "2026-01-01T00:00:00Z" },
+      { id: "done", title: "item/completed", status: "completed", startedAt: "2026-01-01T00:00:01Z", finishedAt: "2026-01-01T00:00:02Z" },
+    ];
+    const settled = settleRunningCodexBackgroundTasks(existing, "completed", "2026-01-01T00:00:05Z");
+
+    expect(settled).toEqual([
+      expect.objectContaining({ id: "stale-shell", status: "completed", finishedAt: "2026-01-01T00:00:05Z" }),
+      existing[1],
+    ]);
+    expect(settleRunningCodexBackgroundTasks(settled)).toBe(settled);
+  });
+
+  it("marks unmatched running items failed when the Codex turn fails", () => {
+    const settled = settleRunningCodexBackgroundTasks(
+      [{ id: "stale-shell", title: "item/started", status: "running" }],
+      "failed",
+      "2026-01-01T00:00:05Z",
+    );
+    expect(settled[0]).toMatchObject({
+      id: "stale-shell",
+      status: "failed",
+      finishedAt: "2026-01-01T00:00:05Z",
+      error: "Codex turn failed",
+    });
   });
 });
 

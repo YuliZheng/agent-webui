@@ -6,6 +6,8 @@ export interface BackgroundTaskRecord {
   id: string;
   title: string;
   status: BackgroundTaskState;
+  kind?: "agent" | "workflow" | "shell" | "cron";
+  relatedSessionIds?: string[];
   toolUseId?: string;
   detail?: string;
   startedAt?: string;
@@ -41,6 +43,12 @@ function printable(value: unknown): string | undefined {
   } catch { return String(value); }
 }
 
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string" && item.length > 0)
+    : [];
+}
+
 /** Merge lifecycle events so a completed event replaces its matching running task. */
 export function mergeCodexBackgroundTask(existing: readonly unknown[], method: string, rawParams: unknown, now = new Date().toISOString()): BackgroundTaskRecord[] {
   const params = asRecord(rawParams);
@@ -49,12 +57,24 @@ export function mergeCodexBackgroundTask(existing: readonly unknown[], method: s
   const id = eventId(method, params);
   const status = eventStatus(method, params);
   const prior = existing.map(asRecord).find(value => asString(value?.id) === id);
-  const title = asString(params?.title) ?? asString(item?.title) ?? asString(task?.title) ?? method;
+  const descriptor = `${method} ${asString(item?.type) ?? ""} ${asString(task?.type) ?? ""}`;
+  const agentTask = /(?:collab.*agent|subagent|agent.*tool)/i.test(descriptor);
+  const relatedSessionIds = stringArray(item?.receiverThreadIds ?? item?.receiver_thread_ids);
+  const title = asString(params?.title) ?? asString(params?.description)
+    ?? asString(item?.title) ?? asString(item?.description) ?? asString(item?.name) ?? asString(item?.prompt)
+    ?? asString(task?.title) ?? asString(task?.description)
+    ?? (agentTask ? "Subagent" : method);
   const detail = printable(params);
   const record: BackgroundTaskRecord = {
     id,
     title,
     status,
+    ...(agentTask ? { kind: "agent" as const } : {}),
+    ...(relatedSessionIds.length
+      ? { relatedSessionIds }
+      : Array.isArray(prior?.relatedSessionIds)
+        ? { relatedSessionIds: stringArray(prior.relatedSessionIds) }
+        : {}),
     ...(detail ? { detail } : {}),
     startedAt: asString(prior?.startedAt) ?? asString(params?.startedAt) ?? now,
     ...(status !== "running" ? { finishedAt: asString(params?.finishedAt) ?? now } : {}),
@@ -62,6 +82,34 @@ export function mergeCodexBackgroundTask(existing: readonly unknown[], method: s
   };
   const retained = existing.filter(value => asString(asRecord(value)?.id) !== id) as BackgroundTaskRecord[];
   return [...retained, record].slice(-100);
+}
+
+/**
+ * A Codex turn boundary is authoritative: lifecycle items from the previous
+ * turn cannot still be running after that turn ended or a later turn began.
+ * Some nested custom tools omit (or change the id of) their completion event,
+ * so id-only pairing otherwise leaves permanent sidebar spinners.
+ */
+export function settleRunningCodexBackgroundTasks(
+  existing: readonly unknown[],
+  outcome: "completed" | "failed" = "completed",
+  now = new Date().toISOString(),
+): BackgroundTaskRecord[] {
+  let changed = false;
+  const tasks = existing.map(value => {
+    const record = asRecord(value);
+    if (record?.status !== "running") return value as BackgroundTaskRecord;
+    changed = true;
+    return {
+      ...record,
+      status: outcome,
+      finishedAt: now,
+      ...(outcome === "failed"
+        ? { error: asString(record.error) ?? "Codex turn failed" }
+        : {}),
+    } as BackgroundTaskRecord;
+  });
+  return changed ? tasks : existing as BackgroundTaskRecord[];
 }
 
 function claudeStatus(value: string, isError = false): BackgroundTaskState {

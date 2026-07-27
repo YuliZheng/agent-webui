@@ -16,6 +16,7 @@ interface TurnReadyWaiter { resolve: () => void; reject: (error: Error) => void;
 export interface CodexTurnOptions {
   model?: string;
   effort?: string;
+  serviceTier?: string;
   approvalPolicy?: string;
   sandboxMode?: string;
   cwd?: string;
@@ -23,6 +24,7 @@ export interface CodexTurnOptions {
 export interface CodexSettingsUpdate {
   model?: string | null;
   effort?: string | null;
+  serviceTier?: string | null;
   approvalPolicy?: string | null;
   sandboxMode?: string | null;
   cwd?: string;
@@ -31,6 +33,16 @@ export interface CodexThreadTurn {
   id: string;
   userText: string;
 }
+export interface CodexRateLimitWindow {
+  usedPercent: number;
+  windowDurationMins: number | null;
+  resetsAt: number | null;
+}
+export interface CodexRateLimits {
+  planType: string | null;
+  primary: CodexRateLimitWindow | null;
+  secondary: CodexRateLimitWindow | null;
+}
 
 const FALLBACK_CODEX_MODELS: AgentModelOption[] = [
   {
@@ -38,26 +50,26 @@ const FALLBACK_CODEX_MODELS: AgentModelOption[] = [
     label: "GPT-5.6-Sol",
     description: "Fast local Codex model",
     defaultEffort: "low",
-    supportedEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"].map(value => ({ value, label: value })),
+    supportedEfforts: ["none", "minimal", "low", "medium", "high", "xhigh", "max"].map(value => ({ value, label: value })),
   },
   {
     value: "gpt-5.6-terra",
     label: "GPT-5.6-Terra",
     description: "General-purpose local Codex model",
     defaultEffort: "medium",
-    supportedEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"].map(value => ({ value, label: value })),
+    supportedEfforts: ["none", "minimal", "low", "medium", "high", "xhigh", "max"].map(value => ({ value, label: value })),
   },
   {
     value: "gpt-5.6-luna",
     label: "GPT-5.6-Luna",
     description: "Deep reasoning local Codex model",
     defaultEffort: "medium",
-    supportedEfforts: ["low", "medium", "high", "xhigh", "max"].map(value => ({ value, label: value })),
+    supportedEfforts: ["none", "minimal", "low", "medium", "high", "xhigh", "max"].map(value => ({ value, label: value })),
   },
   ...["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"].map(value => ({
     value,
     label: value,
-    supportedEfforts: ["low", "medium", "high", "xhigh"].map(effort => ({ value: effort, label: effort })),
+    supportedEfforts: ["none", "minimal", "low", "medium", "high", "xhigh", "max"].map(effort => ({ value: effort, label: effort })),
   })),
 ];
 
@@ -77,12 +89,39 @@ function answerStrings(value: unknown): string[] {
   const wrapped = asRecord(value);
   const source = wrapped && Object.hasOwn(wrapped, "answers") ? wrapped.answers : value;
   const values = Array.isArray(source) ? source : source === undefined || source === null ? [] : [source];
-  return values.flatMap(item => typeof item === "string" ? [item] : typeof item === "number" || typeof item === "boolean" ? [String(item)] : []);
+  return values.flatMap(item => {
+    if (typeof item === "string") return [item];
+    if (typeof item === "number" || typeof item === "boolean") return [String(item)];
+    const record = asRecord(item);
+    const otherText = asString(record?.otherText)?.trim();
+    const selectedLabel = asString(record?.selectedLabel);
+    return otherText ? [otherText] : selectedLabel ? [selectedLabel] : [];
+  });
+}
+
+function finiteNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function rateLimitWindow(value: unknown): CodexRateLimitWindow | null {
+  const window = asRecord(value);
+  if (!window) return null;
+  const usedPercent = finiteNumber(window.usedPercent ?? window.used_percent);
+  if (usedPercent === null) return null;
+  return {
+    usedPercent,
+    windowDurationMins: finiteNumber(window.windowDurationMins ?? window.window_duration_mins),
+    resetsAt: finiteNumber(window.resetsAt ?? window.resets_at),
+  };
 }
 
 function userInputResult(params: Record<string, unknown> | null, answer: unknown): { answers: Record<string, { answers: string[] }> } {
   const questions = Array.isArray(params?.questions) ? params.questions : [];
   const answerRecord = asRecord(answer);
+  const ordered =
+    answerRecord?.kind === "ask-answers" && Array.isArray(answerRecord.answers)
+      ? answerRecord.answers
+      : null;
   const supplied = asRecord(answerRecord?.answers) ?? answerRecord;
   const entries: Array<[string, { answers: string[] }]> = [];
   let usedScalar = false;
@@ -92,7 +131,9 @@ function userInputResult(params: Record<string, unknown> | null, answer: unknown
     const id = asString(question?.id);
     if (!id) return;
     let value: unknown;
-    if (supplied) {
+    if (ordered) {
+      value = ordered[index];
+    } else if (supplied) {
       const header = asString(question?.header);
       if (Object.hasOwn(supplied, id)) value = supplied[id];
       else if (header && Object.hasOwn(supplied, header)) value = supplied[header];
@@ -107,8 +148,27 @@ function userInputResult(params: Record<string, unknown> | null, answer: unknown
   return { answers: Object.fromEntries(entries) };
 }
 
+function normalizedInteractionAnswer(answer: unknown): {
+  accepted: boolean | null;
+  content: unknown;
+} {
+  const value = asRecord(answer);
+  const kind = asString(value?.kind);
+  if (kind === "allow") {
+    return { accepted: true, content: value?.updatedInput ?? null };
+  }
+  if (kind === "deny") {
+    return { accepted: false, content: asString(value?.message) ?? null };
+  }
+  if (typeof answer === "boolean") {
+    return { accepted: answer, content: null };
+  }
+  return { accepted: null, content: answer };
+}
+
 export class CodexDriver extends EventEmitter {
   private child?: ChildProcessWithoutNullStreams;
+  private initializedChild?: ChildProcessWithoutNullStreams;
   private buffer = "";
   private nextId = 1;
   private pending = new Map<number, Pending>();
@@ -116,6 +176,7 @@ export class CodexDriver extends EventEmitter {
   private threads = new Map<string, ThreadState>();
   private clientIds = new Map<string, PromptResult>();
   private clientRequests = new Map<string, Promise<PromptResult>>();
+  private resumingThreads = new Map<string, Promise<void>>();
   private startingTurns = new Map<string, Promise<unknown>>();
   private turnReadyWaiters = new Map<string, TurnReadyWaiter[]>();
   private starting?: Promise<void>;
@@ -123,28 +184,63 @@ export class CodexDriver extends EventEmitter {
   private capabilitiesCache?: { expiresAt: number; value: AgentCapabilities };
   private capabilitiesRequest?: Promise<AgentCapabilities>;
 
-  constructor(private binary: string, private state: AppState) { super(); }
+  constructor(
+    private binary: string,
+    private state: AppState,
+    private spawnProcess: typeof spawn = spawn,
+  ) { super(); }
 
   isActive(id: string): boolean { return this.threads.get(id)?.active === true; }
 
   private async ensure(): Promise<void> {
-    if (this.child?.exitCode === null) return;
     if (this.starting) return this.starting;
+    if (this.child?.exitCode === null && this.initializedChild === this.child) return;
     this.resolvedBinary ??= resolveCodexExecutable(this.binary);
     const binary = await this.resolvedBinary;
-    if (this.child?.exitCode === null) return;
     if (this.starting) return this.starting;
-    this.starting = new Promise<void>((resolve, reject) => {
-      const child = spawn(binary, ["app-server", "--listen", "stdio://"], { shell: false, stdio: ["pipe", "pipe", "pipe"], windowsHide: true, env: { ...process.env, AGENT_WEBUI: "1" } });
+    if (this.child?.exitCode === null && this.initializedChild === this.child) return;
+    const operation = new Promise<void>((resolve, reject) => {
+      const child = this.spawnProcess(binary, ["app-server", "--listen", "stdio://"], { shell: false, stdio: ["pipe", "pipe", "pipe"], windowsHide: true, env: { ...process.env, AGENT_WEBUI: "1" } });
       this.child = child;
-      child.stdout.on("data", chunk => this.stdout(String(chunk)));
-      child.stderr.on("data", chunk => this.emit("stderr", String(chunk).slice(-4096)));
-      child.on("error", error => { reject(error); this.failed(error); });
-      child.on("exit", (code, signal) => this.failed(new Error(`Codex app-server exited (${code ?? signal ?? "unknown"})`)));
-      this.rawRequest("initialize", { clientInfo: { name: "agent-webui", version: "0.1.0" }, capabilities: {} })
-        .then(() => { this.send({ method: "initialized", params: {} }); resolve(); }, reject);
-    }).finally(() => { this.starting = undefined; });
-    return this.starting;
+      this.initializedChild = undefined;
+      child.stdout.on("data", chunk => { if (this.child === child) this.stdout(String(chunk)); });
+      child.stderr.on("data", chunk => { if (this.child === child) this.emit("stderr", String(chunk).slice(-4096)); });
+      child.on("error", error => {
+        reject(error);
+        this.failed(error, child);
+      });
+      child.on("exit", (code, signal) => this.failed(new Error(`Codex app-server exited (${code ?? signal ?? "unknown"})`), child));
+      this.rawRequest("initialize", {
+        clientInfo: { name: "agent-webui", title: "Agent WebUI", version: "0.1.0" },
+        capabilities: { experimentalApi: true },
+      })
+        .then(() => {
+          if (this.child !== child || child.exitCode !== null) {
+            reject(new RpcError(503, "Codex app-server exited during initialization"));
+            return;
+          }
+          try {
+            this.send({ method: "initialized", params: {} });
+            this.initializedChild = child;
+            resolve();
+          } catch (error) {
+            const cause = error instanceof Error ? error : new Error(String(error));
+            reject(cause);
+            this.failed(cause, child);
+            if (child.exitCode === null) child.kill("SIGTERM");
+          }
+        }, error => {
+          reject(error);
+          this.failed(error instanceof Error ? error : new Error(String(error)), child);
+          if (child.exitCode === null) child.kill("SIGTERM");
+        });
+    });
+    let wrapped!: Promise<void>;
+    wrapped = operation.finally(() => {
+      if (this.starting === wrapped) this.starting = undefined;
+    });
+    this.starting = wrapped;
+    return wrapped;
   }
 
   private send(value: unknown): void {
@@ -228,6 +324,14 @@ export class CodexDriver extends EventEmitter {
   private notification(method: string, params: Record<string, unknown> | null): void {
     const sessionId = this.threadId(params);
     if (!sessionId) { this.emit("notification", { method, params }); return; }
+    if (method === "thread/name/updated") {
+      this.emit("thread-name", {
+        id: sessionId,
+        name: (asString(params?.threadName) ?? asString(params?.name) ?? "").trim() || null,
+      });
+      this.emit("notification", { method, params });
+      return;
+    }
     const state = this.threads.get(sessionId) ?? { active: false, steers: [] };
     this.threads.set(sessionId, state);
     if (method === "turn/started") {
@@ -239,6 +343,15 @@ export class CodexDriver extends EventEmitter {
       state.active = false; state.turnId = undefined;
       this.rejectTurnReady(sessionId, new RpcError(409, "Codex turn completed before reporting its ID"));
       this.emit("status", { id: sessionId, status: status === "failed" ? "failed" : "exited", webuiAlive: true, lastBoundaryAt: new Date().toISOString() });
+      if (status === "failed") {
+        const error = asRecord(turn?.error) ?? asRecord(params?.error);
+        this.emit("turn-error", {
+          sessionId,
+          turnId: asString(turn?.id) ?? asString(params?.turnId) ?? null,
+          message: asString(error?.message) ?? "Codex turn failed before producing a reply.",
+          details: asString(error?.additionalDetails) ?? null,
+        });
+      }
       const steers = state.steers.splice(0);
       if (status === "interrupted" && steers.length) {
         // Codex steers are not durable. Resend only after an authoritative interrupted completion.
@@ -248,7 +361,12 @@ export class CodexDriver extends EventEmitter {
       } else if (status !== "interrupted" && status !== "failed") {
         this.emit("steers-completed", { sessionId, clientUuids: steers.flatMap(item => item.clientUuid ? [item.clientUuid] : []), status });
       }
-    } else if (/(?:task|command).*(?:started|completed|finished|failed|cancelled|canceled|error)/i.test(method)) {
+    } else if (
+      /(?:started|completed|finished|failed|cancelled|canceled|error)/i.test(method)
+      && /(?:task|command|collab.*agent|subagent|agent.*tool)/i.test(
+        `${method} ${asString(asRecord(params?.item)?.type) ?? ""} ${asString(asRecord(params?.task)?.type) ?? ""}`,
+      )
+    ) {
       this.emit("background", { sessionId, method, params });
     }
     this.emit("notification", { method, params });
@@ -258,6 +376,8 @@ export class CodexDriver extends EventEmitter {
     const result = asRecord(await this.request("thread/start", {
       cwd,
       ...(options.model ? { model: options.model } : {}),
+      ...(options.effort ? { effort: options.effort } : {}),
+      ...(options.serviceTier ? { serviceTier: options.serviceTier } : {}),
       ...(options.approvalPolicy ? { approvalPolicy: options.approvalPolicy } : {}),
       ...(options.sandboxMode ? { sandbox: options.sandboxMode } : {}),
     }));
@@ -271,6 +391,20 @@ export class CodexDriver extends EventEmitter {
 
   async resume(sessionId: string): Promise<void> {
     if (this.threads.get(sessionId)?.attached) return;
+    const inflight = this.resumingThreads.get(sessionId);
+    if (inflight) return inflight;
+    const operation = this.resumeOnce(sessionId);
+    this.resumingThreads.set(sessionId, operation);
+    try {
+      await operation;
+    } finally {
+      if (this.resumingThreads.get(sessionId) === operation) {
+        this.resumingThreads.delete(sessionId);
+      }
+    }
+  }
+
+  private async resumeOnce(sessionId: string): Promise<void> {
     const result = asRecord(await this.request("thread/resume", { threadId: sessionId }));
     const thread = asRecord(result?.thread);
     const existing = this.threads.get(sessionId) ?? { active: false, steers: [] };
@@ -299,6 +433,7 @@ export class CodexDriver extends EventEmitter {
         input,
         ...(options.model ? { model: options.model } : {}),
         ...(options.effort ? { effort: options.effort } : {}),
+        ...(options.serviceTier ? { serviceTier: options.serviceTier } : {}),
         ...(options.approvalPolicy ? { approvalPolicy: options.approvalPolicy } : {}),
         ...(options.sandboxMode ? { sandboxPolicy: this.sandboxPolicy(options.sandboxMode, options.cwd ?? state.cwd) } : {}),
         ...(clientUserMessageId ? { clientUserMessageId } : {}),
@@ -385,6 +520,20 @@ export class CodexDriver extends EventEmitter {
       })
       .finally(() => { this.capabilitiesRequest = undefined; });
     return this.capabilitiesRequest;
+  }
+
+  async rateLimits(): Promise<CodexRateLimits> {
+    const response = asRecord(await this.request("account/rateLimits/read", undefined));
+    const byLimitId = asRecord(response?.rateLimitsByLimitId ?? response?.rate_limits_by_limit_id);
+    const snapshot =
+      asRecord(byLimitId?.codex) ??
+      asRecord(response?.rateLimits ?? response?.rate_limits);
+    if (!snapshot) throw new RpcError(502, "Codex did not return account rate limits");
+    return {
+      planType: asString(snapshot.planType ?? snapshot.plan_type) ?? null,
+      primary: rateLimitWindow(snapshot.primary),
+      secondary: rateLimitWindow(snapshot.secondary),
+    };
   }
 
   private async readCapabilities(cwd?: string): Promise<AgentCapabilities> {
@@ -481,6 +630,50 @@ export class CodexDriver extends EventEmitter {
     await this.request("thread/settings/update", payload);
   }
   async compact(sessionId: string): Promise<void> { await this.request("thread/compact/start", { threadId: sessionId }); }
+  async threadNames(): Promise<Map<string, string | null>> {
+    const names = new Map<string, string | null>();
+    const collect = async (archived: boolean): Promise<void> => {
+      let cursor: string | undefined;
+      const seenCursors = new Set<string>();
+      for (let page = 0; page < 100; page++) {
+        const response = asRecord(await this.request("thread/list", {
+          limit: 100,
+          archived,
+          useStateDbOnly: true,
+          ...(cursor ? { cursor } : {}),
+        }));
+        for (const rawThread of Array.isArray(response?.data) ? response.data : []) {
+          const thread = asRecord(rawThread);
+          const id = asString(thread?.id);
+          const name = asString(thread?.name)?.replace(/\s+/g, " ").trim();
+          if (id) names.set(id, name || null);
+        }
+        const next = asString(response?.nextCursor) ?? asString(response?.next_cursor);
+        if (!next || seenCursors.has(next)) break;
+        seenCursors.add(next);
+        cursor = next;
+      }
+    };
+
+    await collect(false);
+    // Archived threads are a separate app-server listing. Failure here should
+    // not discard the live thread names already collected from older servers.
+    await collect(true).catch(() => undefined);
+    return names;
+  }
+  async threadName(sessionId: string): Promise<string | null> {
+    const response = asRecord(await this.request("thread/read", {
+      threadId: sessionId,
+      includeTurns: false,
+    }));
+    const thread = asRecord(response?.thread);
+    return (asString(thread?.name) ?? "").replace(/\s+/g, " ").trim() || null;
+  }
+  async setThreadName(sessionId: string, name: string): Promise<void> {
+    const normalized = name.replace(/\s+/g, " ").trim().slice(0, 120);
+    if (!normalized) throw new RpcError(400, "Thread name cannot be empty");
+    await this.request("thread/name/set", { threadId: sessionId, name: normalized });
+  }
   async threadTurns(sessionId: string): Promise<CodexThreadTurn[]> {
     const response = asRecord(await this.request("thread/read", { threadId: sessionId, includeTurns: true }));
     const thread = asRecord(response?.thread);
@@ -507,10 +700,14 @@ export class CodexDriver extends EventEmitter {
       return [{ id, userText }];
     });
   }
-  async fork(sessionId: string, lastTurnId?: string): Promise<unknown> {
+  async fork(
+    sessionId: string,
+    boundary: { beforeTurnId?: string; lastTurnId?: string } = {},
+  ): Promise<unknown> {
     const response = await this.request("thread/fork", {
       threadId: sessionId,
-      ...(lastTurnId ? { lastTurnId } : {}),
+      ...(boundary.beforeTurnId ? { beforeTurnId: boundary.beforeTurnId } : {}),
+      ...(boundary.lastTurnId ? { lastTurnId: boundary.lastTurnId } : {}),
       // A WebUI branch must have an on-disk rollout so it remains discoverable
       // and can continue to use the same raw-JSONL streaming path as every
       // other Codex session.
@@ -539,28 +736,43 @@ export class CodexDriver extends EventEmitter {
     const pending = this.inbound.get(requestId);
     if (!pending || pending.sessionId !== sessionId) throw new RpcError(409, "Interaction is no longer pending");
     this.inbound.delete(requestId); this.state.interactions.delete(this.state.interactionKey(sessionId, requestId));
-    let result: unknown = answer;
+    const normalized = normalizedInteractionAnswer(answer);
+    let result: unknown = normalized.accepted ?? answer;
     if (pending.method === "item/tool/requestUserInput") {
       result = userInputResult(pending.params, answer);
     } else if (pending.method === "mcpServer/elicitation/request") {
-      if (typeof answer === "boolean") result = { action: answer ? "accept" : "decline", content: null, _meta: null };
-      else { const value = asRecord(answer); result = { action: asString(value?.action) ?? "accept", content: value?.content ?? value ?? null, _meta: value?._meta ?? null }; }
+      if (normalized.accepted !== null) {
+        result = {
+          action: normalized.accepted ? "accept" : "decline",
+          content: normalized.accepted ? normalized.content : null,
+          _meta: null,
+        };
+      } else {
+        const value = asRecord(answer);
+        result = { action: asString(value?.action) ?? "accept", content: value?.content ?? value ?? null, _meta: value?._meta ?? null };
+      }
     } else if (pending.method === "item/permissions/requestApproval") {
-      if (typeof answer === "boolean") {
+      if (normalized.accepted !== null) {
         const requested = asRecord(pending.params?.permissions); const permissions: Record<string, unknown> = {};
-        if (answer && requested?.network) permissions.network = requested.network;
-        if (answer && requested?.fileSystem) permissions.fileSystem = requested.fileSystem;
+        if (normalized.accepted && requested?.network) permissions.network = requested.network;
+        if (normalized.accepted && requested?.fileSystem) permissions.fileSystem = requested.fileSystem;
         result = { permissions, scope: "turn" };
       }
-    } else if (typeof answer === "boolean") result = { decision: answer ? "accept" : "decline" };
+    } else if (normalized.accepted !== null) {
+      result = { decision: normalized.accepted ? "accept" : "decline" };
+    }
     this.send({ jsonrpc: "2.0", id: pending.rpcId, result });
     this.emit("interaction-removed", { sessionId, requestId });
   }
 
-  private failed(error: Error): void {
+  private failed(error: Error, child?: ChildProcessWithoutNullStreams): void {
+    if (child && this.child !== child) return;
     this.child = undefined;
+    this.initializedChild = undefined;
+    this.buffer = "";
     this.clientIds.clear();
     this.clientRequests.clear();
+    this.resumingThreads.clear();
     this.startingTurns.clear();
     for (const [sessionId] of this.turnReadyWaiters) this.rejectTurnReady(sessionId, new RpcError(503, error.message));
     for (const [id, pending] of this.pending) { clearTimeout(pending.timer); pending.reject(new RpcError(503, error.message)); this.pending.delete(id); }
@@ -569,6 +781,21 @@ export class CodexDriver extends EventEmitter {
       const wasActive = state.active; state.active = false; state.attached = false; state.steers = [];
       if (wasActive) this.emit("status", { id, status: "failed", webuiAlive: false });
     }
+  }
+  kill(): void {
+    const child = this.child;
+    if (!child || child.exitCode !== null) throw new RpcError(409, "Codex app-server is not running");
+    let signaled = false;
+    try {
+      signaled = child.kill("SIGTERM");
+    } catch (error) {
+      throw new RpcError(503, `Failed to terminate Codex app-server: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (!signaled) throw new RpcError(503, "Failed to terminate Codex app-server");
+    // Invalidate synchronously so a prompt arriving before the OS exit event
+    // cannot write to the process we just asked to terminate. ensure() will
+    // lazily spawn a fresh app-server on the next request.
+    this.failed(new Error("Codex app-server terminated by user"), child);
   }
   close(): void { this.child?.kill("SIGTERM"); }
 

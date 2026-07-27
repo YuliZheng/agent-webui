@@ -1,0 +1,222 @@
+<script setup lang="ts">
+import { computed, onBeforeUnmount, ref, watch } from "vue";
+import type { SessionStatusRow } from "../util/local-commands.js";
+import { buildSessionStatusSummary, latestContextUsage } from "../util/local-commands.js";
+import { killSession } from "../api/sessions.js";
+import { useNotificationsStore } from "../stores/notifications.js";
+import { usePrefsStore } from "../stores/prefs.js";
+import { useSessionCacheStore } from "../stores/session-cache.js";
+import { useSessionSettingsStore } from "../stores/session-settings.js";
+import { useSessionsStore } from "../stores/sessions.js";
+
+const props = defineProps<{ sessionId: string; open: boolean }>();
+const emit = defineEmits<{ close: [] }>();
+
+const sessions = useSessionsStore();
+const prefs = usePrefsStore();
+const sessionCache = useSessionCacheStore();
+const sessionSettings = useSessionSettingsStore();
+const notifications = useNotificationsStore();
+
+const item = computed(() => sessions.byId[props.sessionId]);
+const isCodex = computed(() => item.value?.agent === "codex");
+const canKillClaude = computed(() => (
+  item.value?.agent === "claude" && !!sessions.webuiAliveBySession[props.sessionId]
+));
+const canKillAgent = computed(() => isCodex.value || canKillClaude.value);
+const killLabel = computed(() => (
+  isCodex.value ? "强制终止 Codex 后台" : "终止 Claude 进程"
+));
+
+const rows = ref<SessionStatusRow[]>([]);
+const loading = ref(false);
+const confirmingKill = ref(false);
+let loadSeq = 0;
+let confirmTimer: ReturnType<typeof setTimeout> | undefined;
+
+function resetKillConfirmation() {
+  confirmingKill.value = false;
+  if (confirmTimer) clearTimeout(confirmTimer);
+  confirmTimer = undefined;
+}
+
+function closePage() {
+  resetKillConfirmation();
+  emit("close");
+}
+
+async function loadStatus() {
+  const seq = ++loadSeq;
+  const id = props.sessionId;
+  const codex = isCodex.value;
+  const model = codex
+    ? sessionSettings.effectiveCodex(id).model
+    : sessionSettings.effective(id).model;
+  const lines = sessionCache.bySession[id]?.lines ?? [];
+  const usage = latestContextUsage(
+    lines,
+    codex,
+    model,
+    prefs.autoCompactWindow,
+    prefs.codexAutoCompactWindow,
+  );
+  loading.value = true;
+  try {
+    const summary = await buildSessionStatusSummary({
+      sessionId: id,
+      isCodex: codex,
+      model,
+      ctxTokens: usage.tokens,
+      ctxLimit: usage.limit,
+      ctxReportedTokens: usage.reportedTokens,
+      ctxEstimatedTokens: usage.estimatedTokens,
+      ctxContributors: usage.contributors,
+      lines,
+    });
+    if (seq === loadSeq && props.open && props.sessionId === id) rows.value = summary.rows;
+  } finally {
+    if (seq === loadSeq) loading.value = false;
+  }
+}
+
+async function killAgentProcess() {
+  if (!canKillAgent.value) return;
+  if (!confirmingKill.value) {
+    confirmingKill.value = true;
+    confirmTimer = setTimeout(resetKillConfirmation, 4_000);
+    return;
+  }
+  resetKillConfirmation();
+  try {
+    await killSession(props.sessionId);
+    notifications.pushInfo(
+      isCodex.value
+        ? "Codex 后台已终止；下次发送时会自动重新启动。"
+        : "Claude 进程已终止；下次发送时会重新启动。",
+      { title: "进程已终止" },
+    );
+    closePage();
+  } catch (err) {
+    notifications.pushError(err instanceof Error ? err.message : String(err), { title: "终止失败" });
+  }
+}
+
+function onKeydown(event: KeyboardEvent) {
+  if (event.key === "Escape") closePage();
+}
+
+watch(
+  [() => props.open, () => props.sessionId],
+  ([open]) => {
+    resetKillConfirmation();
+    if (open) {
+      window.addEventListener("keydown", onKeydown);
+      void loadStatus();
+    } else {
+      loadSeq++;
+      window.removeEventListener("keydown", onKeydown);
+    }
+  },
+  { immediate: true },
+);
+
+onBeforeUnmount(() => {
+  resetKillConfirmation();
+  window.removeEventListener("keydown", onKeydown);
+});
+</script>
+
+<template>
+  <Teleport to="body">
+    <Transition name="cw-status-page">
+      <div
+        v-if="open"
+        class="fixed inset-0 z-[90] flex flex-col bg-[var(--cw-panel-2)] text-[var(--cw-text)] md:hidden"
+        role="dialog"
+        aria-modal="true"
+        aria-label="会话状态与操作"
+      >
+        <header
+          class="grid shrink-0 grid-cols-[44px_1fr_44px] items-center border-b border-[var(--cw-border)] bg-[var(--cw-panel-bg)] px-1 pb-2"
+          style="padding-top:max(0.5rem, env(safe-area-inset-top))"
+        >
+          <button
+            type="button"
+            class="flex h-10 w-10 items-center justify-center rounded-full active:bg-[var(--cw-panel-2)]"
+            aria-label="返回会话"
+            @click="closePage"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" class="h-5 w-5" aria-hidden="true">
+              <line x1="20" y1="12" x2="4" y2="12" />
+              <polyline points="11 5 4 12 11 19" />
+            </svg>
+          </button>
+          <h1 class="truncate text-center text-base font-semibold">会话信息</h1>
+          <span aria-hidden="true" />
+        </header>
+
+        <main class="min-h-0 flex-1 overflow-y-auto px-4 py-5">
+          <section class="overflow-hidden rounded-xl bg-[var(--cw-panel-bg)]">
+            <div class="border-b border-[var(--cw-border)] px-4 py-3">
+              <h2 class="text-sm font-medium">会话状态</h2>
+            </div>
+            <div v-if="loading && rows.length === 0" class="py-10 text-center text-sm text-[var(--cw-muted)]">
+              正在读取状态…
+            </div>
+            <dl v-else class="divide-y divide-[var(--cw-border)] px-4">
+              <div
+                v-for="row in rows"
+                :key="row.label"
+                class="grid grid-cols-[minmax(104px,0.42fr)_minmax(0,1fr)] gap-3 py-3.5"
+              >
+                <dt class="text-xs text-[var(--cw-muted)]">{{ row.label }}</dt>
+                <dd
+                  class="break-words text-right font-mono text-xs leading-5"
+                  :class="{ 'text-[var(--cw-success)]': row.label === 'State' && row.value === 'running' }"
+                >{{ row.value }}</dd>
+              </div>
+            </dl>
+          </section>
+
+          <section class="mt-5 overflow-hidden rounded-xl bg-[var(--cw-panel-bg)]">
+            <button
+              v-if="canKillAgent"
+              type="button"
+              class="w-full px-4 py-3.5 text-center text-sm font-medium text-[var(--cw-danger)] active:bg-[var(--cw-panel-2)]"
+              @click="killAgentProcess"
+            >{{ confirmingKill ? "再次点击确认终止" : killLabel }}</button>
+            <p v-else class="px-4 py-3.5 text-center text-sm text-[var(--cw-muted)]">
+              当前没有可终止的 Claude 进程
+            </p>
+          </section>
+          <p class="px-2 pt-2 text-[11px] leading-5 text-[var(--cw-muted)]">
+            <template v-if="isCodex">
+              Codex 使用共享后台。强制终止会中断所有正在运行的 Codex 对话，下次发送消息时会自动重启。
+            </template>
+            <template v-else>
+              这会终止 WebUI 管理的 Claude 进程；普通停止回复请使用输入框旁的停止键。
+            </template>
+          </p>
+        </main>
+      </div>
+    </Transition>
+  </Teleport>
+</template>
+
+<style scoped>
+.cw-status-page-enter-active,
+.cw-status-page-leave-active {
+  transition: transform 0.2s ease, opacity 0.16s ease;
+}
+.cw-status-page-enter-from,
+.cw-status-page-leave-to {
+  opacity: 0;
+  transform: translateX(18px);
+}
+@media (prefers-reduced-motion: reduce) {
+  .cw-status-page-enter-active,
+  .cw-status-page-leave-active {
+    transition: none;
+  }
+}
+</style>
