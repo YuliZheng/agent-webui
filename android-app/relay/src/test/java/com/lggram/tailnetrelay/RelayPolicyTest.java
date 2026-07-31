@@ -31,4 +31,11 @@ public final class RelayPolicyTest {
         assertTrue(RelayTarget.MACBOOK.forceChrome);
         assertTrue(RelayTarget.MACBOOK.launchPath.equals("/agent-macbook-38485/"));
     }
+
+    @Test
+    public void usesDistinctLoopbackOriginsForSeparateAndroidWebApks() {
+        assertTrue(RelayTarget.WINDOWS.launchOrigin().equals("http://127.0.0.1:38484"));
+        assertTrue(RelayTarget.MACBOOK.launchOrigin().equals("http://localhost:38485"));
+        assertFalse(RelayTarget.WINDOWS.launchHost.equals(RelayTarget.MACBOOK.launchHost));
+    }
 }

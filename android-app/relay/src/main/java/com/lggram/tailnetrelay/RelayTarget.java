@@ -11,6 +11,7 @@ final class RelayTarget {
             "100.98.215.97",
             443,
             38484,
+            "127.0.0.1",
             "/",
             false);
     static final RelayTarget MACBOOK = new RelayTarget(
@@ -19,6 +20,7 @@ final class RelayTarget {
             "100.89.50.69",
             443,
             38485,
+            "localhost",
             "/agent-macbook-38485/",
             true);
     static final List<RelayTarget> ALL = Collections.unmodifiableList(
@@ -29,6 +31,7 @@ final class RelayTarget {
     final String tailnetIp;
     final int targetPort;
     final int bridgePort;
+    final String launchHost;
     final String launchPath;
     final boolean forceChrome;
 
@@ -38,6 +41,7 @@ final class RelayTarget {
             String tailnetIp,
             int targetPort,
             int bridgePort,
+            String launchHost,
             String launchPath,
             boolean forceChrome) {
         this.displayName = displayName;
@@ -45,7 +49,12 @@ final class RelayTarget {
         this.tailnetIp = tailnetIp;
         this.targetPort = targetPort;
         this.bridgePort = bridgePort;
+        this.launchHost = launchHost;
         this.launchPath = launchPath;
         this.forceChrome = forceChrome;
+    }
+
+    String launchOrigin() {
+        return "http://" + launchHost + ":" + bridgePort;
     }
 }

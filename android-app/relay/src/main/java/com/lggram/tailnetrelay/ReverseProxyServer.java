@@ -50,7 +50,7 @@ final class ReverseProxyServer {
         this.connectionExecutor = connectionExecutor;
         this.target = target;
         this.events = events;
-        this.localOrigin = "http://" + BridgePolicy.LISTEN_HOST + ":" + target.bridgePort;
+        this.localOrigin = target.launchOrigin();
         this.upstreamOrigin = "https://" + target.domain;
     }
 

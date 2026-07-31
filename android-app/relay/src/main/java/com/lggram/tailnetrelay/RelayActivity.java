@@ -55,17 +55,17 @@ public final class RelayActivity extends Activity {
                         + "SOCKS compatibility: " + RelayPolicy.LISTEN_HOST + ":"
                         + RelayPolicy.LISTEN_PORT + "\n"
                         + "Tailnet targets: Windows + MacBook\n\n"
-                        + "Personal Chrome can open http://" + BridgePolicy.LISTEN_HOST
-                        + ":" + RelayTarget.WINDOWS.bridgePort + "/ or :"
-                        + RelayTarget.MACBOOK.bridgePort + "/ directly. Only the two "
+                        + "Personal Chrome can open "
+                        + RelayTarget.WINDOWS.launchOrigin() + "/ or "
+                        + RelayTarget.MACBOOK.launchOrigin()
+                        + RelayTarget.MACBOOK.launchPath + " directly. Only the two "
                         + "configured Agent WebUI hosts are accepted."
                 : "No personal-profile relay service is needed in version 1.4.\n\n"
                         + "Keep Tailnet Relay and Tailscale running in the work profile, "
                         + "then open:\n\n"
-                        + "http://" + BridgePolicy.LISTEN_HOST + ":"
-                        + RelayTarget.WINDOWS.bridgePort + "/ (Windows)\n"
-                        + "http://" + BridgePolicy.LISTEN_HOST + ":"
-                        + RelayTarget.MACBOOK.bridgePort + "/ (agent-macbook)\n\n"
+                        + RelayTarget.WINDOWS.launchOrigin() + "/ (Windows)\n"
+                        + RelayTarget.MACBOOK.launchOrigin()
+                        + RelayTarget.MACBOOK.launchPath + " (agent-macbook)\n\n"
                         + "This uses no personal VPN slot and can run together "
                         + "with personal-profile FlClash.");
         explanation.setTextSize(16);
@@ -140,14 +140,12 @@ public final class RelayActivity extends Activity {
     }
 
     private void openAgentWebUi(RelayTarget target) {
-        Uri uri = Uri.parse("http://" + BridgePolicy.LISTEN_HOST + ":"
-                + target.bridgePort + target.launchPath);
+        Uri uri = Uri.parse(target.launchOrigin() + target.launchPath);
         Intent browser = new Intent(Intent.ACTION_VIEW, uri);
         if (target.forceChrome) {
-            // Android WebAPK intent filters retain only scheme + host for
-            // loopback URLs and drop the port. Without an explicit Chrome
-            // target, the existing 38484 WebAPK intercepts the 38485 install
-            // URL and opens the Windows Agent instead.
+            // Android WebAPK intent filters omit the loopback port. The Mac
+            // launcher therefore uses localhost instead of the Windows app's
+            // 127.0.0.1 origin and explicitly opens Chrome for installation.
             browser.setPackage("com.android.chrome");
         }
         try {
