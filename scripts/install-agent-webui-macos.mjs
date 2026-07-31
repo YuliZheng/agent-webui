@@ -12,8 +12,12 @@ const value = flag => {
 };
 const appName = value("--name") ?? "agent-macbook";
 const port = Number(value("--port") ?? 3457);
+const publicPort = Number(value("--public-port") ?? 38485);
 if (process.platform !== "darwin") throw new Error("This installer only supports macOS");
 if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) throw new Error("Invalid port");
+if (!Number.isSafeInteger(publicPort) || publicPort < 1 || publicPort > 65_535) {
+  throw new Error("Invalid public port");
+}
 
 const major = Number(process.versions.node.split(".")[0]);
 if (major < 20) throw new Error(`Node.js 20+ is required; found ${process.version}`);
@@ -32,7 +36,7 @@ function xml(value) {
 
 run("npm", ["ci"]);
 run("npm", ["run", "build"]);
-const pwaPath = `/agent-macbook-${port}`;
+const pwaPath = `/agent-macbook-${publicPort}`;
 await configurePwaName({
   distDir: join(root, "frontend", "dist"),
   name: appName,

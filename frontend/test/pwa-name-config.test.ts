@@ -43,4 +43,13 @@ describe("per-instance PWA naming", () => {
       'href="/manifest.webmanifest?instance=agent-macbook-38485"',
     );
   });
+
+  it("keys the Mac identity to the public Relay port, not the backend port", async () => {
+    const installer = await readFile(
+      join(process.cwd(), "..", "scripts", "install-agent-webui-macos.mjs"),
+      "utf8",
+    );
+    expect(installer).toContain('value("--public-port") ?? 38485');
+    expect(installer).toContain('`/agent-macbook-${publicPort}`');
+  });
 });
