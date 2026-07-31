@@ -28,5 +28,7 @@ public final class RelayPolicyTest {
                 == RelayTarget.MACBOOK);
         assertTrue(RelayPolicy.targetFor(RelayTarget.MACBOOK.tailnetIp, 443)
                 == RelayTarget.MACBOOK);
+        assertTrue(RelayTarget.MACBOOK.forceChrome);
+        assertTrue(RelayTarget.MACBOOK.launchPath.equals("/agent-macbook-38485/"));
     }
 }

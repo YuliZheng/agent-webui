@@ -10,13 +10,17 @@ final class RelayTarget {
             "lggram.tail6c8b6c.ts.net",
             "100.98.215.97",
             443,
-            38484);
+            38484,
+            "/",
+            false);
     static final RelayTarget MACBOOK = new RelayTarget(
             "agent-macbook",
             "leomacbook-pro.tail6c8b6c.ts.net",
             "100.89.50.69",
             443,
-            38485);
+            38485,
+            "/agent-macbook-38485/",
+            true);
     static final List<RelayTarget> ALL = Collections.unmodifiableList(
             Arrays.asList(WINDOWS, MACBOOK));
 
@@ -25,17 +29,23 @@ final class RelayTarget {
     final String tailnetIp;
     final int targetPort;
     final int bridgePort;
+    final String launchPath;
+    final boolean forceChrome;
 
     private RelayTarget(
             String displayName,
             String domain,
             String tailnetIp,
             int targetPort,
-            int bridgePort) {
+            int bridgePort,
+            String launchPath,
+            boolean forceChrome) {
         this.displayName = displayName;
         this.domain = domain;
         this.tailnetIp = tailnetIp;
         this.targetPort = targetPort;
         this.bridgePort = bridgePort;
+        this.launchPath = launchPath;
+        this.forceChrome = forceChrome;
     }
 }

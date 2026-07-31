@@ -16,20 +16,31 @@ describe("per-instance PWA naming", () => {
     }));
     await writeFile(join(dist, "index.html"), [
       '<meta name="apple-mobile-web-app-title" content="Agent WebUI" />',
+      '<link rel="manifest" href="/manifest.webmanifest" />',
       "<title>Agent WebUI</title>",
     ].join("\n"));
 
-    await configurePwaName({ distDir: dist, name: "agent-macbook" });
+    await configurePwaName({
+      distDir: dist,
+      name: "agent-macbook",
+      id: "/agent-macbook-38485",
+      startUrl: "/agent-macbook-38485/",
+      scope: "/agent-macbook-38485/",
+    });
 
     const manifest = JSON.parse(await readFile(join(dist, "manifest.webmanifest"), "utf8"));
     expect(manifest).toMatchObject({
       name: "agent-macbook",
       short_name: "agent-macbook",
-      id: "/agent-macbook",
-      start_url: "/",
+      id: "/agent-macbook-38485",
+      start_url: "/agent-macbook-38485/",
+      scope: "/agent-macbook-38485/",
     });
     const html = await readFile(join(dist, "index.html"), "utf8");
     expect(html).toContain('content="agent-macbook"');
     expect(html).toContain("<title>agent-macbook</title>");
+    expect(html).toContain(
+      'href="/manifest.webmanifest?instance=agent-macbook-38485"',
+    );
   });
 });

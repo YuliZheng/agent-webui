@@ -32,7 +32,14 @@ function xml(value) {
 
 run("npm", ["ci"]);
 run("npm", ["run", "build"]);
-await configurePwaName({ distDir: join(root, "frontend", "dist"), name: appName });
+const pwaPath = `/agent-macbook-${port}`;
+await configurePwaName({
+  distDir: join(root, "frontend", "dist"),
+  name: appName,
+  id: pwaPath,
+  startUrl: `${pwaPath}/`,
+  scope: `${pwaPath}/`,
+});
 
 const home = homedir();
 const stateDir = join(home, ".agent-webui");

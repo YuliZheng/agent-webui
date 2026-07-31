@@ -43,6 +43,10 @@ profile where it runs:
   `127.0.0.1:38484` and `agent-macbook` at `127.0.0.1:38485`;
 - the personal owner profile is only a launcher for those two localhost URLs,
   so it occupies no VPN slot and can coexist with personal-profile FlClash;
+- the MacBook launcher explicitly targets Chrome and uses the distinct
+  `/agent-macbook-38485/` install identity because Android WebAPK intent
+  filters omit loopback ports and would otherwise hand 38485 to the existing
+  38484 PWA;
 - only the two configured Agent WebUI HTTPS hosts are accepted by the SOCKS,
   CONNECT, and reverse-proxy paths.
 

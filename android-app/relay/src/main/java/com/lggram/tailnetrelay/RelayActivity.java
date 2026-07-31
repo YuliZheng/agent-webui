@@ -2,6 +2,7 @@ package com.lggram.tailnetrelay;
 
 import android.annotation.SuppressLint;
 import android.app.Activity;
+import android.content.ActivityNotFoundException;
 import android.content.Intent;
 import android.graphics.Typeface;
 import android.net.Uri;
@@ -88,7 +89,7 @@ public final class RelayActivity extends Activity {
         root.addView(start, matchWrap());
 
         Button openMacbook = new Button(this);
-        openMacbook.setText("Open agent-macbook");
+        openMacbook.setText("Install / open agent-macbook in Chrome");
         openMacbook.setOnClickListener(view -> openAgentWebUi(RelayTarget.MACBOOK));
         if (managedProfile) {
             openMacbook.setVisibility(View.GONE);
@@ -140,8 +141,21 @@ public final class RelayActivity extends Activity {
 
     private void openAgentWebUi(RelayTarget target) {
         Uri uri = Uri.parse("http://" + BridgePolicy.LISTEN_HOST + ":"
-                + target.bridgePort + "/");
-        startActivity(new Intent(Intent.ACTION_VIEW, uri));
+                + target.bridgePort + target.launchPath);
+        Intent browser = new Intent(Intent.ACTION_VIEW, uri);
+        if (target.forceChrome) {
+            // Android WebAPK intent filters retain only scheme + host for
+            // loopback URLs and drop the port. Without an explicit Chrome
+            // target, the existing 38484 WebAPK intercepts the 38485 install
+            // URL and opens the Windows Agent instead.
+            browser.setPackage("com.android.chrome");
+        }
+        try {
+            startActivity(browser);
+        } catch (ActivityNotFoundException error) {
+            browser.setPackage(null);
+            startActivity(browser);
+        }
     }
 
     private void updateStatus() {
