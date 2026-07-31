@@ -158,6 +158,44 @@ public final class HttpProxyProtocolTest {
     }
 
     @Test
+    public void preservesTheRequestedLoopbackAliasAsTheLocalOrigin() throws Exception {
+        HttpProxyProtocol.Request localhost = HttpProxyProtocol.readRequest(
+                new ByteArrayInputStream(("GET / HTTP/1.1\r\n"
+                        + "Host: localhost:38485\r\n\r\n")
+                        .getBytes(StandardCharsets.ISO_8859_1)));
+        HttpProxyProtocol.Request ipv4 = HttpProxyProtocol.readRequest(
+                new ByteArrayInputStream(("GET / HTTP/1.1\r\n"
+                        + "Host: 127.0.0.1:38485\r\n\r\n")
+                        .getBytes(StandardCharsets.ISO_8859_1)));
+
+        assertEquals(
+                "http://localhost:38485",
+                HttpProxyProtocol.localLoopbackOrigin(localhost, 38485));
+        assertEquals(
+                "http://127.0.0.1:38485",
+                HttpProxyProtocol.localLoopbackOrigin(ipv4, 38485));
+    }
+
+    @Test
+    public void rejectsForeignOrWrongPortBridgeHosts() throws Exception {
+        HttpProxyProtocol.Request foreign = HttpProxyProtocol.readRequest(
+                new ByteArrayInputStream(("GET / HTTP/1.1\r\n"
+                        + "Host: example.com:38485\r\n\r\n")
+                        .getBytes(StandardCharsets.ISO_8859_1)));
+        HttpProxyProtocol.Request wrongPort = HttpProxyProtocol.readRequest(
+                new ByteArrayInputStream(("GET / HTTP/1.1\r\n"
+                        + "Host: localhost:38484\r\n\r\n")
+                        .getBytes(StandardCharsets.ISO_8859_1)));
+
+        assertThrows(
+                IOException.class,
+                () -> HttpProxyProtocol.localLoopbackOrigin(foreign, 38485));
+        assertThrows(
+                IOException.class,
+                () -> HttpProxyProtocol.localLoopbackOrigin(wrongPort, 38485));
+    }
+
+    @Test
     public void parsesBracketedIpv6Authority() throws Exception {
         HttpProxyProtocol.Authority authority =
                 HttpProxyProtocol.parseConnectAuthority("[fd7a:115c:a1e0::1]:443");

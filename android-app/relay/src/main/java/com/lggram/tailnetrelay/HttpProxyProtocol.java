@@ -39,6 +39,15 @@ final class HttpProxyProtocol {
             }
             return false;
         }
+
+        String headerValue(String candidate) {
+            for (Header header : parseHeaders(rawHeader)) {
+                if (header.name.equalsIgnoreCase(candidate)) {
+                    return header.value;
+                }
+            }
+            return null;
+        }
     }
 
     static final class Authority {
@@ -352,5 +361,21 @@ final class HttpProxyProtocol {
             throw new IOException("CONNECT port is out of range");
         }
         return new Authority(host, port);
+    }
+
+    static String localLoopbackOrigin(Request request, int expectedPort) throws IOException {
+        Authority authority = parseConnectAuthority(request.headerValue("Host"));
+        if (authority.port != expectedPort) {
+            throw new IOException("The local bridge Host port is invalid");
+        }
+        String canonicalHost;
+        if (authority.host.equalsIgnoreCase("127.0.0.1")) {
+            canonicalHost = "127.0.0.1";
+        } else if (authority.host.equalsIgnoreCase("localhost")) {
+            canonicalHost = "localhost";
+        } else {
+            throw new IOException("The local bridge Host must be loopback");
+        }
+        return "http://" + canonicalHost + ":" + expectedPort;
     }
 }

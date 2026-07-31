@@ -36,7 +36,6 @@ final class ReverseProxyServer {
     private final ExecutorService connectionExecutor;
     private final Events events;
     private final RelayTarget target;
-    private final String localOrigin;
     private final String upstreamOrigin;
     private final AtomicBoolean running = new AtomicBoolean(false);
     private volatile ServerSocket serverSocket;
@@ -50,7 +49,6 @@ final class ReverseProxyServer {
         this.connectionExecutor = connectionExecutor;
         this.target = target;
         this.events = events;
-        this.localOrigin = target.launchOrigin();
         this.upstreamOrigin = "https://" + target.domain;
     }
 
@@ -139,6 +137,9 @@ final class ReverseProxyServer {
             HttpProxyProtocol.Request request,
             AtomicBoolean responseStarted) throws IOException {
         boolean counted = false;
+        String localOrigin = HttpProxyProtocol.localLoopbackOrigin(
+                request,
+                target.bridgePort);
         try (Socket upstream = openTlsUpstream()) {
             String rewrittenRequest = HttpProxyProtocol.rewriteRequestForUpstream(
                     request,
