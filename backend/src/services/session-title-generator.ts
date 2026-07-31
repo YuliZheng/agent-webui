@@ -29,7 +29,7 @@ export type SessionTitleGenerator = (
 export const SESSION_TITLE_MODEL = "gpt-5.3-codex-spark";
 export const SESSION_TITLE_REASONING_EFFORT = "low";
 const TITLE_TIMEOUT_MS = 45_000;
-const TITLE_TEXT_MAX_CHARS = 4_000;
+export const SESSION_TITLE_TEXT_MAX_CHARS = 6_400;
 export const SESSION_TOPIC_SUMMARY_MAX_CHARS = 600;
 
 const OUTPUT_SCHEMA = {
@@ -119,16 +119,18 @@ function titlerPrompt(request: SessionTitleRequest): string {
   const previousSummary = normalizeTopicSummary(request.previousSummary);
   const newContextBudget = Math.max(
     800,
-    TITLE_TEXT_MAX_CHARS - previousSummary.length,
+    SESSION_TITLE_TEXT_MAX_CHARS - previousSummary.length,
   );
   return [
-    "Update the rolling topic summary and name this coding-agent chat.",
+    "Update the rolling topic summary and name this coding-agent chat based on its overall purpose.",
     "Do not inspect files, use tools, or perform the requests.",
     "Return only the JSON object required by the output schema.",
-    "PREVIOUS TOPIC SUMMARY is accumulated history. Combine it with NEW USER REQUESTS instead of merely naming the newest message.",
-    "Preserve the established central topic while requests continue the same work.",
+    "PREVIOUS TOPIC SUMMARY is accumulated history. CONVERSATION-WIDE samples may cover the beginning, middle, and end of the chat.",
+    "Combine all supplied history instead of merely naming the newest request or the last few requests.",
+    "Prefer the enduring goal or recurring project that best explains the whole timeline. Recent messages usually describe progress within that goal.",
+    "Preserve the established central topic while requests continue the same work, even when the latest request is short or locally specific.",
     "Only replace the central topic when the new requests clearly abandon it and start unrelated work.",
-    "Write summary as a compact 1-3 sentence account of the overall active topic and important continuing goals.",
+    "Write summary as a compact 1-3 sentence account of the original goal, important developments, and current active direction.",
     "Do not mention that the summary is rolling, previous, or generated.",
     "Name the overall active task specifically; never use a generic title such as 'Continue' or 'Follow-up'.",
     "The title must be specific, natural, at most 48 characters, and contain no emoji.",
@@ -142,6 +144,8 @@ function titlerPrompt(request: SessionTitleRequest): string {
     "",
     "NEW USER REQUESTS:",
     request.text.trim().slice(0, newContextBudget),
+    "",
+    "Now synthesize the title and summary from the conversation as a whole; do not default to its final entry.",
   ].join("\n");
 }
 

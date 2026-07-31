@@ -16,6 +16,8 @@ describe("preferences compatibility adapter", () => {
       pinnedGroupIds: ["g-work"],
       pinnedSessionIds: ["s2"],
       thinkingTrigger: "think hard",
+      autoCompactWindow: 180_000,
+      codexAutoCompactWindow: 350_000,
       autoTitleEnabled: true,
       autoTitleFrequency: 7,
       autoTitleLanguage: "简体中文",
@@ -42,6 +44,8 @@ describe("preferences compatibility adapter", () => {
         { kind: "session", id: "s2" },
       ],
       thinkingTrigger: "think hard",
+      autoCompactWindow: 180_000,
+      codexAutoCompactWindow: 350_000,
       autoRetitleEnabled: true,
       autoRetitleEvery: 7,
       titleLanguage: "简体中文",
@@ -72,6 +76,8 @@ describe("preferences compatibility adapter", () => {
       }],
       pinnedGroupIds: [],
       pinnedSessionIds: [],
+      autoCompactWindow: 180_000,
+      codexAutoCompactWindow: 350_000,
       defaultCodexSandboxMode: "read-only",
     });
 
@@ -104,5 +110,7 @@ describe("preferences compatibility adapter", () => {
     expect(outgoing.defaultCodexApprovalPreset).toBe("never");
     expect(outgoing.defaultCodexSandboxMode).toBe("danger-full-access");
     expect(outgoing.showSubagentSessions).toBe(true);
+    expect(outgoing).not.toHaveProperty("autoCompactWindow");
+    expect(outgoing).not.toHaveProperty("codexAutoCompactWindow");
   });
 });

@@ -12,6 +12,18 @@ const pendingReconciliation = readFileSync(
 );
 
 describe("send feedback latency", () => {
+  it("locks synchronously before any async send preparation", () => {
+    const sendAt = promptInput.indexOf("async function send()");
+    const sendOnceAt = promptInput.indexOf("async function sendOnce");
+    expect(sendAt).toBeGreaterThan(-1);
+    expect(sendOnceAt).toBeGreaterThan(sendAt);
+    const wrapper = promptInput.slice(sendAt, sendOnceAt);
+    expect(wrapper).toContain("drafts.isInflight(sid)");
+    expect(wrapper).toContain("drafts.beginInflight(sid)");
+    expect(wrapper.indexOf("drafts.beginInflight(sid)")).toBeLessThan(wrapper.indexOf("await sendOnce(sid)"));
+    expect(promptInput).toContain(':disabled="!canSend || isInflightHere"');
+  });
+
   it("paints the optimistic prompt before any provider metadata request", () => {
     const optimisticAt = promptInput.indexOf("pendId = promptPending.add");
     const slashLookupAt = promptInput.indexOf("const slashCommands = await providerSlashCommandsFor");
@@ -65,6 +77,8 @@ describe("send feedback latency", () => {
 
   it("uses the optimistic id as the retry-deduplication key", () => {
     expect(promptInput).toMatch(/sendPrompt\([\s\S]*?pendId \?\? undefined,[\s\S]*?slashCommands,/);
+    expect(promptInput).toContain('retrying. Your text is kept.');
+    expect(promptInput).toContain('"Send not confirmed"');
   });
 
   it("advances the source cursor from WS liveness and HTTP tail truth", () => {

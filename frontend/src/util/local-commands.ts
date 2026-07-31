@@ -34,6 +34,7 @@ import {
   type CodexGoal,
 } from "../api/sessions.js";
 import { copyText } from "./clipboard.js";
+import { CODEX_REASONING_EFFORTS } from "./codex-efforts.js";
 import { useLocalBubblesStore } from "../stores/local-bubbles.js";
 import { useNotificationsStore } from "../stores/notifications.js";
 import { useSessionSkillsStore } from "../stores/session-skills.js";
@@ -256,7 +257,12 @@ function rateLimitValue(window: CodexRateLimitWindow): string {
 }
 
 function codexRateLimitRows(limits: CodexRateLimits | null): SessionStatusRow[] {
-  if (!limits) return [{ label: "Weekly usage", value: "unavailable" }];
+  if (!limits) {
+    return [
+      { label: "5-hour usage", value: "unavailable" },
+      { label: "Weekly usage", value: "unavailable" },
+    ];
+  }
   const reportedWindows = [limits.primary, limits.secondary].filter(
     (window): window is CodexRateLimitWindow => window !== null,
   );
@@ -280,10 +286,13 @@ function codexRateLimitRows(limits: CodexRateLimits | null): SessionStatusRow[] 
     : null;
   const shortLabel = shortHours && Number.isInteger(shortHours)
     ? `${shortHours}-hour usage`
-    : "Primary usage";
+    : "5-hour usage";
   return [
     ...(limits.planType ? [{ label: "Plan", value: limits.planType }] : []),
-    ...(short ? [{ label: shortLabel, value: rateLimitValue(short) }] : []),
+    {
+      label: shortLabel,
+      value: short ? rateLimitValue(short) : "not reported",
+    },
     {
       label: "Weekly usage",
       value: weekly ? rateLimitValue(weekly) : "not reported",
@@ -322,7 +331,12 @@ export async function buildSessionStatusSummary(ctx: LocalCommandCtx): Promise<S
       ...(ctx.isCodex
         ? [
             { label: "Reasoning effort", value: settings.effort || "(default)" },
-            { label: "Fast", value: settings.serviceTier === "priority" ? "on" : "off" },
+            {
+              label: "Fast",
+              value: settings.serviceTier === "priority"
+                ? "on"
+                : settings.serviceTier === "standard" ? "off" : "unknown",
+            },
             { label: "Approval preset", value: settings.permissionMode || "(default)" },
           ]
         : [{ label: "Permission mode", value: settings.permissionMode || "(default)" }]),
@@ -479,7 +493,7 @@ export async function runLocalCommand(cmd: LocalCommand, ctx: LocalCommandCtx): 
 
   if (cmd.name === "effort") {
     if (!ctx.isCodex) return;
-    const choices = ["none", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+    const choices = CODEX_REASONING_EFFORTS;
     const current = sessionSettings.effective(ctx.sessionId).effort || "(default)";
     if (!cmd.arg) {
       notifications.pushInfo(
@@ -504,10 +518,12 @@ export async function runLocalCommand(cmd: LocalCommand, ctx: LocalCommandCtx): 
 
   if (cmd.name === "fast") {
     if (!ctx.isCodex) return;
-    const current = sessionSettings.effective(ctx.sessionId).serviceTier === "priority";
+    const currentTier = sessionSettings.effectiveCodex(ctx.sessionId).serviceTier;
+    const current = currentTier === "priority";
     const arg = cmd.arg.toLowerCase();
     if (!arg) {
-      notifications.pushInfo(`Fast is ${current ? "on" : "off"}.\nUsage: /fast <on|off>`, { title: "Fast" });
+      const label = currentTier === "priority" ? "on" : currentTier === "standard" ? "off" : "unknown";
+      notifications.pushInfo(`Fast is ${label}.\nUsage: /fast <on|off>`, { title: "Fast" });
       return;
     }
     if (arg !== "on" && arg !== "off") {
@@ -517,8 +533,8 @@ export async function runLocalCommand(cmd: LocalCommand, ctx: LocalCommandCtx): 
     const tier: "" | "priority" = arg === "on" ? "priority" : "";
     try {
       await setSessionServiceTier(ctx.sessionId, tier);
-      sessionSettings.apply({ id: ctx.sessionId, serviceTier: tier || null });
-      notifications.pushInfo(`Fast turned ${arg}.`, { title: "Fast" });
+      sessionSettings.apply({ id: ctx.sessionId, serviceTier: tier || "standard" });
+      notifications.pushInfo(`Fast turned ${arg} — applies from the next turn.`, { title: "Fast" });
     } catch (err) {
       notifications.pushError(err instanceof Error ? err.message : String(err), { title: "Set Fast failed" });
     }
@@ -662,6 +678,7 @@ export interface ContextContributor {
     | "skills"
     | "instructions"
     | "base"
+    | "compaction"
     | "images"
     | "shell"
     | "browser"
@@ -793,6 +810,7 @@ const CONTRIBUTOR_LABELS: Record<ContextContributor["source"], string> = {
   skills: "skills",
   instructions: "system / context",
   base: "Codex base context",
+  compaction: "compaction summary",
   images: "images",
   shell: "shell",
   browser: "browser",
@@ -967,61 +985,133 @@ function contributorForTool(
   return "tools";
 }
 
+type ContributorToolMap = Map<string, {
+  name: string;
+  source: ContextContributor["source"];
+}>;
+
+function registerContributorTool(
+  tools: ContributorToolMap,
+  payload: Record<string, unknown>,
+): void {
+  if (typeof payload.name !== "string" || /output|result/i.test(String(payload.type ?? ""))) return;
+  const callId = payload.call_id ?? payload.id;
+  if (typeof callId !== "string" || !callId) return;
+  tools.set(callId, {
+    name: payload.name,
+    source: contributorForTool(payload.name, payload),
+  });
+}
+
+function addPayloadContributors(
+  totals: Map<ContributorSource, number>,
+  tools: ContributorToolMap,
+  payload: Record<string, unknown>,
+): void {
+  const type = typeof payload.type === "string" ? payload.type : "";
+  if (!type) return;
+  if (type === "message" || type === "agent_message") {
+    addMessageContributors(totals, payload);
+    return;
+  }
+
+  let source: ContextContributor["source"] = "other";
+  let tokens = Math.ceil(utf8Length(payload) / 4);
+  if (type === "reasoning" || type === "compaction") {
+    source = type === "compaction" ? "compaction" : "reasoning";
+    const encoded = typeof payload.encrypted_content === "string"
+      ? payload.encrypted_content
+      : typeof payload.encryptedContent === "string"
+        ? payload.encryptedContent
+        : "";
+    if (encoded) tokens = estimatedReasoningTokens(encoded.length);
+  } else if (type === "image_generation_call") {
+    source = "images";
+    tokens = Math.min(tokens, IMAGE_CONTEXT_TOKEN_ESTIMATE);
+  } else if (type.includes("call") || type.includes("tool")) {
+    const callId = payload.call_id ?? payload.id;
+    const call = typeof callId === "string" ? tools.get(callId) : undefined;
+    const toolName = typeof payload.name === "string"
+      ? payload.name
+      : call?.name ?? "";
+    source = call?.source ?? contributorForTool(toolName, payload);
+    registerContributorTool(tools, payload);
+    if (/output|result/i.test(type)) {
+      tokens = Math.min(tokens, TOOL_OUTPUT_CONTEXT_TOKEN_LIMIT);
+    }
+  }
+  addContributorTokens(totals, source, Math.max(tokens, 0));
+}
+
+function addCompactionContributors(
+  totals: Map<ContributorSource, number>,
+  tools: ContributorToolMap,
+  record: Record<string, unknown> | null,
+): void {
+  if (record?.type !== "compacted") return;
+  const payload = recordValue(record.payload);
+  if (!payload) return;
+  const replacementHistory = Array.isArray(payload.replacement_history)
+    ? payload.replacement_history
+    : Array.isArray(payload.replacementHistory)
+      ? payload.replacementHistory
+      : [];
+  const replacements = replacementHistory.flatMap((value) => {
+    const item = recordValue(value);
+    if (!item) return [];
+    const replacement = item.type === "response_item"
+      ? recordValue(item.payload)
+      : item;
+    return replacement ? [replacement] : [];
+  });
+  for (const replacement of replacements) registerContributorTool(tools, replacement);
+
+  let hasEncryptedSummary = false;
+  for (const replacement of replacements) {
+    if (
+      replacement.type === "compaction"
+      && (
+        typeof replacement.encrypted_content === "string"
+        || typeof replacement.encryptedContent === "string"
+      )
+    ) {
+      hasEncryptedSummary = true;
+    }
+    addPayloadContributors(totals, tools, replacement);
+  }
+
+  const summary = typeof payload.message === "string"
+    ? payload.message
+    : typeof payload.summary === "string"
+      ? payload.summary
+      : "";
+  if (!hasEncryptedSummary && summary) {
+    addContributorTokens(
+      totals,
+      "compaction",
+      Math.ceil(new TextEncoder().encode(summary).length / 4) + MESSAGE_ENVELOPE_TOKEN_ESTIMATE,
+    );
+  }
+}
+
 function localHistoryContributors(
   lines: readonly string[],
   segmentStart: number,
   usageIndex: number,
   authoritativeTotal: number,
+  compactionRecord: Record<string, unknown> | null = null,
 ): readonly ContextContributor[] {
-  const toolByCallId = new Map<string, {
-    name: string;
-    source: ContextContributor["source"];
-  }>();
+  const toolByCallId: ContributorToolMap = new Map();
   for (let i = segmentStart; i < usageIndex; i++) {
     const payload = responsePayload(parsedRecord(lines[i]));
-    if (!payload || typeof payload.name !== "string") continue;
-    const callId = payload.call_id ?? payload.id;
-    if (typeof callId === "string" && callId) {
-      toolByCallId.set(callId, {
-        name: payload.name,
-        source: contributorForTool(payload.name, payload),
-      });
-    }
+    if (payload) registerContributorTool(toolByCallId, payload);
   }
 
   const totals = new Map<ContributorSource, number>();
+  addCompactionContributors(totals, toolByCallId, compactionRecord);
   for (let i = segmentStart; i < usageIndex; i++) {
     const payload = responsePayload(parsedRecord(lines[i]));
-    if (!payload || typeof payload.type !== "string") continue;
-
-    let source: ContextContributor["source"] = "other";
-    let tokens = Math.ceil(utf8Length(payload) / 4);
-    if (payload.type === "message") {
-      addMessageContributors(totals, payload);
-      continue;
-    } else if (payload.type === "reasoning") {
-      source = "reasoning";
-      if (typeof payload.encrypted_content === "string") {
-        tokens = estimatedReasoningTokens(payload.encrypted_content.length);
-      }
-    } else if (payload.type === "image_generation_call") {
-      source = "images";
-      // The generated bitmap is an output artifact, not base64 text in the
-      // model context. Count only a bounded visual/context estimate here; the
-      // authoritative Codex total below remains the source of truth.
-      tokens = Math.min(tokens, IMAGE_CONTEXT_TOKEN_ESTIMATE);
-    } else if (payload.type.includes("call") || payload.type.includes("tool")) {
-      const callId = payload.call_id ?? payload.id;
-      const call = typeof callId === "string" ? toolByCallId.get(callId) : undefined;
-      const toolName = typeof payload.name === "string"
-        ? payload.name
-        : call?.name ?? "";
-      source = call?.source ?? contributorForTool(toolName, payload);
-      if (/output|result/i.test(payload.type)) {
-        tokens = Math.min(tokens, TOOL_OUTPUT_CONTEXT_TOKEN_LIMIT);
-      }
-    }
-    totals.set(source, (totals.get(source) ?? 0) + Math.max(tokens, 0));
+    if (payload) addPayloadContributors(totals, toolByCallId, payload);
   }
 
   const target = Number.isFinite(authoritativeTotal)
@@ -1114,6 +1204,9 @@ export function latestCodexContextUsage(
               output_tokens?: unknown;
               total_tokens?: unknown;
             };
+            total_token_usage?: {
+              total_tokens?: unknown;
+            };
             model_context_window?: unknown;
           };
         };
@@ -1135,18 +1228,36 @@ export function latestCodexContextUsage(
           Number(usage?.input_tokens ?? 0) + Number(usage?.output_tokens ?? 0)
         ));
         const window = Number(rec.payload.info?.model_context_window ?? 0);
+        const failureTotal = Number(rec.payload.info?.total_token_usage?.total_tokens);
         let segmentStart = 0;
+        let compactionRecord: Record<string, unknown> | null = null;
         for (let j = i - 1; j >= 0; j--) {
-          if (isCompactionRecord(parsedRecord(lines[j]))) {
+          const candidate = parsedRecord(lines[j]);
+          if (isCompactionRecord(candidate)) {
             segmentStart = j + 1;
+            compactionRecord = candidate;
             break;
           }
         }
         // `last_token_usage.total_tokens` is the exact value Codex 0.144.6
         // uses for `/status`'s "tokens in context". Never add a second local
         // estimate to it; any source uncertainty belongs in the breakdown.
-        const tokens = Number.isFinite(reported) ? Math.max(0, reported) : 0;
-        const contributors = localHistoryContributors(lines, segmentStart, i, tokens);
+        let tokens = Number.isFinite(reported) ? Math.max(0, reported) : 0;
+        if (
+          tokens === 0
+          && Number.isFinite(window)
+          && window > 0
+          && failureTotal === window
+        ) {
+          tokens = window;
+        }
+        const contributors = localHistoryContributors(
+          lines,
+          segmentStart,
+          i,
+          tokens,
+          compactionRecord,
+        );
         return {
           tokens,
           limit: codexAutoCompactLimit(
@@ -1164,14 +1275,23 @@ export function latestCodexContextUsage(
         ));
         const window = Number(rec.params?.tokenUsage?.modelContextWindow ?? 0);
         let segmentStart = 0;
+        let compactionRecord: Record<string, unknown> | null = null;
         for (let j = i - 1; j >= 0; j--) {
-          if (isCompactionRecord(parsedRecord(lines[j]))) {
+          const candidate = parsedRecord(lines[j]);
+          if (isCompactionRecord(candidate)) {
             segmentStart = j + 1;
+            compactionRecord = candidate;
             break;
           }
         }
         const tokens = Number.isFinite(reported) ? Math.max(0, reported) : 0;
-        const contributors = localHistoryContributors(lines, segmentStart, i, tokens);
+        const contributors = localHistoryContributors(
+          lines,
+          segmentStart,
+          i,
+          tokens,
+          compactionRecord,
+        );
         return {
           tokens,
           limit: codexAutoCompactLimit(

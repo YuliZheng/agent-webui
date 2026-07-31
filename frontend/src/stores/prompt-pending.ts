@@ -81,6 +81,19 @@ export const usePromptPendingStore = defineStore("promptPending", {
   state: (): State => ({ bySession: loadAll() }),
   getters: {
     pending: (s) => (id: string): PendingPrompt[] => s.bySession[id] ?? [],
+    latestStartedAt: (s) => (id: string): number => {
+      let latest = 0;
+      for (const entry of s.bySession[id] ?? []) {
+        if (
+          typeof entry.startedAt === "number"
+          && Number.isFinite(entry.startedAt)
+          && entry.startedAt > latest
+        ) {
+          latest = entry.startedAt;
+        }
+      }
+      return latest;
+    },
   },
   actions: {
     persist() {

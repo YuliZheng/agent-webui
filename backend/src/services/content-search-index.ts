@@ -6,7 +6,7 @@ import type { DatabaseSync, StatementSync } from "node:sqlite";
 import type { SessionRecord } from "../types.js";
 import { searchableRecordPrefix, searchableRecordText } from "./search-text.js";
 
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 const INDEX_READ_CHUNK_BYTES = 256 * 1024;
 const INDEX_PARSE_LINE_MAX_BYTES = 2 * 1024 * 1024;
 const INDEX_TEXT_CHUNK_CHARS = 128 * 1024;
@@ -87,8 +87,20 @@ function asNumber(value: unknown): number {
   return typeof value === "bigint" ? Number(value) : Number(value);
 }
 
-function isNonAscii(value: string): boolean {
-  return value.codePointAt(0)! > 0x7f;
+function isAsciiDigit(value: number): boolean {
+  return value >= 0x30 && value <= 0x39;
+}
+
+function isAsciiLetter(value: number): boolean {
+  return (value >= 0x41 && value <= 0x5a)
+    || (value >= 0x61 && value <= 0x7a);
+}
+
+function shouldIndexBigram(left: number, right: number): boolean {
+  return left > 0x7f
+    || right > 0x7f
+    || (isAsciiDigit(left) && isAsciiLetter(right))
+    || (isAsciiLetter(left) && isAsciiDigit(right));
 }
 
 function encodedBigram(left: string, right: string): string {
@@ -120,11 +132,17 @@ function encodedStoredGramHash(value: number): string {
   return `${bigram ? "b" : "t"}${hash.toString(16).padStart(5, "0")}`;
 }
 
-function nonAsciiBigramTerms(text: string): string {
+function indexedBigramTerms(text: string): string {
   const terms = new Set<string>();
   let previous: string | undefined;
   for (const current of text) {
-    if (previous !== undefined && (isNonAscii(previous) || isNonAscii(current))) {
+    if (
+      previous !== undefined
+      && shouldIndexBigram(
+        previous.codePointAt(0)!,
+        current.codePointAt(0)!,
+      )
+    ) {
       terms.add(encodedBigram(previous, current));
     }
     previous = current;
@@ -483,7 +501,7 @@ export class ContentSearchIndex {
         const indexedText = `${currentOverlap}${text.slice(cursor, end)}`;
         const hasTrigrams = characterCountAtLeast(indexedText, 3);
         const bigrams = characterCountAtLeast(indexedText, 2)
-          ? nonAsciiBigramTerms(indexedText)
+          ? indexedBigramTerms(indexedText)
           : "";
         if (hasTrigrams || bigrams) {
           const inserted = insertRecord.run(key, lineIndex, byteOffset, byteLength);
@@ -519,7 +537,7 @@ export class ContentSearchIndex {
           ? text.codePointAt(index++)!
           : firstUnit;
         if (rawPrevious !== undefined) {
-          if (rawPrevious > 0x7f || current > 0x7f) {
+          if (shouldIndexBigram(rawPrevious, current)) {
             const bigram = INDEX_BIGRAM_HASH_FLAG + gramHashCodePoints(rawPrevious, current);
             const word = bigram >>> 5;
             rawGramBitmap[word] = rawGramBitmap[word]! | (1 << (bigram & 31));
@@ -741,7 +759,13 @@ export class ContentSearchIndex {
           `),
         },
       );
-    } else if (characters.length === 2 && (isNonAscii(characters[0]!) || isNonAscii(characters[1]!))) {
+    } else if (
+      characters.length === 2
+      && shouldIndexBigram(
+        characters[0]!.codePointAt(0)!,
+        characters[1]!.codePointAt(0)!,
+      )
+    ) {
       const bigram = `${characters[0]!}${characters[1]!}`;
       searches.push(
         {

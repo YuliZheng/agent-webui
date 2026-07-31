@@ -17,6 +17,7 @@ import { useBackgroundTasksStore } from "./background-tasks.js";
 import type { BackgroundTask } from "@claude-webui/shared/api";
 import { osNotify } from "../util/os-notify.js";
 import type { InteractionAdded, InteractionRemoved } from "@claude-webui/shared/api";
+import { shouldNotifyForSession } from "../util/session-visibility.js";
 
 interface State {
   globalUnsub: (() => void) | null;
@@ -286,6 +287,28 @@ export const useLiveStore = defineStore("live", {
           ...(msg.effort !== undefined ? { effort: msg.effort as string | null } : {}),
           ...(msg.serviceTier !== undefined ? { serviceTier: msg.serviceTier as string | null } : {}),
         });
+      } else if (kind === "capacity-retry") {
+        const sessionId = typeof msg.sessionId === "string" ? msg.sessionId : "";
+        const turnId = typeof msg.turnId === "string" ? msg.turnId : "";
+        const attempt = typeof msg.attempt === "number" ? msg.attempt : 0;
+        const maxAttempts = typeof msg.maxAttempts === "number" ? msg.maxAttempts : 0;
+        const delayMs = typeof msg.delayMs === "number" ? msg.delayMs : 0;
+        const suppliedRetryAt = typeof msg.retryAt === "string" ? msg.retryAt : "";
+        // Backward-compatible with a backend that already emits retry progress
+        // but predates the absolute retry timestamp. This keeps the freshly
+        // published frontend useful before the user's next backend restart.
+        const retryAt = Number.isFinite(Date.parse(suppliedRetryAt))
+          ? suppliedRetryAt
+          : new Date(Date.now() + Math.max(0, delayMs)).toISOString();
+        if (
+          sessionId
+          && turnId
+          && attempt > 0
+          && maxAttempts >= attempt
+          && delayMs >= 0
+        ) {
+          sessions.setCapacityRetry(sessionId, { turnId, attempt, maxAttempts, delayMs, retryAt });
+        }
       } else if (kind === "session-error") {
         const message = typeof msg.message === "string" ? msg.message : "Agent turn failed.";
         const details = typeof msg.details === "string" && msg.details ? `\n${msg.details}` : "";
@@ -409,8 +432,11 @@ export const useLiveStore = defineStore("live", {
         }
         const prefs = usePrefsStore();
         const item = sessions.byId[id];
-        if (prefs.hidden.includes(id)) return;
-        if ((msg.peer === true || item?.peer === true) && !prefs.showPeerSessions) return;
+        if (!shouldNotifyForSession({
+          id,
+          peer: msg.peer === true || item?.peer === true,
+          subagent: msg.subagent === true || item?.subagent === true,
+        }, prefs)) return;
         sessions.bumpUnread(id);
         const body = (msg.body as string) ?? "";
         if (!body.trim()) return;

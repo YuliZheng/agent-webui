@@ -29,4 +29,25 @@ describe("session cache physical cursor", () => {
     expect(cache.bySession["cursor-b"]?.lines).toHaveLength(3);
     await cache.clear("cursor-b");
   });
+
+  it("accepts a shorter reset replay that replaces the old first slot", async () => {
+    const cache = useSessionCacheStore();
+    cache.appendBatch("rewrite-a", [
+      { index: 0, raw: "old-zero" },
+      { index: 1, raw: "old-one" },
+    ]);
+
+    // live.ts handles stream-reset by starting clear() without awaiting it;
+    // the in-memory deletion is synchronous, so the following replay must
+    // populate fresh slots rather than merge against the old rows.
+    const clearing = cache.clear("rewrite-a");
+    cache.appendBatch("rewrite-a", [
+      { index: 0, raw: "new-zero" },
+    ]);
+
+    expect(cache.bySession["rewrite-a"]?.lines).toEqual(["new-zero"]);
+    expect(cache.bySession["rewrite-a"]?.nextLineIndex).toBe(1);
+    await clearing;
+    await cache.clear("rewrite-a");
+  });
 });

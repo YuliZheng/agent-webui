@@ -15,6 +15,7 @@ import { usePendingInteractionsStore } from "../stores/pending-interactions.js";
 import { basenameFromPath, codexImageUrl, localFileFromHref } from "../util/local-file-links.js";
 import { copyText } from "../util/clipboard.js";
 import { extractAttachedImages } from "../util/extract-images.js";
+import { standaloneExternalNavigationHref } from "../util/pwa-history.js";
 import {
   matchedCodexPendingPromptIds,
   pendingPromptProbeRange,
@@ -26,6 +27,7 @@ import { codexRolloutToClaudeLines } from "../parser/codex-adapt.js";
 import { isTaskNotificationContent, parseTaskNotification, type TaskNotificationInfo } from "../parser/task-notification.js";
 import { isQueueOperation } from "@claude-webui/shared/discriminate";
 import { readSessionRange, sendPrompt, stopSession } from "../api/sessions.js";
+import { revealLocalPath } from "../api/local-files.js";
 import { wake as wsWake } from "../api/ws.js";
 
 import UserPromptBlock from "./blocks/UserPromptBlock.vue";
@@ -258,15 +260,37 @@ function onContentClick(e: MouseEvent) {
   const target = e.target as Element | null;
   const anchor = target?.closest?.("a[href]") as HTMLAnchorElement | null;
   if (!anchor || !scroller.value?.contains(anchor)) return;
-  const local = localFileFromHref(anchor.getAttribute("href") ?? anchor.href, window.location.href);
-  if (!local) return;
-  e.preventDefault();
-  e.stopPropagation();
-  if (local.isImage) {
-    lightbox.open(codexImageUrl(local.path), basenameFromPath(local.path));
+  const href = anchor.getAttribute("href") ?? anchor.href;
+  const local = localFileFromHref(href, window.location.href);
+  if (local) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (local.openInSystem) {
+      void revealLocalPath(local.path)
+        .then(() => notificationsStore.pushInfo("Opened in the system file manager"))
+        .catch(err => notificationsStore.pushError(
+          err instanceof Error ? err.message : String(err),
+          { title: "Could not open local path" },
+        ));
+      return;
+    }
+    if (local.isImage) {
+      lightbox.open(codexImageUrl(local.path), basenameFromPath(local.path));
+      return;
+    }
+    localFileViewer.show(props.sessionId, local.path, local.line);
     return;
   }
-  localFileViewer.show(props.sessionId, local.path, local.line);
+
+  // Android/Chrome standalone PWAs do not reliably surface target=_blank
+  // navigations. Use an in-context navigation for out-of-scope web URLs; the
+  // browser then hands the external page off while preserving the installed
+  // app. Ordinary browser tabs keep the Markdown renderer's new-tab behavior.
+  const external = standaloneExternalNavigationHref(href, window.location.href);
+  if (!external) return;
+  e.preventDefault();
+  e.stopPropagation();
+  window.location.assign(external);
 }
 
 // ─── Stall detection ───
@@ -323,6 +347,7 @@ const pullDistance = ref(0);
 const PULL_THRESHOLD = 60;
 const PULL_MAX = 90;
 const PULL_REFRESH_HOLD = 50;
+const PULL_START_SLOP = 8;
 let pullStartY = 0;
 let pullActive = false;
 
@@ -350,14 +375,14 @@ function onPullTouchMove(e: TouchEvent) {
   }
   const y = e.touches[0]?.clientY ?? pullStartY;
   const dy = y - pullStartY;
-  if (dy <= 0) {
+  if (dy <= PULL_START_SLOP) {
     pullDistance.value = 0;
     pullState.value = "idle";
     return;
   }
   // Resistance curve: half the actual delta, capped at PULL_MAX. Feels
   // like rubber-band tension instead of 1:1 finger-following.
-  pullDistance.value = Math.min(dy * 0.5, PULL_MAX);
+  pullDistance.value = Math.min((dy - PULL_START_SLOP) * 0.5, PULL_MAX);
   pullState.value = "pulling";
   e.preventDefault();
 }
@@ -1079,7 +1104,11 @@ function forceScrollSoon() {
   // pending → real message swap, first assistant text chunk,
   // Shiki highlight). Without this the bubble routinely lands below the
   // fold because scrollHeight grows AFTER our scroll.
-  pinToBottomUntilStable(1500);
+  //
+  // Do not allow the loop to declare stability during the quiet frames before
+  // Android starts its keyboard animation. On some Chromium/HyperOS builds
+  // the layout viewport changes a few hundred milliseconds after focus.
+  pinToBottomUntilStable(1800, 700);
 }
 
 defineExpose({ revealLatest: forceScrollSoon });
@@ -1161,7 +1190,7 @@ function scrollToUuidUntilStable(uuid: string, maxMs = 8000) {
 // IDB cache restore, WS catch-up, render-window expansion (30 → 200),
 // Shiki async highlight, image load — all change scrollHeight after
 // mount and a single scrollTo would land at the wrong target.
-function pinToBottomUntilStable(maxMs = 6000) {
+function pinToBottomUntilStable(maxMs = 6000, minMs = 0) {
   const el0 = scroller.value;
   if (!el0) return;
   let lastScrollHeight = -1;
@@ -1174,7 +1203,10 @@ function pinToBottomUntilStable(maxMs = 6000) {
     el.scrollTop = el.scrollHeight;
     if (el.scrollHeight === lastScrollHeight && el.clientHeight === lastClientHeight) {
       stableFrames++;
-      if (stableFrames >= 12) { lockedToBottom.value = true; return; }
+      if (stableFrames >= 12 && performance.now() - start >= minMs) {
+        lockedToBottom.value = true;
+        return;
+      }
     } else {
       lastScrollHeight = el.scrollHeight;
       lastClientHeight = el.clientHeight;

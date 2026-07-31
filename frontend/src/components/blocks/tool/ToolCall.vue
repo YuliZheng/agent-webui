@@ -11,10 +11,13 @@ import SubagentBlock from "../SubagentBlock.vue";
 import PreviewChip from "./PreviewChip.vue";
 import AskUserQuestionInteractive from "./AskUserQuestionInteractive.vue";
 import InteractionCard from "../../InteractionCard.vue";
+import { extractToolResultImages } from "../../../util/tool-result-images.js";
 
 const props = defineProps<{ pair: ToolPair }>();
 const open = ref(false);
 const header = () => `▶ ${toolSummary(props.pair.use.name, props.pair.use.input)}`;
+
+const hasResultImages = computed(() => extractToolResultImages(props.pair.result).length > 0);
 
 const isErr = (v: unknown) => Array.isArray(v) ? false : typeof v === "object" && v !== null && (v as any).is_error === true;
 
@@ -72,7 +75,12 @@ const pendingPermission = computed(() => {
       <pre v-else class="text-xs whitespace-pre-wrap bg-[var(--cw-panel-2)] p-2 rounded-sm">{{ JSON.stringify(pair.use.input, null, 2) }}</pre>
       <SubagentBlock v-if="pair.subagentTimeline" :timeline="pair.subagentTimeline" />
       <WorkflowProgressBlock v-if="pair.workflow" :workflow="pair.workflow" class="mb-1" />
-      <ToolResult v-if="pair.result !== undefined" :value="pair.result" :is-error="isErr(pair.result)" />
+      <ToolResult
+        v-if="pair.result !== undefined"
+        :value="pair.result"
+        :is-error="isErr(pair.result)"
+        :hide-images="hasResultImages"
+      />
     </div>
   </div>
 </template>

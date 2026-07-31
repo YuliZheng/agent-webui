@@ -13,6 +13,7 @@ import { avatarGradient, avatarText, gradientForIndex, paletteColor } from "../u
 import { imTime } from "../util/time.js";
 import { nowMs, formatElapsed } from "../util/now-tick.js";
 import { currentTurnBackgroundTasks } from "../util/runtime-work.js";
+import { effectiveSessionActivityIso } from "../util/session-recency.js";
 import { APP_BACK_PRIORITY, registerAppBackHandler } from "../util/app-back.js";
 import { setPwaLayerActive } from "../util/pwa-history.js";
 import { retitleSession, setSessionTitle } from "../api/sessions.js";
@@ -47,6 +48,13 @@ const bgRunning = computed(() => currentTurnBackgroundTasks(
 ).length);
 
 const status = computed(() => sessions.statusBySession[props.id] ?? null);
+const capacityRetry = computed(() => sessions.capacityRetryBySession[props.id] ?? null);
+const capacityRetryWaitSeconds = computed(() => {
+  if (!capacityRetry.value) return 0;
+  return Math.max(0, Math.ceil(
+    (Date.parse(capacityRetry.value.retryAt) - nowMs.value) / 1_000,
+  ));
+});
 const selected = computed(() => ui.selectedSessionId === props.id);
 const cwd = computed(() => displayCwd(item.value?.cwd, ui.home));
 const cwdRaw = computed(() => item.value?.cwd ?? "");
@@ -88,12 +96,15 @@ const avatarChar = computed(() => titleEmoji.value || avatarText({
   cwd: cwdRaw.value,
   id: props.id,
 }));
-// Prefer the per-message lastTurnAt the backend sends back with each list
-// row — file mtime can be touched by sidechain writes that don't represent
-// user-visible activity. Fall back to mtime when the backend hasn't been
-// updated to populate the new field.
+// Draft edits and optimistic sends are user-visible activity immediately.
+// Otherwise prefer backend lastTurnAt; file mtime is only the compatibility
+// fallback because sidechain writes can touch it without visible activity.
 const lastActivity = computed(() => {
-  return item.value?.lastTurnAt || item.value?.mtime || "";
+  return effectiveSessionActivityIso(
+    item.value,
+    drafts.editedAt(props.id),
+    promptPending.latestStartedAt(props.id),
+  );
 });
 const timeLabel = computed(() => (lastActivity.value ? imTime(lastActivity.value) : ""));
 // Last message preview: shown as the row's secondary line. If the backend
@@ -105,10 +116,11 @@ const preview = computed(() => item.value?.preview ?? null);
 // the chat, WeChat-style. Priority order, highest first:
 //   1. Draft text the user is composing  →  "[Draft] xxx"
 //   2. Pending images attached to draft  →  "📷 N images attached"
-//   3. Optimistic prompt (just clicked Send, jsonl not yet observed)
-//   4. Claude is mid-turn (running)      →  "Claude is thinking…"
-//   5. Backend's stored last-message preview (fallback)
-type PreviewKind = "draft" | "images" | "pending" | "thinking" | "preview" | "none";
+//   3. Capacity retry in progress         →  "Model busy · retry N/M"
+//   4. Optimistic prompt (just clicked Send, jsonl not yet observed)
+//   5. Backend's stored latest visible message (user or assistant)
+//   6. Agent is mid-turn, but no visible message has landed yet
+type PreviewKind = "draft" | "images" | "retry" | "pending" | "thinking" | "preview" | "none";
 interface LivePreview { text: string; kind: PreviewKind }
 
 const livePreview = computed<LivePreview>(() => {
@@ -120,11 +132,28 @@ const livePreview = computed<LivePreview>(() => {
     return { text: `📷 ${imgCount} image${imgCount === 1 ? "" : "s"} attached`, kind: "images" };
   }
 
+  if (capacityRetry.value) {
+    const wait = capacityRetryWaitSeconds.value > 0
+      ? ` · next in ${capacityRetryWaitSeconds.value}s`
+      : "";
+    return {
+      text: `Model busy · retry ${capacityRetry.value.attempt}/${capacityRetry.value.maxAttempts}${wait}`,
+      kind: "retry",
+    };
+  }
+
   const pending = promptPending.pending(props.id);
   const pp = pending[pending.length - 1];
   if (pp?.text) {
     return { text: pp.text, kind: "pending" };
   }
+
+  // A running turn is status, not conversation content. Once the backend has
+  // observed a visible user/assistant message, keep that newest message in the
+  // row instead of hiding it behind a generic "thinking" placeholder. This is
+  // especially important just after the user's optimistic prompt reconciles
+  // with its durable JSONL/rollout record.
+  if (preview.value) return { text: preview.value, kind: "preview" };
 
   if (isRunning.value) {
     // Anchor on lastBoundaryAt — the moment THIS turn started (user message
@@ -146,8 +175,6 @@ const livePreview = computed<LivePreview>(() => {
       kind: "thinking",
     };
   }
-
-  if (preview.value) return { text: preview.value, kind: "preview" };
 
   return { text: "", kind: "none" };
 });
@@ -836,7 +863,7 @@ function onTitleKey(e: KeyboardEvent) {
         <span
           v-if="timeLabel"
           class="cw-session-time shrink-0 text-[11px] opacity-50 leading-none whitespace-nowrap"
-          :title="item?.mtime"
+          :title="lastActivity"
         >{{ timeLabel }}</span>
       </div>
       <!-- Bottom row: preview (flex-1, truncates) + status dot / unread.
@@ -851,15 +878,23 @@ function onTitleKey(e: KeyboardEvent) {
           class="cw-session-preview flex-1 min-w-0 text-[13px] truncate"
           :class="{
             'opacity-60': livePreview.kind === 'preview',
-            'text-[var(--cw-info)]': livePreview.kind === 'draft' || livePreview.kind === 'images',
+             'text-[var(--cw-info)]': livePreview.kind === 'draft' || livePreview.kind === 'images',
+             'text-[var(--cw-warning)]': livePreview.kind === 'retry',
             'opacity-70 italic': livePreview.kind === 'thinking',
             'opacity-70': livePreview.kind === 'pending',
           }"
           :title="livePreview.text"
         >{{ livePreview.text }}</div>
         <div v-else class="flex-1 min-w-0" />
-        <div class="shrink-0 flex items-center gap-1.5 leading-none">
-          <span
+         <div class="shrink-0 flex items-center gap-1.5 leading-none">
+           <span
+             v-if="capacityRetry"
+             class="text-[11px] leading-none font-medium text-[var(--cw-warning)]"
+             :title="`Selected model is busy. Automatic retry ${capacityRetry.attempt} of ${capacityRetry.maxAttempts}.`"
+           >⟳{{ capacityRetry.attempt }}/{{ capacityRetry.maxAttempts }}<template
+             v-if="capacityRetryWaitSeconds > 0"
+           > {{ capacityRetryWaitSeconds }}s</template></span>
+           <span
             v-if="bgRunning > 0"
             class="text-[11px] leading-none text-[var(--cw-info)] flex items-center gap-0.5"
             :title="`${bgRunning} background task${bgRunning === 1 ? '' : 's'} running`"

@@ -3,16 +3,24 @@ import { computed, ref, watch } from "vue";
 import { useSessionsStore } from "../../stores/sessions.js";
 import { useUiStore } from "../../stores/ui.js";
 import { usePrefsStore } from "../../stores/prefs.js";
+import { useDraftsStore } from "../../stores/drafts.js";
+import { usePromptPendingStore } from "../../stores/prompt-pending.js";
+import { useNotificationsStore } from "../../stores/notifications.js";
+import { promotePendingDraft } from "../../stores/live.js";
 import { newSession, normalizeCwd, completePath, HttpError } from "../../api/sessions.js";
 import { getSessionSkills } from "../../api/skills.js";
 import { HIDDEN_CLI_COMMANDS } from "../../util/local-commands.js";
 import { displayCwd } from "../../util/cwd-display.js";
+import { idempotencyFingerprint } from "../../util/idempotency.js";
 import AgentBadge from "../AgentBadge.vue";
 
 const emit = defineEmits<{ (e: "close"): void }>();
 const sessions = useSessionsStore();
 const ui = useUiStore();
 const prefs = usePrefsStore();
+const drafts = useDraftsStore();
+const promptPending = usePromptPendingStore();
+const notifications = useNotificationsStore();
 
 const cwd = ref("");
 const prompt = ref("");
@@ -21,32 +29,6 @@ const adHoc = ref(false);
 const inflight = ref(false);
 const cwdError = ref<string | null>(null);
 const generalError = ref<string | null>(null);
-let retryFingerprint = "";
-let retryClientUuid = "";
-
-function createClientUuid(): string {
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-    return crypto.randomUUID();
-  }
-  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-}
-
-// Keep the idempotency key stable when the transport outcome is unknown and
-// the user retries the same request. A materially different payload gets a
-// fresh key so it can create a genuinely new session.
-function clientUuidFor(cwdResolved: string, promptText: string, selectedAgent: "claude" | "codex"): string {
-  const fingerprint = JSON.stringify([cwdResolved, promptText, selectedAgent]);
-  if (!retryClientUuid || retryFingerprint !== fingerprint) {
-    retryFingerprint = fingerprint;
-    retryClientUuid = createClientUuid();
-  }
-  return retryClientUuid;
-}
-
-function clearRetryClientUuid() {
-  retryFingerprint = "";
-  retryClientUuid = "";
-}
 
 // Parent keeps its trailing slash so the leaf reads naturally; the parent
 // gets middle-truncated in the UI while the leaf is always shown in full.
@@ -150,6 +132,10 @@ async function submit() {
   generalError.value = null;
   const rawCwd = effectiveCwd.value.trim();
   if (!rawCwd) return;
+  const promptText = prompt.value;
+  const selectedAgent = agent.value;
+  let draftId: string | null = null;
+  let pendingId: string | null = null;
   inflight.value = true;
   try {
     // Canonicalize first (expand ~, resolve symlinks) so a hand-typed "~/aksrc"
@@ -161,31 +147,75 @@ async function submit() {
     try { cwdResolved = await normalizeCwd(rawCwd); } catch { /* keep raw */ }
     // Empty prompt → create a pending draft in the sidebar; user can type the
     // first message in the regular composer and the spawn happens then.
-    if (!prompt.value.trim()) {
-      const draftId = sessions.createPending(cwdResolved, agent.value);
+    if (!promptText.trim()) {
+      const draftId = sessions.createPending(cwdResolved, selectedAgent);
       ui.select(draftId);
       emit("close");
       return;
     }
-    const slashCommands = prompt.value.startsWith("/")
-      ? (await getSessionSkills("new-session", { cwd: cwdResolved, agent: agent.value }))
+    // Materialize a local draft and its optimistic user bubble before any
+    // provider metadata lookup or session-spawn round trip. The first prompt
+    // now paints in the ordinary message timeline immediately, exactly like
+    // a send from the composer; the durable rollout record reconciles it.
+    draftId = sessions.createPending(cwdResolved, selectedAgent);
+    pendingId = promptPending.add(draftId, {
+      text: promptText,
+      imageCount: 0,
+      startedAtLineCount: 0,
+      agent: selectedAgent,
+    });
+    const clientFingerprint = idempotencyFingerprint(JSON.stringify([
+      promptText,
+      [],
+      selectedAgent,
+      "",
+      "",
+      "",
+      "",
+    ]));
+    const clientUuid = sessions.newSessionClientUuid(
+      draftId,
+      clientFingerprint,
+      pendingId,
+    );
+    drafts.beginInflight(draftId);
+    ui.select(draftId);
+    emit("close");
+
+    const slashCommands = promptText.startsWith("/")
+      ? (await getSessionSkills("new-session", { cwd: cwdResolved, agent: selectedAgent }))
           .map((s) => s.name)
           .filter((n) => !HIDDEN_CLI_COMMANDS.has(n.toLowerCase()))
       : [];
-    const clientUuid = clientUuidFor(cwdResolved, prompt.value, agent.value);
-    await newSession({
-      cwd: cwdResolved,
-      prompt: prompt.value,
-      clientUuid,
-      agent: agent.value,
-      ...(slashCommands.length ? { slashCommands } : {}),
-    });
-    clearRetryClientUuid();
-    emit("close");
+    const created = await newSession(
+      {
+        cwd: cwdResolved,
+        prompt: promptText,
+        clientUuid,
+        agent: selectedAgent,
+        ...(slashCommands.length ? { slashCommands } : {}),
+      },
+      () => {
+        if (draftId && pendingId) promptPending.markDispatched(draftId, pendingId);
+      },
+    );
+    promotePendingDraft(draftId, created.sessionId);
+    promptPending.markAccepted(created.sessionId, pendingId);
   } catch (err) {
-    if (err instanceof HttpError && err.code === 400) cwdError.value = err.message || "invalid cwd";
-    else generalError.value = (err as Error).message;
+    const message = err instanceof Error ? err.message : String(err);
+    if (draftId) {
+      if (pendingId) promptPending.remove(draftId, pendingId);
+      // The modal is already closed so the chat itself owns recovery: put the
+      // unsent text back in its composer and keep the draft available to retry.
+      drafts.set(draftId, promptText);
+      notifications.pushError(message, { title: "New session failed" });
+    } else if (err instanceof HttpError && err.code === 400) {
+      cwdError.value = err.message || "invalid cwd";
+    } else {
+      generalError.value = message;
+    }
   } finally {
+    if (draftId) drafts.endInflight(sessions.resolvePromoted(draftId));
     inflight.value = false;
   }
 }

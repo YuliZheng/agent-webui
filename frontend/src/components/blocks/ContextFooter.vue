@@ -7,6 +7,7 @@ import { useSessionsStore } from "../../stores/sessions.js";
 import { useSessionSettingsStore } from "../../stores/session-settings.js";
 import { usePrefsStore } from "../../stores/prefs.js";
 import { usePromptPendingStore } from "../../stores/prompt-pending.js";
+import { useDraftsStore } from "../../stores/drafts.js";
 import { useUiStore } from "../../stores/ui.js";
 import { compactSession, newSession } from "../../api/sessions.js";
 import { promotePendingDraft } from "../../stores/live.js";
@@ -33,6 +34,7 @@ const sessions = useSessionsStore();
 const sessionSettings = useSessionSettingsStore();
 const prefs = usePrefsStore();
 const promptPending = usePromptPendingStore();
+const drafts = useDraftsStore();
 const ui = useUiStore();
 
 // Show the action buttons once context occupancy crosses this fraction.
@@ -178,6 +180,10 @@ async function startContinuationSession() {
   continuationError.value = "";
   continuationStarting.value = true;
   const pendingId = promptPending.add(draftId, { text: prompt, imageCount: 0, startedAtLineCount: 0, agent: nextAgent });
+  // The continuation RPC may spend a long time booting Codex/Claude. Lock the
+  // newly selected draft before exposing its composer so a second Send cannot
+  // race this newSession and promote the same draft into two real sessions.
+  drafts.beginInflight(draftId);
   ui.select(draftId);
   try {
     const created = await newSession(
@@ -191,9 +197,12 @@ async function startContinuationSession() {
   } catch (e) {
     promptPending.clear(draftId);
     sessions.dropPending(draftId);
-    ui.select(oldSessionId);
+    // The user may have navigated elsewhere while the provider was starting.
+    // Only undo our own navigation if this draft still owns the selection.
+    if (ui.selectedSessionId === draftId) ui.select(oldSessionId);
     continuationError.value = e instanceof Error ? e.message : String(e);
   } finally {
+    drafts.endInflight(sessions.resolvePromoted(draftId));
     continuationStarting.value = false;
   }
 }
@@ -286,7 +295,7 @@ async function startContinuationSession() {
           </div>
           <div class="cw-context-usage-note">
             <template v-if="ctxBreakdownFullScanRecords !== null && ctxBreakdownFullScanRecords !== undefined">
-              Every physical rollout record was scanned. The stable first-turn residual is shown as “Codex base context” because Codex counts its hidden base instructions and tool schemas without writing them as rollout rows. Only the remaining changing estimate gap stays under “unattributed context”; known rows are never inflated to fill it.
+              Every physical rollout record was scanned. After compaction, the persisted replacement history is reconstructed and encrypted carry-over is shown as “compaction summary”. The first complete usage sample calibrates “Codex base context” because Codex counts hidden base instructions and tool schemas without writing them as rollout rows; later estimate noise cannot shrink that stable floor. Only the remaining changing estimate gap stays under “unattributed context”; known rows are never inflated to fill it.
             </template>
             <template v-else>
               Source attribution is approximate because Codex reports only the total. Missing or unloaded context stays under “unattributed context”; known rows are never inflated to fill it.

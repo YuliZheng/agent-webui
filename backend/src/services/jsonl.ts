@@ -1001,10 +1001,14 @@ export class JsonlTailer {
     );
     this.lastMtimeMs = (await stat(this.path)).mtimeMs;
     await this.updateCheckpoints();
-    this.emit({ type: "stream-truncate", keepCount: this.nextIndex });
     const initialFrom = this.options.tailN === undefined
-      ? Math.min(snapshot.lineCount, Math.max(0, Math.floor(this.options.from)))
+      ? 0
       : Math.max(0, snapshot.lineCount - Math.min(MAX_READ_RANGE_LINES, Math.max(0, Math.floor(this.options.tailN))));
+    // A new tailer has no proof that the reconnecting client's cached prefix
+    // still matches disk. Reset before replay; tailN keeps normal UI reconnects
+    // bounded, while a cursor-only subscriber must rebuild from zero.
+    this.options.from = initialFrom;
+    this.emit({ type: "stream-reset" });
     await this.emitInitialRange(index, initialFrom, snapshot.lineCount);
     if (this.stopped) return;
     this.watcher = chokidar.watch(this.path, { ignoreInitial: true, followSymlinks: false });
@@ -1177,7 +1181,6 @@ export class JsonlTailer {
   private async rescan(): Promise<void> {
     const index = await getLineIndex(this.path, "interactive");
     const snapshot = await snapshotFromIndex(this.path, index, { from: 0, to: 0 });
-    const oldCount = this.nextIndex;
     this.positionBytes = snapshot.size;
     this.lastSize = snapshot.size;
     this.lastMtimeMs = (await stat(this.path)).mtimeMs;
@@ -1188,12 +1191,19 @@ export class JsonlTailer {
       snapshot.trailingDiscarded ? snapshot.size - snapshot.completeBytes : 0,
     );
     await this.updateCheckpoints();
-    this.emit(this.nextIndex <= oldCount
-      ? { type: "stream-truncate", keepCount: this.nextIndex }
-      : { type: "stream-reset" });
+    // rescan() runs only after previously observed bytes may have changed.
+    // A smaller line count does not prove a pure suffix truncation: the file
+    // may also have rewritten its retained prefix. Since clients deliberately
+    // do not clobber populated cache slots during replay, always reset before
+    // sending the authoritative snapshot.
     const initialFrom = this.options.tailN === undefined
-      ? Math.min(snapshot.lineCount, Math.max(0, Math.floor(this.options.from)))
+      ? 0
       : Math.max(0, snapshot.lineCount - Math.min(MAX_READ_RANGE_LINES, Math.max(0, Math.floor(this.options.tailN))));
+    // Reset clears every cached slot, so the old resume cursor is no longer a
+    // valid lower bound. Re-anchor both this replay and future live filtering
+    // at the range the client is about to receive.
+    this.options.from = initialFrom;
+    this.emit({ type: "stream-reset" });
     await this.emitInitialRange(index, initialFrom, snapshot.lineCount);
   }
 

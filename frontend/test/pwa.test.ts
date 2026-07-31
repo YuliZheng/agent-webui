@@ -13,6 +13,7 @@ const manifest = JSON.parse(
   start_url?: string;
   scope?: string;
   display?: string;
+  orientation?: string;
   icons?: Array<{ src?: string; sizes?: string; type?: string }>;
 };
 
@@ -25,6 +26,7 @@ describe("PWA install support", () => {
       start_url: "/",
       scope: "/",
       display: "standalone",
+      orientation: "portrait",
     });
     expect(manifest.icons).toEqual(expect.arrayContaining([
       expect.objectContaining({ src: "/assets/icon-192.png", sizes: "192x192", type: "image/png" }),

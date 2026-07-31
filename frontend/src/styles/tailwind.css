@@ -608,6 +608,7 @@ body { @apply bg-white text-; }
   --cw-context-skills: #eab308;
   --cw-context-instructions: #64748b;
   --cw-context-base: #14b8a6;
+  --cw-context-compaction: #6366f1;
   --cw-context-images: #84cc16;
   --cw-context-messages: #22c55e;
   --cw-context-tools: #06b6d4;
@@ -1540,6 +1541,16 @@ body { @apply bg-white text-; }
   border-radius: 6px !important;
 }
 .cw-display-wechat .cw-user-prompt-image-bubble::after {
+  display: none;
+}
+.cw-display-wechat .cw-assistant-image-bubble {
+  width: fit-content !important;
+  margin-right: auto;
+  padding: 0 !important;
+  background: transparent !important;
+  border-radius: 6px !important;
+}
+.cw-display-wechat .cw-assistant-image-bubble::before {
   display: none;
 }
 /* Image+text prompts split into two bubbles (two WeChat "messages"), but the

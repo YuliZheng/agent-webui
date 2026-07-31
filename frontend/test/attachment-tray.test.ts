@@ -31,7 +31,13 @@ describe("mobile attachment tray", () => {
     );
   });
 
-  it("separates gallery, camera, and generic SAF browsing intents", () => {
+  it("keeps the latest message visible when the mobile tray opens", () => {
+    expect(promptInput).toMatch(
+      /if \(attachmentTrayOpen\.value\)[\s\S]*?emit\("mobile-composer-focus"\)/,
+    );
+  });
+
+  it("keeps gallery photos, camera capture, and PDF documents separate", () => {
     expect(promptInput).toMatch(
       /ref="galleryInputRef"[\s\S]*?accept="image\/\*"[\s\S]*?multiple/,
     );
@@ -39,7 +45,7 @@ describe("mobile attachment tray", () => {
       /ref="cameraInputRef"[\s\S]*?accept="image\/\*"[\s\S]*?capture="environment"/,
     );
     expect(promptInput).toMatch(
-      /ref="browseInputRef"[\s\S]*?accept="\*\/\*"[\s\S]*?multiple/,
+      /ref="browseInputRef"[\s\S]*?accept="application\/pdf"[\s\S]*?multiple/,
     );
     expect(promptInput).toContain(
       "if (!ACCEPTED_ATTACHMENT_MIME.test(blob.type))",

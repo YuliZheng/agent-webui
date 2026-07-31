@@ -1,10 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import { EventEmitter } from "node:events";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
-import { CodexDriver } from "../src/services/codex-driver.js";
+import { CODEX_REASONING_EFFORTS, CodexDriver } from "../src/services/codex-driver.js";
 import { AppState } from "../src/services/state.js";
 
 function fakeCodexChild() {
@@ -18,6 +18,61 @@ function fakeCodexChild() {
 }
 
 describe("Codex steer semantics", () => {
+  it("reports malformed stdout without emitting Node's fatal error event", async () => {
+    const state = new AppState(await mkdtemp(join(tmpdir(), "agent-webui-codex-malformed-")));
+    const driver = new CodexDriver("codex", state) as any;
+    const warning = vi.fn();
+    driver.on("driver-error", warning);
+
+    expect(() => driver.stdout("not-json\n")).not.toThrow();
+    expect(warning).toHaveBeenCalledWith("Malformed Codex app-server record");
+  });
+
+  it("reconciles a matching durable terminal exactly once without clearing a newer turn", async () => {
+    const state = new AppState(await mkdtemp(join(tmpdir(), "agent-webui-codex-durable-terminal-")));
+    const driver = new CodexDriver("codex", state) as any;
+    driver.threads.set("thread", { active: true, attached: true, turnId: "turn-a", steers: [] });
+    const statuses = vi.fn();
+    driver.on("status", statuses);
+
+    expect(driver.reconcileDurableTerminal(
+      "thread",
+      "turn-a",
+      "completed",
+      "2026-01-02T03:04:05Z",
+    )).toBe(true);
+    expect(driver.threads.get("thread")).toMatchObject({ active: false, turnId: undefined });
+    expect(statuses).toHaveBeenCalledTimes(1);
+    expect(statuses).toHaveBeenCalledWith({
+      id: "thread",
+      status: "exited",
+      webuiAlive: true,
+      lastBoundaryAt: "2026-01-02T03:04:05Z",
+    });
+
+    expect(driver.reconcileDurableTerminal("thread", "turn-a", "completed")).toBe(false);
+    driver.threads.set("thread", { active: true, attached: true, turnId: "turn-b", steers: [] });
+    expect(driver.reconcileDurableTerminal("thread", "turn-a", "completed")).toBe(false);
+    expect(driver.threads.get("thread")).toMatchObject({ active: true, turnId: "turn-b" });
+    expect(statuses).toHaveBeenCalledTimes(1);
+  });
+
+  it("clears running status when turn/start rejects", async () => {
+    const state = new AppState(await mkdtemp(join(tmpdir(), "agent-webui-codex-start-reject-")));
+    const driver = new CodexDriver("codex", state) as any;
+    const statuses: unknown[] = [];
+    driver.on("status", (event: unknown) => statuses.push(event));
+    driver.threads.set("thread", { active: false, attached: true, steers: [] });
+    driver.request = vi.fn(async () => { throw new Error("start rejected"); });
+
+    await expect(driver.prompt("thread", "hello")).rejects.toThrow("start rejected");
+    expect(driver.threads.get("thread")).toMatchObject({ active: false, turnId: undefined });
+    expect(statuses).toEqual([
+      expect.objectContaining({ id: "thread", status: "running", webuiAlive: true }),
+      expect.objectContaining({ id: "thread", status: "failed", webuiAlive: true }),
+    ]);
+  });
+
   it("surfaces collaboration-agent item lifecycle as background work", async () => {
     const state = new AppState(await mkdtemp(join(tmpdir(), "agent-webui-codex-collab-")));
     const driver = new CodexDriver("codex", state) as any;
@@ -200,11 +255,96 @@ describe("Codex steer semantics", () => {
     }));
 
     request.mockClear();
+    driver.threads.set("thread", { active: false, attached: true, steers: [], cwd: "C:\\work" });
+    await driver.prompt("thread", "standard", { serviceTier: null, cwd: "C:\\work" });
+    expect(request).toHaveBeenCalledWith("turn/start", expect.objectContaining({
+      threadId: "thread",
+      serviceTier: null,
+    }));
+
+    request.mockClear();
     await driver.updateSettings("thread", { serviceTier: null, cwd: "C:\\work" });
     expect(request).toHaveBeenCalledWith("thread/settings/update", {
       threadId: "thread",
       serviceTier: null,
     });
+
+    request.mockClear();
+    request.mockImplementation(async (method: string) => method === "thread/start" ? { thread: { id: "new-thread" } } : {});
+    await driver.newSession("C:\\work", "", { serviceTier: null });
+    expect(request).toHaveBeenCalledWith("thread/start", expect.objectContaining({
+      cwd: "C:\\work",
+      serviceTier: null,
+    }));
+  });
+  it("exposes live and legacy Fast service-tier capabilities", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-webui-codex-capabilities-"));
+    await writeFile(join(root, "models_cache.json"), JSON.stringify({
+      models: [
+        {
+          slug: "camel",
+          displayName: "Camel",
+          supportedReasoningEfforts: [],
+          serviceTiers: [{ id: "priority", name: "Fast", description: "Live tier" }],
+          defaultServiceTier: "priority",
+        },
+        {
+          slug: "snake",
+          display_name: "Snake",
+          supported_reasoning_efforts: [],
+          service_tiers: [{ id: "fast", name: "Fast" }],
+          default_service_tier: "fast",
+        },
+        {
+          slug: "legacy",
+          supported_reasoning_efforts: [],
+          additional_speed_tiers: ["fast"],
+        },
+        {
+          slug: "unsupported",
+          supported_reasoning_efforts: [],
+          service_tiers: [],
+        },
+        {
+          slug: "reasoning-levels",
+          supported_reasoning_levels: [
+            { effort: "low", description: "Fast responses" },
+            { effort: "ultra", description: "Maximum reasoning with delegation" },
+          ],
+          default_reasoning_level: "ultra",
+          service_tiers: [],
+        },
+      ],
+    }), "utf8");
+    const prior = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = root;
+    try {
+      const driver = new CodexDriver("codex", new AppState(root));
+      const capabilities = await driver.capabilities();
+      expect(capabilities.models.find(model => model.value === "camel")).toMatchObject({
+        defaultServiceTier: "priority",
+        serviceTiers: [{ value: "priority", label: "Fast", description: "Live tier" }],
+      });
+      expect(capabilities.models.find(model => model.value === "snake")).toMatchObject({
+        defaultServiceTier: "priority",
+        serviceTiers: [{ value: "priority", label: "Fast" }],
+      });
+      expect(capabilities.models.find(model => model.value === "legacy")?.serviceTiers).toEqual([
+        expect.objectContaining({ value: "priority", label: "Fast" }),
+      ]);
+      expect(capabilities.models.find(model => model.value === "unsupported")?.serviceTiers).toEqual([]);
+      expect(capabilities.models.find(model => model.value === "reasoning-levels")).toMatchObject({
+        defaultEffort: "ultra",
+        supportedEfforts: [
+          { value: "low", label: "low", description: "Fast responses" },
+          { value: "ultra", label: "ultra", description: "Maximum reasoning with delegation" },
+        ],
+      });
+      expect(CODEX_REASONING_EFFORTS.at(-1)).toBe("ultra");
+    } finally {
+      if (prior === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = prior;
+    }
   });
   it("surfaces the app-server error from a failed turn", async () => {
     const state = new AppState(await mkdtemp(join(tmpdir(), "agent-webui-codex-turn-error-"))); const driver = new CodexDriver("codex", state) as any;
@@ -224,6 +364,194 @@ describe("Codex steer semantics", () => {
       message: "Invalid reasoning effort",
       details: "Use medium",
     }]);
+  });
+  it("retries a pre-output capacity failure with bounded backoff and no duplicate user input", async () => {
+    vi.useFakeTimers();
+    try {
+      const state = new AppState(await mkdtemp(join(tmpdir(), "agent-webui-codex-capacity-retry-")));
+      const driver = new CodexDriver("codex", state) as any;
+      driver.threads.set("thread", { active: false, attached: true, steers: [], cwd: "C:\\work" });
+      let nextTurn = 0;
+      const request = vi.fn(async (method: string) => (
+        method === "turn/start" ? { turn: { id: `turn-${++nextTurn}` } } : {}
+      ));
+      driver.request = request;
+      const retries = vi.fn();
+      const errors = vi.fn();
+      driver.on("capacity-retry", retries);
+      driver.on("turn-error", errors);
+
+      await driver.prompt("thread", "run checks", {
+        model: "gpt-5.6-sol",
+        effort: "medium",
+        cwd: "C:\\work",
+      }, [], "client-1");
+      driver.notification("error", {
+        threadId: "thread",
+        turnId: "turn-1",
+        willRetry: false,
+        error: {
+          message: "Selected model is at capacity. Please try a different model.",
+          codexErrorInfo: "serverOverloaded",
+        },
+      });
+      expect(driver.reconcileDurableTerminal("thread", "turn-1", "completed")).toBe(true);
+
+      expect(retries).toHaveBeenCalledWith({
+        sessionId: "thread",
+        turnId: "turn-1",
+        attempt: 1,
+        maxAttempts: 6,
+        delayMs: 1_000,
+      });
+      expect(errors).not.toHaveBeenCalled();
+      expect(driver.threads.get("thread")).toMatchObject({ active: true, turnId: undefined });
+
+      // A delayed duplicate app-server completion must not cancel the retry
+      // already scheduled from the durable rollout boundary.
+      driver.notification("turn/completed", {
+        threadId: "thread",
+        turn: {
+          id: "turn-1",
+          status: "failed",
+          error: {
+            message: "Selected model is at capacity. Please try a different model.",
+            codexErrorInfo: "serverOverloaded",
+          },
+        },
+      });
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(request).toHaveBeenCalledTimes(2);
+      expect(request.mock.calls[1]).toEqual([
+        "turn/start",
+        expect.objectContaining({
+          threadId: "thread",
+          input: [],
+          model: "gpt-5.6-sol",
+          effort: "medium",
+          additionalContext: expect.objectContaining({
+            "agent-webui.capacity-retry": expect.objectContaining({ kind: "application" }),
+          }),
+        }),
+      ]);
+      expect(driver.threads.get("thread")).toMatchObject({ active: true, turnId: "turn-2" });
+
+      driver.notification("turn/completed", {
+        threadId: "thread",
+        turn: { id: "turn-2", status: "completed" },
+      });
+      expect(driver.threads.get("thread")).toMatchObject({ active: false, turnId: undefined });
+      expect(driver.threads.get("thread").capacityRetry).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  it("continues from completed tool activity after a capacity failure", async () => {
+    vi.useFakeTimers();
+    try {
+      const state = new AppState(await mkdtemp(join(tmpdir(), "agent-webui-codex-capacity-side-effect-")));
+      const driver = new CodexDriver("codex", state) as any;
+      driver.threads.set("thread", { active: false, attached: true, steers: [] });
+      let nextTurn = 0;
+      const request = vi.fn(async () => ({ turn: { id: `turn-${++nextTurn}` } }));
+      driver.request = request;
+      const errors = vi.fn();
+      driver.on("turn-error", errors);
+
+      await driver.prompt("thread", "change a file");
+      driver.notification("item/started", {
+        threadId: "thread",
+        turnId: "turn-1",
+        item: { id: "command-1", type: "commandExecution" },
+      });
+      driver.notification("item/completed", {
+        threadId: "thread",
+        turnId: "turn-1",
+        item: { id: "command-1", type: "commandExecution", status: "completed" },
+      });
+      driver.notification("error", {
+        threadId: "thread",
+        turnId: "turn-1",
+        willRetry: false,
+        error: { message: "Selected model is at capacity.", codexErrorInfo: "serverOverloaded" },
+      });
+      driver.notification("turn/completed", {
+        threadId: "thread",
+        turn: {
+          id: "turn-1",
+          status: "failed",
+          error: { message: "Selected model is at capacity.", codexErrorInfo: "serverOverloaded" },
+        },
+      });
+
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(request).toHaveBeenCalledTimes(2);
+      expect(request.mock.calls[1]).toEqual([
+        "turn/start",
+        expect.objectContaining({
+          threadId: "thread",
+          input: [],
+          additionalContext: {
+            "agent-webui.capacity-retry": expect.objectContaining({
+              kind: "application",
+              value: expect.stringContaining("partial progress"),
+            }),
+          },
+        }),
+      ]);
+      expect(errors).not.toHaveBeenCalled();
+      expect(driver.threads.get("thread")).toMatchObject({ active: true, turnId: "turn-2" });
+
+      driver.notification("turn/completed", {
+        threadId: "thread",
+        turn: { id: "turn-2", status: "completed" },
+      });
+      expect(driver.threads.get("thread")).toMatchObject({ active: false });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  it("stops retrying after six capacity retries and surfaces the final error", async () => {
+    vi.useFakeTimers();
+    try {
+      const state = new AppState(await mkdtemp(join(tmpdir(), "agent-webui-codex-capacity-limit-")));
+      const driver = new CodexDriver("codex", state) as any;
+      driver.threads.set("thread", { active: false, attached: true, steers: [] });
+      let nextTurn = 0;
+      const request = vi.fn(async () => ({ turn: { id: `turn-${++nextTurn}` } }));
+      driver.request = request;
+      const errors = vi.fn();
+      driver.on("turn-error", errors);
+
+      await driver.prompt("thread", "hello");
+      const fail = (turnId: string) => {
+        const error = { message: "Selected model is at capacity.", codexErrorInfo: "serverOverloaded" };
+        driver.notification("error", { threadId: "thread", turnId, willRetry: false, error });
+        driver.notification("turn/completed", {
+          threadId: "thread",
+          turn: { id: turnId, status: "failed", error },
+        });
+      };
+
+      const delays = [1_000, 2_000, 4_000, 8_000, 16_000, 30_000];
+      for (let attempt = 1; attempt <= 6; attempt++) {
+        fail(`turn-${attempt}`);
+        await vi.advanceTimersByTimeAsync(delays[attempt - 1]!);
+        expect(request).toHaveBeenCalledTimes(attempt + 1);
+      }
+      fail("turn-7");
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      expect(request).toHaveBeenCalledTimes(7);
+      expect(errors).toHaveBeenCalledTimes(1);
+      expect(errors).toHaveBeenCalledWith(expect.objectContaining({
+        turnId: "turn-7",
+        message: "Selected model is at capacity.",
+      }));
+      expect(driver.threads.get("thread")).toMatchObject({ active: false });
+    } finally {
+      vi.useRealTimers();
+    }
   });
   it("uses the installed compact and goal method contracts", async () => {
     const state = new AppState(await mkdtemp(join(tmpdir(), "agent-webui-codex-methods-"))); const driver = new CodexDriver("codex", state) as any;

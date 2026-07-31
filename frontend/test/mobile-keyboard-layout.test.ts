@@ -35,5 +35,7 @@ describe("mobile software-keyboard layout", () => {
     expect(mainPane).toContain("messageListRef.value?.revealLatest()");
     expect(messageList).toContain("defineExpose({ revealLatest: forceScrollSoon })");
     expect(messageList).toContain("el.clientHeight === lastClientHeight");
+    expect(messageList).toContain("pinToBottomUntilStable(1800, 700)");
+    expect(messageList).toContain("performance.now() - start >= minMs");
   });
 });

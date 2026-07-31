@@ -1,3 +1,33 @@
+export type AgentKind = "claude" | "codex";
+
+export interface AgentSelectOption {
+  value: string;
+  label: string;
+  description?: string | null;
+}
+
+export interface AgentModelOption extends AgentSelectOption {
+  supportedEfforts: AgentSelectOption[];
+  serviceTiers?: AgentSelectOption[];
+  defaultEffort?: string | null;
+  defaultServiceTier?: string | null;
+  isDefault?: boolean;
+}
+
+export interface AgentCapabilities {
+  agent: AgentKind;
+  models: AgentModelOption[];
+  permissionModes: AgentSelectOption[];
+  sandboxModes: AgentSelectOption[];
+  defaults: {
+    model?: string | null;
+    effort?: string | null;
+    serviceTier?: string | null;
+    permissionMode?: string | null;
+    sandboxMode?: string | null;
+  };
+}
+
 export interface SessionListItem {
   id: string;
   cwd: string;

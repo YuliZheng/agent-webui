@@ -10,6 +10,7 @@ import { applyTheme } from "../../util/theme.js";
 import { displayCwd } from "../../util/cwd-display.js";
 import { deleteSessions, retitleAll } from "../../api/sessions.js";
 import { requestNotifyPermission } from "../../util/os-notify.js";
+import { CODEX_REASONING_EFFORTS } from "../../util/codex-efforts.js";
 import {
   pwaInstallStatus,
   requestPwaInstall,
@@ -364,7 +365,7 @@ async function doRetitleAll() {
                 class="w-full text-sm font-mono rounded border border-[var(--cw-border)]  bg-[var(--cw-panel-bg)] text-[var(--cw-text)]  px-2 py-1 focus:outline-none focus:border-[var(--cw-accent)] [&>option]:bg-white [&>option]:text-[var(--cw-text)] dark:[&>option]:bg-[var(--cw-panel-2)] dark:[&>option]:text-[var(--cw-text)]"
               >
                 <option value="">(default · medium)</option>
-                <option v-for="e in ['none','minimal','low','medium','high','xhigh','max']" :key="e" :value="e">{{ e }}</option>
+                <option v-for="e in CODEX_REASONING_EFFORTS" :key="e" :value="e">{{ e }}</option>
               </select>
             </label>
           </div>
@@ -388,7 +389,7 @@ async function doRetitleAll() {
                   :checked="prefs.defaultCodexServiceTier === 'priority'"
                   @change="prefs.setDefaultCodexFast(($event.target as HTMLInputElement).checked)"
                 />
-                <span class="text-sm">Use priority service tier</span>
+                <span class="text-sm">Use Fast service tier for supported models</span>
               </label>
             </div>
           </div>

@@ -17,9 +17,13 @@ describe("pending prompt promotion", () => {
       agent: "codex",
     });
     pending.markDispatched("draft:1", id);
+    const startedAt = pending.pending("draft:1")[0]?.startedAt ?? 0;
+    expect(pending.latestStartedAt("draft:1")).toBe(startedAt);
 
     pending.moveSession("draft:1", "real:1");
     expect(pending.pending("draft:1")).toEqual([]);
+    expect(pending.latestStartedAt("draft:1")).toBe(0);
+    expect(pending.latestStartedAt("real:1")).toBe(startedAt);
     expect(pending.pending("real:1")).toMatchObject([{ id, phase: "dispatched", text: "hello" }]);
 
     pending.markAccepted("real:1", id);

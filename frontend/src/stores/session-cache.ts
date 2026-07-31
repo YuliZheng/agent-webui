@@ -10,19 +10,53 @@ interface PerSession {
   // when no real lines are present.
   firstLoadedIndex: number;
   dirty: boolean;
+  // Monotonic in-memory content generation. A flush only clears `dirty` when
+  // the generation it snapshotted is still current after the async IDB write.
+  revision: number;
   saveTimer: ReturnType<typeof setTimeout> | null;
 }
 
 interface State { bySession: Record<string, PerSession> }
 
 const DEBOUNCE_MS = 200;
+// Bound the amount of catch-up work one flush performs while a live transcript
+// is changing continuously. One extra pass closes the ordinary append-during-
+// write race; further changes retain `dirty` and use the normal debounce.
+const MAX_COALESCED_FLUSH_PASSES = 2;
+
+type CacheSnapshot = { id: string; lines: string[]; nextLineIndex: number };
+
+// IDB writes for one session must preserve invocation order. In particular,
+// clear(empty) must run after an older snapshot already in flight.
+const writeTails = new Map<string, Promise<void>>();
+const flushWork = new Map<string, Promise<void>>();
+
+function enqueueWrite(value: CacheSnapshot): Promise<void> {
+  const previous = writeTails.get(value.id) ?? Promise.resolve();
+  const write = previous
+    .catch(() => undefined)
+    .then(() => saveSessionCache(value));
+  let tracked!: Promise<void>;
+  tracked = write.finally(() => {
+    if (writeTails.get(value.id) === tracked) writeTails.delete(value.id);
+  });
+  writeTails.set(value.id, tracked);
+  return tracked;
+}
 
 export const useSessionCacheStore = defineStore("session-cache", {
   state: (): State => ({ bySession: {} }),
   actions: {
     ensure(id: string): PerSession {
       if (!this.bySession[id]) {
-        this.bySession[id] = { lines: [], nextLineIndex: 0, firstLoadedIndex: 0, dirty: false, saveTimer: null };
+        this.bySession[id] = {
+          lines: [],
+          nextLineIndex: 0,
+          firstLoadedIndex: 0,
+          dirty: false,
+          revision: 0,
+          saveTimer: null,
+        };
       }
       // Re-read so the returned reference is the reactive Proxy (not the raw object
       // we just assigned). Mutating through the raw reference would bypass Vue's
@@ -104,6 +138,7 @@ export const useSessionCacheStore = defineStore("session-cache", {
       } else if (minIdx < entry.firstLoadedIndex) {
         entry.firstLoadedIndex = minIdx;
       }
+      entry.revision++;
       entry.dirty = true;
       this.scheduleSave(id);
     },
@@ -128,6 +163,7 @@ export const useSessionCacheStore = defineStore("session-cache", {
           if (lineIndex < entry.firstLoadedIndex) entry.firstLoadedIndex = lineIndex;
         }
       }
+      entry.revision++;
       entry.dirty = true;
       this.scheduleSave(id);
     },
@@ -142,6 +178,7 @@ export const useSessionCacheStore = defineStore("session-cache", {
       const entry = this.ensure(id);
       if (normalized <= entry.nextLineIndex) return;
       entry.nextLineIndex = normalized;
+      entry.revision++;
       entry.dirty = true;
       this.scheduleSave(id);
     },
@@ -150,18 +187,54 @@ export const useSessionCacheStore = defineStore("session-cache", {
       if (entry.saveTimer) clearTimeout(entry.saveTimer);
       entry.saveTimer = setTimeout(() => { void this.flush(id); }, DEBOUNCE_MS);
     },
-    async flush(id: string) {
-      const entry = this.bySession[id];
-      if (!entry || !entry.dirty) return;
-      if (entry.saveTimer) { clearTimeout(entry.saveTimer); entry.saveTimer = null; }
-      // structuredClone (used by IDB) can't serialize Vue's reactive Proxy.
-      // Spread into a plain array of plain strings.
-      await saveSessionCache({
-        id,
-        lines: [...entry.lines],
-        nextLineIndex: entry.nextLineIndex,
+    async flush(id: string): Promise<void> {
+      const existing = flushWork.get(id);
+      if (existing) {
+        await existing;
+        // `clear()` may replace the entry while the old writer is active, or a
+        // timer may join after a newer generation appears. The first waiter
+        // starts exactly one successor; all others join it through this branch.
+        if (this.bySession[id]?.dirty) await this.flush(id);
+        return;
+      }
+
+      const work = (async () => {
+        for (let pass = 0; pass < MAX_COALESCED_FLUSH_PASSES; pass++) {
+          const entry = this.bySession[id];
+          if (!entry || !entry.dirty) return;
+          if (entry.saveTimer) { clearTimeout(entry.saveTimer); entry.saveTimer = null; }
+          const revision = entry.revision;
+          // structuredClone (used by IDB) can't serialize Vue's reactive
+          // Proxy. Snapshot plain data before entering the serialized queue.
+          await enqueueWrite({
+            id,
+            lines: [...entry.lines],
+            nextLineIndex: entry.nextLineIndex,
+          });
+
+          const current = this.bySession[id];
+          // A clear/recreate owns a different entry and queues its own final
+          // state after this write. Never mutate or resave the retired object.
+          if (current !== entry) return;
+          if (current.revision === revision) {
+            current.dirty = false;
+            return;
+          }
+          // A live append landed during the write. Keep dirty and use the next
+          // bounded pass to persist the latest coalesced snapshot.
+          current.dirty = true;
+        }
+
+        const current = this.bySession[id];
+        if (current?.dirty) this.scheduleSave(id);
+      })();
+
+      let tracked!: Promise<void>;
+      tracked = work.finally(() => {
+        if (flushWork.get(id) === tracked) flushWork.delete(id);
       });
-      entry.dirty = false;
+      flushWork.set(id, tracked);
+      await tracked;
     },
     async flushAll() {
       const ids = Object.keys(this.bySession);
@@ -171,7 +244,9 @@ export const useSessionCacheStore = defineStore("session-cache", {
       const entry = this.bySession[id];
       if (entry?.saveTimer) { clearTimeout(entry.saveTimer); entry.saveTimer = null; }
       delete this.bySession[id];
-      try { await saveSessionCache({ id, lines: [], nextLineIndex: 0 }); } catch { /* noop */ }
+      // Share the same per-session queue as flush snapshots. If an older write
+      // is already running, the empty state is guaranteed to land after it.
+      try { await enqueueWrite({ id, lines: [], nextLineIndex: 0 }); } catch { /* noop */ }
     },
     // Smart truncation: keep the first `keepCount` lines, drop the rest.
     // Used by the stream-truncate handler so rewind doesn't have to re-stream
@@ -193,6 +268,7 @@ export const useSessionCacheStore = defineStore("session-cache", {
       // where trailing records were filtered from the visible transcript).
       entry.nextLineIndex = Math.max(0, Math.floor(keepCount));
       if (entry.firstLoadedIndex >= keepCount) entry.firstLoadedIndex = Math.max(0, keepCount - 1);
+      entry.revision++;
       entry.dirty = true;
       // Cancel any pending debounced save so flush sees the latest state
       // exactly once instead of racing a stale schedule.

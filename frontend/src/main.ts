@@ -6,10 +6,12 @@ import "./styles/tailwind.css";
 // Imported eagerly so the first assistant bubble with math doesn't FOUC.
 import "katex/dist/katex.min.css";
 import { initPwaInstall } from "./util/pwa-install.js";
+import { initStandalonePwaOrientationLock } from "./util/pwa-orientation.js";
 
 // Capture the one-shot browser event before mounting any UI. Settings may not
 // be opened until long after beforeinstallprompt has fired.
 initPwaInstall();
+initStandalonePwaOrientationLock();
 const pinia = createPinia();
 createApp(App).use(pinia).mount("#app");
 

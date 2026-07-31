@@ -20,6 +20,7 @@ import { useLocalFileViewerStore } from "../stores/local-file-viewer.js";
 import { displayCwd } from "../util/cwd-display.js";
 import { copyText } from "../util/clipboard.js";
 import { getSessionGoal, killSession } from "../api/sessions.js";
+import { nowMs } from "../util/now-tick.js";
 
 const ui = useUiStore();
 const prefs = usePrefsStore();
@@ -41,6 +42,15 @@ const webuiAlive = computed(() => !!(
   && sessions.webuiAliveBySession[sessionId.value]
 ));
 const isWorking = computed(() => status.value === "running");
+const capacityRetry = computed(() => (
+  sessionId.value ? sessions.capacityRetryBySession[sessionId.value] ?? null : null
+));
+const capacityRetryWaitSeconds = computed(() => {
+  if (!capacityRetry.value) return 0;
+  return Math.max(0, Math.ceil(
+    (Date.parse(capacityRetry.value.retryAt) - nowMs.value) / 1_000,
+  ));
+});
 // CLI mid-/compact — wire-only signal, the jsonl is silent for the whole
 // window. Swaps the green pill's label so the user knows why nothing streams.
 const isCompacting = computed(() => !!(sessionId.value && sessions.compactingBySession[sessionId.value]));
@@ -56,6 +66,12 @@ const isDraft = computed(() => !!sessionId.value && sessions.isPending(sessionId
 const mobileHeaderTitle = computed(() => {
   if (isDraft.value) return `New session in ${cwdDisplay.value}`;
   if (isCompacting.value) return "正在整理上下文…";
+  if (capacityRetry.value) {
+    const wait = capacityRetryWaitSeconds.value > 0
+      ? `，${capacityRetryWaitSeconds.value} 秒后继续`
+      : "";
+    return `模型繁忙，正在重试 ${capacityRetry.value.attempt}/${capacityRetry.value.maxAttempts}${wait}…`;
+  }
   if (isWorking.value) return `${agent.value === "codex" ? "Codex" : "Claude"} 正在思考…`;
   return displayTitle.value || `${shortId.value}…`;
 });
@@ -298,8 +314,17 @@ async function copyCwd() {
             class="text-xs px-1.5 py-0.5 rounded bg-[color-mix(in_srgb,var(--cw-danger)_16%,transparent)] text-[var(--cw-danger)] [@media(hover:hover)]:hover:bg-[color-mix(in_srgb,var(--cw-danger)_24%,transparent)] active:opacity-75 transition"
             title="Tap to reconnect now"
             @click="retryReconnect"
-          >{{ retryingReconnect ? "Reconnecting…" : "Disconnected · tap to retry" }}</button>
-          <span
+           >{{ retryingReconnect ? "Reconnecting…" : "Disconnected · tap to retry" }}</button>
+           <span
+             v-else-if="capacityRetry"
+             class="flex items-center gap-1.5 text-xs px-2 py-0.5 rounded bg-[color-mix(in_srgb,var(--cw-warning)_16%,transparent)] text-[var(--cw-warning)]"
+             :title="`Selected model is busy. Automatic retry ${capacityRetry.attempt} of ${capacityRetry.maxAttempts}.`"
+           >
+             <span class="inline-block animate-spin">⟳</span>
+             Model busy · retry {{ capacityRetry.attempt }}/{{ capacityRetry.maxAttempts }}
+             <template v-if="capacityRetryWaitSeconds > 0"> · {{ capacityRetryWaitSeconds }}s</template>
+           </span>
+           <span
             v-else-if="isWorking || isCompacting"
             class="flex items-center gap-1.5 text-xs px-2 py-0.5 rounded bg-[color-mix(in_srgb,var(--cw-success)_16%,transparent)] text-[var(--cw-success)]"
           >

@@ -8,7 +8,7 @@ const userMsg = (text: string) => ev("event_msg", { type: "user_message", messag
 const agentMsg = (text: string) => ev("event_msg", { type: "agent_message", message: text });
 const fnCall = (callId: string, cmd: string) =>
   ev("response_item", { type: "function_call", name: "exec_command", call_id: callId, arguments: JSON.stringify({ cmd }) });
-const fnOut = (callId: string, output: string) =>
+const fnOut = (callId: string, output: unknown) =>
   ev("response_item", { type: "function_call_output", call_id: callId, output });
 
 function render(lines: string[]) {
@@ -82,6 +82,30 @@ describe("codexToClaudeLines (rollout shape) + groupTimeline", () => {
     expect(String(t[0]!.toolPairs![0]!.result)).toContain("hi");
   });
 
+  it("preserves emitted tool-result images as renderable image blocks", () => {
+    const t = render([
+      fnCall("image_call", "emit image"),
+      fnOut("image_call", [
+        {
+          type: "input_text",
+          text: "Chunk ID: image\nProcess exited with code 0\nOutput:\nready",
+        },
+        { type: "input_image", image_url: "data:image/png;base64,aGVsbG8=", detail: "original" },
+      ]),
+    ]);
+    expect(t[0]!.toolPairs?.[0]!.result).toEqual([
+      { type: "text", text: "ready" },
+      {
+        type: "image",
+        source: {
+          type: "base64",
+          media_type: "image/png",
+          data: "aGVsbG8=",
+        },
+      },
+    ]);
+  });
+
   it("renders a full turn (user → command → reply) in order", () => {
     const t = render([
       ev("event_msg", { type: "task_started", turn_id: "t1" }),
@@ -94,6 +118,41 @@ describe("codexToClaudeLines (rollout shape) + groupTimeline", () => {
     ]);
     expect(t.map((n) => n.block)).toEqual(["UserPromptBlock", "AssistantBlock", "AssistantBlock"]);
     expect(t[1]!.toolPairs?.[0]!.use.name).toBe("Bash");
+  });
+
+  it("persists an explicit marker when a turn ends without a final response", () => {
+    const t = render([
+      userMsg("continue"),
+      fnCall("c1", "echo working"),
+      fnOut("c1", "Output:\nworking\n"),
+      ev("event_msg", { type: "task_complete", turn_id: "t1", last_agent_message: null }),
+    ]);
+    expect(t.map((n) => n.block)).toEqual(["UserPromptBlock", "AssistantBlock", "AssistantBlock"]);
+    expect(t[2]!.record.message).toEqual(expect.objectContaining({
+      content: [expect.objectContaining({
+        type: "text",
+        text: "Turn ended without a final response. Send another message to retry or continue.",
+      })],
+    }));
+    expect(codexToClaudeLines(ev("event_msg", {
+      type: "task_complete",
+      turn_id: "t2",
+      last_agent_message: "Done",
+    }))).toEqual([]);
+  });
+
+  it("replaces an empty-completion marker when a retry attempt starts", () => {
+    const t = render([
+      userMsg("continue"),
+      ev("event_msg", { type: "task_complete", turn_id: "t1", last_agent_message: null }),
+      ev("event_msg", { type: "task_started", turn_id: "t2" }),
+      agentMsg("Completed on retry."),
+      ev("event_msg", { type: "task_complete", turn_id: "t2", last_agent_message: "Completed on retry." }),
+    ]);
+    expect(t.map((node) => node.block)).toEqual(["UserPromptBlock", "AssistantBlock"]);
+    expect(t[1]!.record.message).toEqual(expect.objectContaining({
+      content: [expect.objectContaining({ type: "text", text: "Completed on retry." })],
+    }));
   });
 
   it("honors rollback markers when rendering append-only rollout logs", () => {

@@ -316,17 +316,40 @@ describe("JSONL indexing and tails", () => {
     expect(lines[1]?.prefix).toContain('"type":"file-history-snapshot"');
   });
 
-  it("resumes from from, completes partial bytes, and emits confirmed truncation", async () => {
+  it("resets an unverifiable resume cursor, completes partial bytes, and resets after truncation", async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-webui-tail-")); const path = join(root, "a.jsonl");
     await writeFile(path, "zero\none\npart"); const events: any[] = [];
     const tailer = new JsonlTailer(path, { from: 1, pollMs: 60_000, truncateVerifyMs: 5 }, event => events.push(event));
     await tailer.start();
-    expect(events[0]).toEqual({ type: "stream-truncate", keepCount: 2 });
-    expect(events[1].lines).toEqual([{ index: 1, raw: "one" }]);
+    expect(events[0]).toEqual({ type: "stream-reset" });
+    expect(events[1].lines).toEqual([{ index: 0, raw: "zero" }, { index: 1, raw: "one" }]);
     await appendFile(path, "ial\nnext\n"); await tailer.check();
     expect(events.at(-1).lines).toEqual([{ index: 2, raw: "partial" }, { index: 3, raw: "next" }]);
     await truncate(path, Buffer.byteLength("zero\n")); await tailer.check();
-    expect(events.some(event => event.type === "stream-truncate" && event.keepCount === 1)).toBe(true);
+    expect(events.slice(-2)).toEqual([
+      { type: "stream-reset" },
+      { type: "stream-batch", lines: [{ index: 0, raw: "zero" }] },
+    ]);
+    await tailer.stop();
+  });
+
+  it("does not trust a reconnect cursor after same-length bytes changed while disconnected", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-webui-reconnect-rewrite-")); const path = join(root, "a.jsonl");
+    await writeFile(path, "new-zero\nnew-one\n"); const events: any[] = [];
+    const tailer = new JsonlTailer(path, { from: 2, pollMs: 60_000 }, event => events.push(event));
+
+    await tailer.start();
+
+    expect(events).toEqual([
+      { type: "stream-reset" },
+      {
+        type: "stream-batch",
+        lines: [
+          { index: 0, raw: "new-zero" },
+          { index: 1, raw: "new-one" },
+        ],
+      },
+    ]);
     await tailer.stop();
   });
 
@@ -369,6 +392,48 @@ describe("JSONL indexing and tails", () => {
     await tailer.check();
     expect(events.some(event => event.type === "stream-reset")).toBe(true);
     expect(events.some(event => event.type === "stream-batch" && event.lines[0]?.raw === "new-zero")).toBe(true);
+    await tailer.stop();
+  });
+
+  it("resets and replays when existing lines are rewritten without changing the line count", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-webui-rewrite-same-count-")); const path = join(root, "a.jsonl");
+    await writeFile(path, "old-zero\nold-one\n"); const events: any[] = [];
+    const tailer = new JsonlTailer(path, { from: 0, pollMs: 60_000 }, event => events.push(event));
+    await tailer.start(); events.length = 0;
+
+    // Keep both byte size and physical line count unchanged. A truncate event
+    // would incorrectly promise that the client's two cached rows are valid.
+    await new Promise(resolve => setTimeout(resolve, 5));
+    await writeFile(path, "new-zero\nnew-one\n");
+    await tailer.check();
+
+    expect(events[0]).toEqual({ type: "stream-reset" });
+    expect(events[1]).toEqual({
+      type: "stream-batch",
+      lines: [
+        { index: 0, raw: "new-zero" },
+        { index: 1, raw: "new-one" },
+      ],
+    });
+    expect(events.some(event => event.type === "stream-truncate")).toBe(false);
+    await tailer.stop();
+  });
+
+  it("resets and replaces the retained prefix when a rewrite also shrinks the file", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-webui-rewrite-shrink-")); const path = join(root, "a.jsonl");
+    await writeFile(path, "old-zero\nold-one\n"); const events: any[] = [];
+    const tailer = new JsonlTailer(path, { from: 0, pollMs: 60_000, truncateVerifyMs: 5 }, event => events.push(event));
+    await tailer.start(); events.length = 0;
+
+    await writeFile(path, "new-zero\n");
+    await tailer.check();
+
+    expect(events[0]).toEqual({ type: "stream-reset" });
+    expect(events[1]).toEqual({
+      type: "stream-batch",
+      lines: [{ index: 0, raw: "new-zero" }],
+    });
+    expect(events.some(event => event.type === "stream-truncate")).toBe(false);
     await tailer.stop();
   });
 });

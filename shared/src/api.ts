@@ -89,7 +89,10 @@ export interface AgentSelectOption {
 
 export interface AgentModelOption extends AgentSelectOption {
   supportedEfforts: AgentSelectOption[];
+  /** Service-tier ids accepted by Codex app-server for this model. */
+  serviceTiers?: AgentSelectOption[];
   defaultEffort?: string | null;
+  defaultServiceTier?: string | null;
   isDefault?: boolean;
 }
 
@@ -101,6 +104,7 @@ export interface AgentCapabilities {
   defaults: {
     model?: string | null;
     effort?: string | null;
+    serviceTier?: string | null;
     permissionMode?: string | null;
     sandboxMode?: string | null;
   };
@@ -248,6 +252,7 @@ export interface RpcRequestPayloads {
   "normalize-cwd": { cwd: string };
   "complete-path": { path: string };
   "read-local-file": { path: string; line?: number };
+  "reveal-local-path": { path: string };
   "new-session": {
     cwd: string;
     prompt: string;
@@ -324,6 +329,7 @@ export interface RpcResponsePayloads {
   "normalize-cwd": { cwd: string };
   "complete-path": { paths: string[] };
   "read-local-file": LocalFilePayload;
+  "reveal-local-path": { path: string; kind: "file" | "directory" };
   "new-session": { sessionId: string };
   prompt:
     | { sessionId: string; queued: boolean; steered?: never }
@@ -339,7 +345,7 @@ export interface RpcResponsePayloads {
   "get-agent-capabilities": AgentCapabilities;
   "set-model": { applies: "immediately" | "next-process" };
   "set-effort": { applies: "immediately" | "next-process" };
-  "set-service-tier": { applies: "immediately" };
+  "set-service-tier": { applies: "next-turn" };
   "set-permission-mode": { applies: "immediately" | "next-process" };
   "set-sandbox-mode": { applies: "immediately" | "next-process" };
   "interaction-respond": Record<string, never>;
@@ -393,6 +399,7 @@ const RPC_METHODS: ReadonlySet<string> = new Set<RpcMethod>([
   "normalize-cwd",
   "complete-path",
   "read-local-file",
+  "reveal-local-path",
   "new-session",
   "prompt",
   "stop",

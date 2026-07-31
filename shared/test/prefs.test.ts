@@ -46,6 +46,8 @@ describe("preference normalization", () => {
       pinnedGroupIds: ["work"],
       pinnedSessionIds: ["two", "one"],
       thinkingTrigger: "ultrathink",
+      autoCompactWindow: 180_000,
+      codexAutoCompactWindow: 350_000,
       autoTitleEnabled: false,
       autoTitleFrequency: 12,
       autoTitleLanguage: "zh-CN",
@@ -73,6 +75,8 @@ describe("preference normalization", () => {
       },
     ]);
     expect(prefs.pinnedSessionIds).toEqual(["two", "one"]);
+    expect(prefs.autoCompactWindow).toBe(180_000);
+    expect(prefs.codexAutoCompactWindow).toBe(350_000);
     expect(prefs.autoTitleFrequency).toBe(12);
     expect(prefs.defaultCodexServiceTier).toBe("priority");
     expect(prefs.showSubagentSessions).toBe(true);
@@ -96,6 +100,8 @@ describe("preference normalization", () => {
     expect(prefs.colorPreference).toBe("system");
     expect(prefs.autoTitleFrequency).toBe(5);
     expect(prefs.defaultCodexServiceTier).toBe("");
+    expect(prefs.autoCompactWindow).toBeNull();
+    expect(prefs.codexAutoCompactWindow).toBeNull();
     expect(Object.keys(prefs)).not.toContain("legacySecret");
     expect(Object.keys(prefs)).not.toContain("legacyDraft");
     expect(Object.keys(prefs)).not.toContain("legacyRemote");
@@ -105,6 +111,15 @@ describe("preference normalization", () => {
     expect(normalizePrefs({ defaultCodexServiceTier: "priority" }).defaultCodexServiceTier).toBe("priority");
     expect(normalizePrefs({ defaultCodexServiceTier: "fast" }).defaultCodexServiceTier).toBe("");
     expect(normalizePrefs({ defaultCodexServiceTier: "standard" }).defaultCodexServiceTier).toBe("");
+  });
+
+  it("accepts only positive integer compact windows", () => {
+    expect(normalizePrefs({ autoCompactWindow: 180_000 }).autoCompactWindow).toBe(180_000);
+    expect(normalizePrefs({ codexAutoCompactWindow: 350_000 }).codexAutoCompactWindow).toBe(350_000);
+    for (const value of [0, -1, 1.5, Number.POSITIVE_INFINITY, "350000"]) {
+      expect(normalizePrefs({ autoCompactWindow: value }).autoCompactWindow).toBeNull();
+      expect(normalizePrefs({ codexAutoCompactWindow: value }).codexAutoCompactWindow).toBeNull();
+    }
   });
 
   it("validates canonical blobs", () => {

@@ -6,6 +6,23 @@ export interface OrdinarySessionVisibilityPrefs {
   showSubagentSessions: boolean;
 }
 
+export interface SessionNotificationSource {
+  id: string;
+  peer?: boolean;
+  subagent?: boolean;
+}
+
+/** Completion toasts follow the same hidden-session preferences as the sidebar. */
+export function shouldNotifyForSession(
+  source: SessionNotificationSource,
+  prefs: OrdinarySessionVisibilityPrefs,
+): boolean {
+  if (prefs.hidden.includes(source.id)) return false;
+  if (!prefs.showPeerSessions && source.peer === true) return false;
+  if (!prefs.showSubagentSessions && source.subagent === true) return false;
+  return true;
+}
+
 /**
  * Visibility for the ordinary sidebar tree (Active/Pinned/groups/cwd buckets).
  * Search deliberately bypasses this helper so hidden worker sessions remain

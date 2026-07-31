@@ -31,3 +31,24 @@ $gradle = "$env:USERPROFILE\.gradle\wrapper\dists\gradle-7.4-all\aadb4xli5jkdsnu
 `assembleRelease` is signed only when `keystore.properties` exists. Keep the
 keystore and its passwords private and backed up; losing it makes future APK
 updates incompatible with an already installed copy.
+
+## Cross-profile Agent relay
+
+The `relay` module builds one package that chooses its role from the Android
+profile where it runs:
+
+- the managed work profile exposes a loopback-only SOCKS5 relay on
+  `127.0.0.1:38483` and permits only the Agent WebUI host on port 443;
+- the personal owner profile exposes a loopback-only PAC/HTTP CONNECT bridge on
+  `127.0.0.1:38484`, with its PAC at
+  `http://127.0.0.1:38484/proxy.pac`, and advertises that PAC to Chrome through
+  a Chrome-only split `VpnService`;
+- all other destinations are `DIRECT` in the PAC and are rejected by the
+  bridge itself.
+
+Both roles are foreground services, restart after boot, and share no public
+listener. The personal bridge reaches the work-profile SOCKS listener through
+Android's shared loopback network. Its Chrome-only VPN occupies the personal
+profile's VPN slot, while work-profile Tailscale continues in the work profile's
+separate slot. Stop the personal Agent Bridge before starting a personal-profile
+VPN such as FlClash; start Agent Bridge when FlClash is not in use.

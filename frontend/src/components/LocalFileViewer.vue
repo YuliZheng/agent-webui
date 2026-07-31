@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
-import { readLocalFile, type LocalFileResponse } from "../api/local-files.js";
+import { localFileContentUrl, readLocalFile, type LocalFileResponse } from "../api/local-files.js";
 import { highlightToHtml } from "../render/shiki.js";
+import { renderMarkdown } from "../render/markdown.js";
 import { useLocalFileViewerStore } from "../stores/local-file-viewer.js";
 import { useUiStore } from "../stores/ui.js";
 import { APP_BACK_PRIORITY, registerAppBackHandler } from "../util/app-back.js";
 import { setPwaLayerActive } from "../util/pwa-history.js";
+import { basenameFromPath, codexImageUrl, localFilePreviewKind } from "../util/local-file-links.js";
 import { useDark } from "../util/theme.js";
 
 const viewer = useLocalFileViewerStore();
@@ -20,10 +22,16 @@ let loadToken = 0;
 let unregisterAppBack: (() => void) | undefined;
 
 const active = computed(() => viewer.open && viewer.sessionId === ui.selectedSessionId);
+const previewKind = computed(() => localFilePreviewKind(viewer.path));
+const contentUrl = computed(() => localFileContentUrl(viewer.path));
+const downloadUrl = computed(() => localFileContentUrl(viewer.path, true));
+const imageUrl = computed(() => codexImageUrl(viewer.path));
+const markdownHtml = computed(() => renderMarkdown(file.value?.content ?? ""));
+const htmlDocument = computed(() => file.value?.content ?? "");
 const title = computed(() => {
   const path = viewer.path;
   const trimmed = path.endsWith("/") ? path.slice(0, -1) : path;
-  const base = trimmed.slice(trimmed.lastIndexOf("/") + 1) || trimmed;
+  const base = basenameFromPath(trimmed);
   return `${base}${viewer.line ? `:${viewer.line}` : ""}`;
 });
 const lines = computed(() => (file.value?.content ?? "").split(/\r?\n/));
@@ -104,11 +112,15 @@ async function load() {
   error.value = "";
   file.value = null;
   highlightedLines.value = [];
+  if (["image", "pdf", "binary"].includes(previewKind.value)) {
+    loading.value = false;
+    return;
+  }
   try {
     const result = await readLocalFile(viewer.path, viewer.line);
     if (token !== loadToken) return;
     file.value = result;
-    await applyHighlight(token, result);
+    if (previewKind.value === "text") await applyHighlight(token, result);
     await nextTick();
     if (viewer.line) {
       scroller.value?.querySelector(`#L${viewer.line}`)?.scrollIntoView({ block: "center" });
@@ -126,7 +138,7 @@ watch(active, open => {
   setPwaLayerActive("local-file-viewer", open, ui.selectedSessionId);
 });
 watch(dark, async () => {
-  if (!active.value || !file.value) return;
+  if (!active.value || !file.value || previewKind.value !== "text") return;
   const token = ++loadToken;
   await applyHighlight(token, file.value);
 });
@@ -166,6 +178,19 @@ onUnmounted(() => {
         <div class="text-base font-semibold truncate" :title="title">{{ title }}</div>
         <div class="text-[11px] opacity-60 truncate font-mono" :title="viewer.path">{{ viewer.path }}</div>
       </div>
+      <a
+        :href="downloadUrl"
+        download
+        class="cw-local-file-close w-9 h-9 rounded-full flex items-center justify-center opacity-70 hover:opacity-100 transition"
+        title="Download file"
+        aria-label="Download file"
+      >
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" class="w-5 h-5">
+          <path d="M12 3v12" />
+          <path d="m7 10 5 5 5-5" />
+          <path d="M5 21h14" />
+        </svg>
+      </a>
       <button
         type="button"
         class="cw-local-file-close w-9 h-9 rounded-full flex items-center justify-center opacity-70 hover:opacity-100 transition"
@@ -192,6 +217,36 @@ onUnmounted(() => {
       >
         Retry
       </button>
+    </div>
+    <div v-else-if="previewKind === 'image'" class="flex-1 min-h-0 overflow-auto flex items-center justify-center p-4">
+      <img :src="imageUrl" :alt="title" class="max-w-full max-h-full object-contain" />
+    </div>
+    <iframe
+      v-else-if="previewKind === 'pdf'"
+      :src="contentUrl"
+      :title="title"
+      class="flex-1 min-h-0 w-full border-0 bg-white"
+    />
+    <iframe
+      v-else-if="previewKind === 'html'"
+      :srcdoc="htmlDocument"
+      :title="title"
+      sandbox=""
+      referrerpolicy="no-referrer"
+      class="flex-1 min-h-0 w-full border-0 bg-white"
+    />
+    <article
+      v-else-if="previewKind === 'markdown'"
+      class="flex-1 min-h-0 overflow-auto px-5 py-4 prose prose-sm dark:prose-invert max-w-none break-words"
+      v-html="markdownHtml"
+    />
+    <div v-else-if="previewKind === 'binary'" class="flex-1 flex flex-col items-center justify-center gap-4 px-6 text-center">
+      <div class="text-sm opacity-70">This file type cannot be previewed safely.</div>
+      <a
+        :href="downloadUrl"
+        download
+        class="px-4 py-2 rounded-md bg-[var(--cw-accent)] text-[var(--cw-accent-text)] text-sm font-semibold"
+      >Download file</a>
     </div>
     <div
       v-else

@@ -15,7 +15,7 @@ describe("persistent content search index", () => {
     await mkdir(codexRoot);
     const path = join(claudeRoot, "indexed.jsonl");
     await writeFile(path, [
-      JSON.stringify({ type: "user", cwd: root, uuid: "u1", message: { content: "英国旅行" } }),
+      JSON.stringify({ type: "user", cwd: root, uuid: "u1", message: { content: "英国旅行与5G网络" } }),
       JSON.stringify({ type: "assistant", cwd: root, uuid: "a1", message: { content: "alpha beta together" } }),
       JSON.stringify({ type: "assistant", cwd: root, uuid: "a2", message: { content: "alpha only" } }),
       "",
@@ -48,11 +48,36 @@ describe("persistent content search index", () => {
         scannedArchiveBytes: 0,
       })]);
 
+      const techCandidates = await contentIndex.candidates(sessions.list(), "5g");
+      expect(techCandidates.coveredPaths.size).toBe(1);
+      expect(techCandidates.candidates.map(item => item.lineIndex)).toEqual([0]);
+      const techDiagnostics: Array<{ strategy: string; scannedArchiveBytes: number }> = [];
+      const acceleratedTech = await searchSessions(sessions, "5g", {
+        contentIndex,
+        rgMinArchiveBytes: Number.POSITIVE_INFINITY,
+        onDiagnostic: diagnostic => techDiagnostics.push(diagnostic),
+      });
+      const fallbackTech = await searchSessions(sessions, "5g", {
+        rgBinary: "missing-rg-agent-webui-test",
+        rgMinArchiveBytes: 0,
+      });
+      expect(acceleratedTech).toEqual(fallbackTech);
+      expect(acceleratedTech.matches).toEqual([
+        expect.objectContaining({ id: "indexed", lastMatchIndex: 0 }),
+      ]);
+      expect(techDiagnostics).toEqual([expect.objectContaining({
+        strategy: "content-index",
+        scannedArchiveBytes: 0,
+      })]);
+      const missingTechCandidates = await contentIndex.candidates(sessions.list(), "2g");
+      expect(missingTechCandidates.coveredPaths.size).toBe(1);
+      expect(missingTechCandidates.candidates).toEqual([]);
+
       await appendFile(path, `${JSON.stringify({
         type: "assistant",
         cwd: root,
         uuid: "a3",
-        message: { content: "加拿大旅行" },
+        message: { content: "加拿大旅行与4K视频" },
       })}\n`);
       const info = await stat(path);
       const updated = {
@@ -81,6 +106,16 @@ describe("persistent content search index", () => {
         scannedArchiveBytes: 0,
         indexCatchupFiles: 1,
       })]);
+      expect((await searchSessions(sessions, "4k", {
+        contentIndex,
+        rgMinArchiveBytes: Number.POSITIVE_INFINITY,
+      })).matches).toEqual([
+        expect.objectContaining({
+          id: "indexed",
+          lastMatchUuid: "a3",
+          lastMatchIndex: 3,
+        }),
+      ]);
     } finally {
       await contentIndex.close();
     }
@@ -98,7 +133,7 @@ describe("persistent content search index", () => {
       cwd: root,
       uuid: "large-record",
       message: {
-        content: `alpha 英国 ${"x".repeat(2 * 1024 * 1024)} beta`,
+        content: `alpha 英国 5G ${"x".repeat(2 * 1024 * 1024)} beta`,
       },
     })}\n`);
     const sessions = new SessionIndex({ claudeRoot, codexRoot });
@@ -115,6 +150,9 @@ describe("persistent content search index", () => {
         expect.objectContaining({ lineIndex: 0, byteOffset: 0 }),
       ]);
       expect((await contentIndex.stats()).unsupportedFiles).toBe(0);
+      expect((await contentIndex.candidates(sessions.list(), "5g")).candidates).toEqual([
+        expect.objectContaining({ lineIndex: 0, byteOffset: 0 }),
+      ]);
 
       const query = "alpha 英国 beta";
       const accelerated = await searchSessions(sessions, query, {
@@ -127,6 +165,16 @@ describe("persistent content search index", () => {
       });
       expect(accelerated).toEqual(fallback);
       expect(accelerated.matches).toEqual([
+        expect.objectContaining({
+          id: "oversized",
+          lastMatchUuid: "large-record",
+          lastMatchIndex: 0,
+        }),
+      ]);
+      expect((await searchSessions(sessions, "5g", {
+        contentIndex,
+        rgMinArchiveBytes: Number.POSITIVE_INFINITY,
+      })).matches).toEqual([
         expect.objectContaining({
           id: "oversized",
           lastMatchUuid: "large-record",

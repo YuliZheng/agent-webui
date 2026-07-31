@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { isForwardedSlashCommand, newSession, sendPrompt, type OutgoingImage } from "../api/sessions.js";
+import { WsError } from "../api/ws.js";
 import { useSessionsStore } from "../stores/sessions.js";
 import { useDraftsStore } from "../stores/drafts.js";
 import { useImageDraftsStore, type PendingImage } from "../stores/image-drafts.js";
@@ -17,6 +18,7 @@ import SlashCommandMenu from "./SlashCommandMenu.vue";
 import { useSessionSettingsStore } from "../stores/session-settings.js";
 import { promotePendingDraft } from "../stores/live.js";
 import { parseLocalCommand, runLocalCommand, latestContextUsage, HIDDEN_CLI_COMMANDS } from "../util/local-commands.js";
+import { idempotencyFingerprint } from "../util/idempotency.js";
 import { APP_BACK_PRIORITY, registerAppBackHandler } from "../util/app-back.js";
 import { setPwaLayerActive } from "../util/pwa-history.js";
 
@@ -47,14 +49,6 @@ function applyThinkingTrigger(text: string): string {
   return trig ? `${trimmed} ${trig}` : text;
 }
 
-function idempotencyFingerprint(value: string): string {
-  let hash = 0x811c9dc5;
-  for (let index = 0; index < value.length; index++) {
-    hash ^= value.charCodeAt(index);
-    hash = Math.imul(hash, 0x01000193);
-  }
-  return `${value.length}:${(hash >>> 0).toString(36)}`;
-}
 const notifications = useNotificationsStore();
 const ui = useUiStore();
 const lightbox = useLightboxStore();
@@ -157,6 +151,10 @@ function toggleAttachmentTray() {
   if (attachmentTrayOpen.value) {
     textareaRef.value?.blur();
     stopWechatComposerResize();
+    // The tray takes height away from the message scroller just like the
+    // software keyboard does. Ask the list to keep the latest message visible
+    // while Vue mounts the tray and the mobile viewport finishes reflowing.
+    emit("mobile-composer-focus");
   }
 }
 
@@ -359,13 +357,46 @@ function friendlySendError(err: unknown): string {
   if (err && typeof err === "object" && (err as { name?: string }).name === "AbortError") {
     return "Send timed out — refresh the page if SSO needs re-auth, then try again. Your text is kept.";
   }
+  if (err instanceof WsError && err.code === 0) {
+    if (/timed out/i.test(err.message)) {
+      return "Send confirmation timed out. The message may already have arrived; check the conversation before retrying. Your text is kept.";
+    }
+    return "The connection changed before send confirmation arrived. Your text is kept; check the conversation before retrying.";
+  }
   return err instanceof Error ? err.message : String(err);
 }
 
+function sendErrorTitle(err: unknown): string {
+  return err instanceof WsError && err.code === 0 ? "Send not confirmed" : "Send failed";
+}
+
 async function send() {
-  if (!canSend.value) return;
-  attachmentTrayOpen.value = false;
   const sid = props.sessionId;
+  // This lock is taken synchronously, before nextTick or provider metadata
+  // lookup. Button disabling alone cannot prevent a second Enter/click in the
+  // same render turn.
+  if (!canSend.value || drafts.isInflight(sid)) return;
+  drafts.beginInflight(sid);
+  try {
+    await sendOnce(sid);
+  } catch (err) {
+    notifications.pushError(friendlySendError(err), { title: sendErrorTitle(err) });
+  } finally {
+    drafts.endInflight(sessions.resolvePromoted(sid));
+    // Re-enabling the textarea after the in-flight window does NOT restore
+    // focus on its own — disabling a focused element blurs it, so the caret
+    // is lost and the user can't fire off a second message without clicking
+    // back in. Restore focus on desktop. Skip touch (would pop the on-screen
+    // keyboard), and bail if the user switched sessions mid-send.
+    if (isDesktopLike && sid === props.sessionId) {
+      await nextTick();
+      textareaRef.value?.focus();
+    }
+  }
+}
+
+async function sendOnce(sid: string) {
+  attachmentTrayOpen.value = false;
   // Webui-local control commands (/model, /context) branch off here: handled
   // in the browser, never sent to the agent. Only on a real session —
   // pending drafts have no id to control.
@@ -433,7 +464,6 @@ async function send() {
   }
   const slashCommands = await providerSlashCommandsFor(snapText, sid);
   const providerSlash = isForwardedSlashCommand(snapText, slashCommands);
-  drafts.beginInflight(sid);
   let dispatched = false;
   let clearedTextOnDispatch = false;
   let removedImagesOnDispatch: PendingImage[] = [];
@@ -510,18 +540,7 @@ async function send() {
     }
     // Drop the optimistic bubble so it doesn't linger pretending success.
     if (pendId) promptPending.remove(settledSid, pendId);
-    notifications.pushError(friendlySendError(err), { title: "Send failed" });
-  } finally {
-    drafts.endInflight(sessions.resolvePromoted(sid));
-    // Re-enabling the textarea after the in-flight window does NOT restore
-    // focus on its own — disabling a focused element blurs it, so the caret
-    // is lost and the user can't fire off a second message without clicking
-    // back in. Restore focus on desktop. Skip touch (would pop the on-screen
-    // keyboard), and bail if the user switched sessions mid-send.
-    if (isDesktopLike && sid === props.sessionId) {
-      await nextTick();
-      textareaRef.value?.focus();
-    }
+    notifications.pushError(friendlySendError(err), { title: sendErrorTitle(err) });
   }
 }
 
@@ -687,13 +706,12 @@ onBeforeUnmount(() => {
       class="hidden"
       @change="onFileInput"
     />
-    <!-- HyperOS 3 intercepts image-MIME document intents with its limited
-         privacy picker. Keep this action generic so Android can offer SAF;
-         ingestAttachmentBlob still rejects everything except images/PDFs. -->
+    <!-- Keep documents separate from the photo picker. PDF is the only
+         non-image attachment type supported by the composer. -->
     <input
       ref="browseInputRef"
       type="file"
-      accept="*/*"
+      accept="application/pdf"
       multiple
       class="hidden"
       @change="onFileInput"
@@ -778,7 +796,7 @@ onBeforeUnmount(() => {
           <button
             type="button"
             class="cw-cc-send"
-            :disabled="!canSend"
+            :disabled="!canSend || isInflightHere"
             @click="() => void send()"
             :title="running ? 'Send to queue' : 'Send'"
             aria-label="Send"
@@ -863,7 +881,7 @@ onBeforeUnmount(() => {
         v-if="showSendButton"
         type="button"
         @click="() => void send()"
-        :disabled="!canSend"
+        :disabled="!canSend || isInflightHere"
         class="cw-send-button shrink-0 h-9 px-4 rounded-lg bg-[var(--cw-accent)] text-[var(--cw-accent-text)] text-sm font-semibold hover:opacity-100 active:scale-95 transition disabled:opacity-50 disabled:cursor-not-allowed"
       >{{ sendLabel }}</button>
       <button

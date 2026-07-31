@@ -26,11 +26,18 @@ describe("token authentication", () => {
       mkdir(join(home, ".codex", "sessions"), { recursive: true }),
       mkdir(stateDir, { recursive: true }),
     ]);
-    const obsolete = ["content-search.sqlite", "content-search.sqlite-wal", "content-search.sqlite-shm"];
+    const obsolete = [
+      "content-search.sqlite",
+      "content-search.sqlite-wal",
+      "content-search.sqlite-shm",
+      "content-search-v5.sqlite",
+      "content-search-v5.sqlite-wal",
+      "content-search-v5.sqlite-shm",
+    ];
     await Promise.all(obsolete.map(name => writeFile(join(stateDir, name), "obsolete")));
     const app = await buildApp({ home, token: "a".repeat(64), startWatchers: false });
     apps.push(app);
-    await access(join(stateDir, "content-search-v5.sqlite"));
+    await access(join(stateDir, "content-search-v6.sqlite"));
     for (const name of obsolete) {
       await expect(access(join(stateDir, name))).rejects.toMatchObject({ code: "ENOENT" });
     }
@@ -178,6 +185,51 @@ describe("token authentication", () => {
       url: "/api/sessions/codex-image/input-image/1/1",
       headers: { cookie },
     })).statusCode).toBe(404);
+  });
+  it("serves only the owning Codex session's sandboxed inline visualization", async () => {
+    const home = await mkdtemp(join(tmpdir(), "agent-webui-inline-vis-"));
+    const claudeRoot = join(home, ".claude", "projects");
+    const codexRoot = join(home, ".codex", "sessions");
+    const datedSessions = join(codexRoot, "2026", "07", "28");
+    const visualizationRoot = join(
+      home,
+      ".codex",
+      "visualizations",
+      "2026",
+      "07",
+      "28",
+      "codex-vis",
+    );
+    await mkdir(claudeRoot, { recursive: true });
+    await mkdir(datedSessions, { recursive: true });
+    await mkdir(visualizationRoot, { recursive: true });
+    await writeFile(join(datedSessions, "rollout-codex-vis.jsonl"), `${JSON.stringify({
+      type: "session_meta",
+      payload: { id: "codex-vis", cwd: home },
+    })}\n`);
+    await writeFile(
+      join(visualizationRoot, "chart.html"),
+      "<div id=\"chart\">visualized</div><script>document.body.dataset.ready='yes'</script>",
+    );
+    await writeFile(join(visualizationRoot, "not-html.txt"), "nope");
+    const app = await buildApp({ home, token: "a".repeat(64), startWatchers: false });
+    apps.push(app);
+
+    const url = "/api/sessions/codex-vis/visualization/chart.html";
+    expect((await app.inject({ url })).statusCode).toBe(401);
+    const bind = await app.inject({ url: `/api/auth/bind?token=${"a".repeat(64)}` });
+    const cookie = String(bind.headers["set-cookie"]).split(";")[0]!;
+    const result = await app.inject({ url, headers: { cookie } });
+    expect(result.statusCode).toBe(200);
+    expect(result.headers["content-type"]).toContain("text/html");
+    expect(result.headers["content-security-policy"]).toContain("sandbox allow-scripts");
+    expect(result.body).toContain("visualized");
+    expect(result.body).toContain("--foreground: #111827");
+    expect(result.body).toContain("@media (prefers-color-scheme: dark)");
+    expect((await app.inject({
+      url: "/api/sessions/codex-vis/visualization/not-html.txt",
+      headers: { cookie },
+    })).statusCode).toBe(415);
   });
   it("returns an authenticated full-rollout Codex usage summary", async () => {
     const home = await mkdtemp(join(tmpdir(), "agent-webui-context-usage-"));

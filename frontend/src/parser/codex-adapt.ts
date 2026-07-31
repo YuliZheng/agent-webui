@@ -12,8 +12,10 @@
 //   - event_msg/turn_aborted → "[Request interrupted by user]" marker (parity
 //     with claude's interrupt), appended to the aborted turn
 //   - response_item/function_call (+ /function_call_output) → tool call pair
+//   - event_msg/task_complete with no final agent message → persistent empty-turn
+//     marker, so a failed turn does not silently stop after its last tool call
 //   - everything else (session_meta, turn_context, reasoning, response_item
-//     message duplicates, token_count, task_*) → dropped
+//     message duplicates, token_count, other task_*) → dropped
 //
 // function_call and its output are SEPARATE rollout records paired by call_id;
 // we emit a claude tool_use + tool_result with the same id and let groupTimeline
@@ -122,11 +124,57 @@ function claudeToolUse(callId: string, name: string, input: unknown): string {
   });
 }
 
-function claudeToolResult(callId: string, output: string): string {
+function claudeToolResult(callId: string, output: unknown): string {
   return JSON.stringify({
     type: "user",
     uuid: `${callId}:result`,
     message: { role: "user", content: [{ type: "tool_result", tool_use_id: callId, content: output }] },
+  });
+}
+
+function normalizedCodexToolOutput(output: unknown): unknown {
+  const candidate = (
+    output
+    && typeof output === "object"
+    && !Array.isArray(output)
+    && Array.isArray((output as { content?: unknown }).content)
+  )
+    ? (output as { content: unknown[] }).content
+    : output;
+  if (!Array.isArray(candidate)) {
+    const raw = typeof candidate === "string"
+      ? candidate
+      : typeof (candidate as { content?: unknown })?.content === "string"
+        ? (candidate as { content: string }).content
+        : JSON.stringify(candidate ?? "");
+    return cleanExecOutput(raw);
+  }
+  return candidate.map(raw => {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
+    const block = raw as Record<string, unknown>;
+    if (
+      (block.type === "input_text" || block.type === "output_text" || block.type === "text")
+      && typeof block.text === "string"
+    ) {
+      return { type: "text", text: cleanExecOutput(block.text) };
+    }
+    if (block.type === "input_image") {
+      const url = typeof block.image_url === "string"
+        ? block.image_url
+        : typeof block.imageUrl === "string" ? block.imageUrl : "";
+      const match = /^data:(image\/(?:png|jpe?g|gif|webp));base64,([a-z0-9+/]*={0,2})$/i.exec(url);
+      if (match?.[1] && match[2]) {
+        return {
+          type: "image",
+          source: {
+            type: "base64",
+            media_type: match[1].toLowerCase().replace("jpg", "jpeg"),
+            data: match[2],
+          },
+        };
+      }
+    }
+    return raw;
   });
 }
 
@@ -163,6 +211,20 @@ const adaptCache = new Map<string, string[]>();
 // grow it without limit. Overflow just clears and re-warms on the next pass.
 const ADAPT_CACHE_MAX = 50_000;
 
+function isCodexTaskStarted(rawLine: string): boolean {
+  if (!rawLine.includes("event_msg") || !rawLine.includes("task_started")) return false;
+  try {
+    const record = JSON.parse(rawLine) as { type?: unknown; payload?: { type?: unknown } };
+    return record.type === "event_msg" && record.payload?.type === "task_started";
+  } catch {
+    return false;
+  }
+}
+
+function isEmptyCompleteLine(line: string | undefined): boolean {
+  return typeof line === "string" && line.includes('"uuid":"empty-complete-');
+}
+
 function adaptLineCached(rawLine: string, lineIndex: number): string[] {
   const key = lineIndex + " " + rawLine;
   let out = adaptCache.get(key);
@@ -185,6 +247,12 @@ export function codexRolloutToClaudeLines(rawLines: string[]): string[] {
 
   rawLines.forEach((rawLine, lineIndex) => {
     if (!rawLine) return;
+    // A new Codex attempt (automatic or manual) supersedes the prior
+    // empty-completion marker. If the new attempt also ends empty, its own
+    // terminal marker remains, so repeated retries do not accumulate clutter.
+    if (isCodexTaskStarted(rawLine) && current && isEmptyCompleteLine(current.at(-1))) {
+      current.pop();
+    }
     const imageRecord = codexUserImageRecord(rawLine, lineIndex);
     if (imageRecord) pendingImages = imageRecord.pending;
     if (pendingImages && lineIndex - pendingImages.sourceLineIndex > 4) pendingImages = null;
@@ -235,6 +303,12 @@ export function codexToClaudeLines(rawLine: string, lineIndex?: number): string[
       // be dropped together with the turn it belongs to on rewind.
       return [claudeUser(stableId("abort", lineIndex), "[Request interrupted by user]")];
     }
+    if (p.type === "task_complete" && p.last_agent_message === null) {
+      return [claudeAssistantText(
+        stableId("empty-complete", lineIndex),
+        "Turn ended without a final response. Send another message to retry or continue.",
+      )];
+    }
     return [];
   }
 
@@ -252,10 +326,7 @@ export function codexToClaudeLines(rawLine: string, lineIndex?: number): string[
       return [claudeToolUse(callId, name, args)];
     }
     if (p.type === "function_call_output" && callId) {
-      const raw = typeof p.output === "string" ? p.output
-        : typeof (p.output as { content?: unknown })?.content === "string" ? (p.output as { content: string }).content
-        : JSON.stringify(p.output ?? "");
-      return [claudeToolResult(callId, cleanExecOutput(raw))];
+      return [claudeToolResult(callId, normalizedCodexToolOutput(p.output))];
     }
     // response_item/message (developer + injected env_context + assistant
     // duplicates) and reasoning are dropped — event_msg carries clean text.

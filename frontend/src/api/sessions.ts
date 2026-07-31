@@ -1,4 +1,6 @@
 import type {
+  AgentCapabilities,
+  AgentKind,
   CliInfoResult,
   CliInfoTopic,
   CodexGoal,
@@ -13,10 +15,12 @@ import { DEFAULT_FORWARDED_SLASH_COMMANDS as DEFAULT_SLASH_COMMANDS } from "@cla
 import { request, WsError } from "./ws.js";
 import type { ContextUsage } from "../util/local-commands.js";
 
-// Must exceed the backend's longest sync-RPC timeout (Codex rawRequest 20s,
-// Claude process write). At 30s the backend covers its 20s ceiling; a truly
-// stuck WS is independently caught by the pong heartbeat (~63s → reconnect).
-const PROMPT_TIMEOUT_MS = 30_000;
+// A cold Codex send can legitimately perform initialize + thread/resume +
+// turn/start serially (each has a 20s backend ceiling), with a short active-turn
+// readiness wait in between. Keep the browser deadline above that full chain;
+// otherwise the UI can report failure while the backend accepts the prompt a
+// few seconds later.
+const PROMPT_TIMEOUT_MS = 90_000;
 const CODEX_GOAL_TIMEOUT_MS = 60_000;
 // Long timeout for new-session: agent spawn + first-turn setup can take a
 // while on a cold start; a truly stuck socket is caught independently by the
@@ -167,8 +171,15 @@ export async function sendPrompt(
     "prompt",
     params,
     onDispatched
-      ? { timeoutMs: PROMPT_TIMEOUT_MS, onSent: onDispatched }
-      : { timeoutMs: PROMPT_TIMEOUT_MS },
+      ? {
+          timeoutMs: PROMPT_TIMEOUT_MS,
+          onSent: onDispatched,
+          ...(clientUuid ? { retryOnReconnect: true } : {}),
+        }
+      : {
+          timeoutMs: PROMPT_TIMEOUT_MS,
+          ...(clientUuid ? { retryOnReconnect: true } : {}),
+        },
   );
 }
 
@@ -242,8 +253,16 @@ export async function setSessionEffort(id: string, effort: string): Promise<void
   await request("set-effort", { sessionId: id, effort });
 }
 
-export async function setSessionServiceTier(id: string, serviceTier: "" | "priority"): Promise<void> {
-  await request("set-service-tier", { sessionId: id, serviceTier });
+export async function setSessionServiceTier(id: string, serviceTier: "" | "priority"): Promise<"next-turn"> {
+  const result = await request<{ applies: "next-turn" }>("set-service-tier", { sessionId: id, serviceTier });
+  return result.applies;
+}
+
+export async function getAgentCapabilities(agent: AgentKind, cwd?: string): Promise<AgentCapabilities> {
+  return request<AgentCapabilities>("get-agent-capabilities", {
+    agent,
+    ...(cwd ? { cwd } : {}),
+  });
 }
 
 // Read-only CLI info (/mcp, /status, /doctor, …). Backend may invoke the CLI,
@@ -347,17 +366,26 @@ export interface FullContextUsageResponse extends ContextUsage {
   compactionCount: number;
 }
 
+const SESSION_TAIL_TIMEOUT_MS = 8_000;
+
 // Fast initial-load: returns just the last `n` lines of a session jsonl.
 // Used on first visit to avoid streaming every line of long conversations
 // over WebSocket before paint.
 export async function readSessionTail(id: string, n: number): Promise<TailResponse> {
   const q = new URLSearchParams({ n: String(n) });
-  const res = await fetch(`/api/sessions/${encodeURIComponent(id)}/tail?${q.toString()}`, {
-    credentials: "include",
-    cache: "no-store",
-  });
-  if (!res.ok) throw new Error(`read tail failed: ${res.status}`);
-  return res.json() as Promise<TailResponse>;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SESSION_TAIL_TIMEOUT_MS);
+  try {
+    const res = await fetch(`/api/sessions/${encodeURIComponent(id)}/tail?${q.toString()}`, {
+      credentials: "include",
+      cache: "no-store",
+      signal: controller.signal,
+    });
+    if (!res.ok) throw new Error(`read tail failed: ${res.status}`);
+    return res.json() as Promise<TailResponse>;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 // Used by "Load earlier" to fetch a contiguous older index range.

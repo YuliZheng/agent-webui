@@ -10,12 +10,13 @@ import { scanClaudeFile, type SessionIndex } from "../services/session-index.js"
 import { searchableRecordPrefix, searchableRecordText } from "../services/search-text.js";
 import type { ClaudeDriver } from "../services/claude-driver.js";
 import type { CodexDriver, CodexThreadTurn } from "../services/codex-driver.js";
-import type { AppState } from "../services/state.js";
+import type { AppState, TitleEntry } from "../services/state.js";
 import { readRecordAt, streamJsonlLines } from "../services/jsonl.js";
 import {
   fallbackTitleEmoji,
   fallbackTopicSummary,
   normalizeTopicSummary,
+  SESSION_TITLE_TEXT_MAX_CHARS,
 } from "../services/session-title-generator.js";
 import {
   formatTitleRequestContext,
@@ -1343,51 +1344,81 @@ export async function autoTitleFromText(
   const prefs = await state.prefs.get();
   if (!force && !prefs.autoTitleEnabled) return existing?.title ?? "";
 
+  const sameTitleEntry = (
+    left: TitleEntry | undefined,
+    right: TitleEntry | undefined,
+  ): boolean => left?.title === right?.title
+    && left?.source === right?.source
+    && left?.emoji === right?.emoji
+    && left?.parentSessionId === right?.parentSessionId
+    && left?.topicSummary === right?.topicSummary;
+  const commitIfUnchanged = async (entry: TitleEntry): Promise<string> => {
+    if (!force && !(await state.prefs.get()).autoTitleEnabled) {
+      return (await state.titles.get())[sessionId]?.title ?? "";
+    }
+    const updated = await state.titles.update(all => {
+      // A manual rename, title clear, competing refresh, or session deletion
+      // that lands while the model is running must win over this stale result.
+      if (!index.get(sessionId) || !sameTitleEntry(all[sessionId], existing)) return;
+      all[sessionId] = {
+        ...entry,
+        ...(existing?.parentSessionId !== undefined
+          ? { parentSessionId: existing.parentSessionId }
+          : {}),
+      };
+    });
+    return updated[sessionId]?.title ?? "";
+  };
+
   // Both Claude and Codex sessions use the same tiny Codex structured-output
   // job. The generator is injected by buildApp so unit tests and offline
   // installations can fall through to the deterministic heuristic below.
   if (state.titleGenerator) {
     try {
       const generated = await state.titleGenerator({
-        text: text.trim().slice(0, 4_000),
+        text: text.trim().slice(0, SESSION_TITLE_TEXT_MAX_CHARS),
         language: prefs.autoTitleLanguage,
         ...(existing?.topicSummary ? { previousSummary: existing.topicSummary } : {}),
       });
       const topicSummary = normalizeTopicSummary(generated.summary)
         || fallbackTopicSummary(existing?.topicSummary, text);
-      await state.titles.update(all => {
-        all[sessionId] = {
-          title: generated.title,
-          emoji: generated.emoji,
-          source: "auto",
-          ...(topicSummary ? { topicSummary } : {}),
-        };
+      return commitIfUnchanged({
+        title: generated.title,
+        emoji: generated.emoji,
+        source: "auto",
+        ...(topicSummary ? { topicSummary } : {}),
       });
-      return generated.title;
     } catch (error) {
       console.error("Codex titler failed, falling back to heuristic", error instanceof Error ? error.message : error);
       /* fall through to heuristic fallback */
     }
   }
 
-  // Heuristic fallback: string-slice + language prefix
-  let base = text.replace(/\s+/g, " ").trim() || index.get(sessionId)?.preview || "Untitled session";
+  // Heuristic fallback: remove title-context scaffolding before slicing. If the
+  // model is unavailable, users should still see their actual task rather than
+  // a title such as "CONVERSATION-WIDE USER REQUEST SAMPLE".
+  const requestLines = text.split(/\r?\n/).flatMap(line => {
+    const match = line.match(/^(?:\d+\.|Context \d+:)\s*(.+)$/i);
+    return match?.[1]?.trim() ? [match[1].trim()] : [];
+  });
+  const legacyCurrent = text.match(/CURRENT REQUEST \(highest priority\):\s*\n([^\n]+)/i)?.[1]?.trim();
+  const fallbackText = requestLines.join(" ")
+    || legacyCurrent
+    || text.replace(/\s+/g, " ").trim();
+  let base = fallbackText || index.get(sessionId)?.preview || "Untitled session";
   const language = prefs.autoTitleLanguage.trim().toLocaleLowerCase();
   const identifiers = (base.match(/[A-Za-z_][A-Za-z0-9_.-]{2,}/g) ?? []).slice(0, 3).join(", ");
   if ((language === "中文" || language.startsWith("zh")) && !/[\u3400-\u9fff]/u.test(base)) base = `编程会话${identifiers ? `：${identifiers}` : ""}`;
   else if ((language === "english" || language.startsWith("en")) && /[\u3400-\u9fff]/u.test(base)) base = `Coding session${identifiers ? `: ${identifiers}` : ""}`;
   const title = base.length > 48 ? `${base.slice(0, 47)}…` : base;
-  const emoji = fallbackTitleEmoji(text);
-  const topicSummary = fallbackTopicSummary(existing?.topicSummary, text);
-  await state.titles.update(all => {
-    all[sessionId] = {
-      title,
-      emoji,
-      source: "auto",
-      ...(topicSummary ? { topicSummary } : {}),
-    };
+  const emoji = fallbackTitleEmoji(fallbackText);
+  const topicSummary = fallbackTopicSummary(existing?.topicSummary, fallbackText);
+  return commitIfUnchanged({
+    title,
+    emoji,
+    source: "auto",
+    ...(topicSummary ? { topicSummary } : {}),
   });
-  return title;
 }
 
 export async function autoTitle(index: SessionIndex, state: AppState, sessionId: string, force = false): Promise<string> {

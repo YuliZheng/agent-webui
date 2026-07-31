@@ -62,6 +62,7 @@ const usageFullScanRecords = ref<number | null>(null);
 const fullCompactionCount = ref<number | null>(null);
 const usageUsingFallback = ref(false);
 let loadSeq = 0;
+let usageLoadSeq = 0;
 let confirmTimer: ReturnType<typeof setTimeout> | undefined;
 let unregisterAppBack: (() => void) | undefined;
 
@@ -103,6 +104,9 @@ function closePage() {
 }
 
 function resetUsageBreakdown() {
+  // Invalidate any full-scan/range request that belongs to the previously
+  // selected session. The status sheet is reused as sessionId changes.
+  usageLoadSeq++;
   usageOlderLines.value = [];
   usageBackfillLoading.value = false;
   usageBackfillAttempted.value = false;
@@ -113,6 +117,10 @@ function resetUsageBreakdown() {
   usageFullScanRecords.value = null;
   fullCompactionCount.value = null;
   usageUsingFallback.value = false;
+}
+
+function usageRequestCurrent(seq: number, id: string): boolean {
+  return seq === usageLoadSeq && props.open && props.sessionId === id;
 }
 
 async function loadStatus() {
@@ -144,6 +152,7 @@ async function loadStatus() {
 async function loadCodexUsageBreakdown(): Promise<void> {
   if (!isCodex.value || usageBackfillLoading.value) return;
   if (usageBackfillAttempted.value && !usageBackfillError.value) return;
+  const seq = ++usageLoadSeq;
   const id = props.sessionId;
   const entry = sessionCache.bySession[id];
   if (!id || !entry) return;
@@ -154,12 +163,14 @@ async function loadCodexUsageBreakdown(): Promise<void> {
   try {
     try {
       const full = await readFullCodexContextUsage(id, prefs.codexAutoCompactWindow);
+      if (!usageRequestCurrent(seq, id)) return;
       fullCodexUsage.value = full;
       usageFullScanRecords.value = full.recordsScanned;
       fullCompactionCount.value = full.compactionCount;
       usageBackfillAttempted.value = true;
       return;
     } catch {
+      if (!usageRequestCurrent(seq, id)) return;
       // Keep the bounded range fallback until the user restarts the currently
       // running backend into the build that provides the full-scan endpoint.
       usageUsingFallback.value = true;
@@ -174,6 +185,7 @@ async function loadCodexUsageBreakdown(): Promise<void> {
     const from = Math.max(0, to - USAGE_BACKFILL_MAX_LINES);
     usageBackfillFrom.value = from;
     const response = await readSessionRange(id, from, to);
+    if (!usageRequestCurrent(seq, id)) return;
     usageOlderLines.value = response.lines.filter(
       (line): line is LineEntry => Number.isSafeInteger(line.index) && typeof line.raw === "string" && !!line.raw,
     );
@@ -184,10 +196,11 @@ async function loadCodexUsageBreakdown(): Promise<void> {
     usageBackfillTruncated.value = to > from && lastReturnedIndex < to - 1;
     usageBackfillAttempted.value = true;
   } catch (error) {
+    if (!usageRequestCurrent(seq, id)) return;
     usageBackfillAttempted.value = true;
     usageBackfillError.value = error instanceof Error ? error.message : String(error);
   } finally {
-    usageBackfillLoading.value = false;
+    if (usageRequestCurrent(seq, id)) usageBackfillLoading.value = false;
   }
 }
 
@@ -229,6 +242,7 @@ watch(
       void loadCodexUsageBreakdown();
     } else {
       loadSeq++;
+      usageLoadSeq++;
       window.removeEventListener("keydown", onKeydown);
     }
   },
@@ -236,6 +250,7 @@ watch(
 );
 
 onBeforeUnmount(() => {
+  usageLoadSeq++;
   unregisterAppBack?.();
   resetKillConfirmation();
   window.removeEventListener("keydown", onKeydown);

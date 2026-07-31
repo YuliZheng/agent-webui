@@ -149,6 +149,13 @@ interface State {
   // signal — the jsonl is silent for the whole compact, so this is the only
   // way to render "Compacting…" instead of generic thinking dots).
   compactingBySession: Record<string, boolean>;
+  capacityRetryBySession: Record<string, {
+    turnId: string;
+    attempt: number;
+    maxAttempts: number;
+    delayMs: number;
+    retryAt: string;
+  }>;
   // Set of sessions that are currently being (re)titled by the backend,
   // either via periodic auto-retitle or a user-clicked Auto button. Used
   // by SessionRow to render the same "⟳ Retitling…" spinner regardless of
@@ -172,6 +179,11 @@ interface State {
   lastError: string | null;
   loaded: boolean;
   syncInFlight: number;
+  /** Monotonic local metadata-event revision used to reject stale list snapshots. */
+  metadataRevision: number;
+  revisionBySession: Record<string, number>;
+  /** Latest list request generation; older HTTP responses are ignored. */
+  fetchGeneration: number;
 }
 
 let draftCounter = 0;
@@ -182,6 +194,53 @@ function nextDraftId(): string {
 
 function byMtimeDesc(a: SessionListItem, b: SessionListItem): number {
   return Date.parse(b.mtime) - Date.parse(a.mtime);
+}
+
+function validTime(value: string | null | undefined): number {
+  const parsed = value ? Date.parse(value) : Number.NaN;
+  return Number.isFinite(parsed) ? parsed : Number.NEGATIVE_INFINITY;
+}
+
+function compareSessionRecency(
+  existing: SessionListItem,
+  incoming: SessionListItem,
+): -1 | 0 | 1 {
+  // Draft promotion and fork navigation can insert a synthetic empty row with
+  // a client-side "now" before the authoritative watcher/list item arrives.
+  // Its clock can be a few milliseconds ahead of the file's mtime, so let the
+  // first non-empty file record replace it even when that timestamp is older.
+  if (existing.size === 0 && !existing.preview && incoming.size > 0) return 1;
+
+  const incomingTime = validTime(incoming.mtime);
+  const existingTime = validTime(existing.mtime);
+  if (incomingTime !== existingTime) return incomingTime > existingTime ? 1 : -1;
+
+  // Appends can share an mtime at the filesystem/API timestamp resolution.
+  // For the same mtime, the larger append-only file is the newer snapshot.
+  if (incoming.size !== existing.size) return incoming.size > existing.size ? 1 : -1;
+  return 0;
+}
+
+export function mergeSessionListItem(
+  existing: SessionListItem,
+  incoming: SessionListItem,
+  preserveExistingRecency = false,
+): SessionListItem {
+  const recency = compareSessionRecency(existing, incoming);
+  const shouldPreserve = recency < 0
+    || (preserveExistingRecency && recency === 0);
+  if (!shouldPreserve) return { ...existing, ...incoming };
+  return {
+    ...existing,
+    ...incoming,
+    // Titles/settings from a snapshot can still be useful, but an older
+    // snapshot/event must never roll the visible latest-message metadata back.
+    mtime: existing.mtime,
+    size: existing.size,
+    preview: existing.preview ?? null,
+    lastTurnAt: existing.lastTurnAt ?? null,
+    lastBoundaryAt: existing.lastBoundaryAt ?? null,
+  };
 }
 
 export const useSessionsStore = defineStore("sessions", {
@@ -196,6 +255,7 @@ export const useSessionsStore = defineStore("sessions", {
       statusBySession: {},
       webuiAliveBySession: {},
       compactingBySession: {},
+      capacityRetryBySession: {},
       retitlingBySession: {},
       goalBySession: {},
       unreadBySession: loadUnreadFromStorage(),
@@ -204,6 +264,9 @@ export const useSessionsStore = defineStore("sessions", {
       lastError: null,
       loaded: false,
       syncInFlight: 0,
+      metadataRevision: 0,
+      revisionBySession: {},
+      fetchGeneration: 0,
     };
   },
   getters: {
@@ -219,7 +282,7 @@ export const useSessionsStore = defineStore("sessions", {
   actions: {
     // Hydrate from a pre-fetched list (e.g. window.__BOOT__.sessions baked
     // into the HTML by the backend). Skips the RPC roundtrip on first load.
-    hydrateList(list: SessionListItem[]) {
+    hydrateList(list: SessionListItem[], preserveAfterRevision?: number) {
       // Re-attach pending drafts: the backend list only knows real jsonl
       // sessions, but drafts live client-side and must survive refreshes.
       // Keep the existing row object when present so in-place edits (e.g.
@@ -227,7 +290,25 @@ export const useSessionsStore = defineStore("sessions", {
       const draftItems = Object.entries(this.pendingDrafts).map(
         ([id, d]) => this.byId[id] ?? draftListItem(id, d),
       );
-      const sorted = [...list, ...draftItems].sort(byMtimeDesc);
+      const backendIds = new Set(list.map(item => item.id));
+      const mergedBackend = list.flatMap(item => {
+        const existing = this.byId[item.id];
+        const changedAfterRequest = preserveAfterRevision !== undefined
+          && (this.revisionBySession[item.id] ?? 0) > preserveAfterRevision;
+        // A delete that happened after this request started leaves a revision
+        // tombstone but no row. Do not resurrect it from the stale response.
+        if (!existing && changedAfterRequest) return [];
+        return [existing
+          ? mergeSessionListItem(existing, item, changedAfterRequest)
+          : item];
+      });
+      const liveOnly = preserveAfterRevision === undefined
+        ? []
+        : this.list.filter(item =>
+          !(item.id in this.pendingDrafts)
+          && !backendIds.has(item.id)
+          && (this.revisionBySession[item.id] ?? 0) > preserveAfterRevision);
+      const sorted = [...mergedBackend, ...liveOnly, ...draftItems].sort(byMtimeDesc);
       this.list = sorted;
       this.byId = Object.fromEntries(sorted.map((s) => [s.id, s]));
       for (const s of sorted) {
@@ -250,22 +331,34 @@ export const useSessionsStore = defineStore("sessions", {
     },
     async fetchAll() {
       this.syncInFlight++;
+      const generation = ++this.fetchGeneration;
+      const startedAtRevision = this.metadataRevision;
       try {
         const list = await listSessions();
-        this.hydrateList(list);
+        if (generation === this.fetchGeneration) {
+          this.hydrateList(list, startedAtRevision);
+        }
       } catch (err) {
-        this.lastError = (err as Error).message;
+        if (generation === this.fetchGeneration) {
+          this.lastError = (err as Error).message;
+        }
       } finally {
         this.syncInFlight = Math.max(0, this.syncInFlight - 1);
       }
     },
     addOrTouch(item: SessionListItem) {
       const existing = this.byId[item.id];
+      const acceptedRecency = !existing
+        || compareSessionRecency(existing, item) >= 0;
       if (existing) {
-        Object.assign(existing, item);
+        Object.assign(existing, mergeSessionListItem(existing, item));
       } else {
         this.byId[item.id] = item;
         this.list.push(item);
+      }
+      if (acceptedRecency) {
+        this.metadataRevision += 1;
+        this.revisionBySession[item.id] = this.metadataRevision;
       }
       this.list.sort(byMtimeDesc);
       const row = this.byId[item.id];
@@ -273,6 +366,7 @@ export const useSessionsStore = defineStore("sessions", {
     },
     setStatus(id: string, status: Status | null, webuiAlive: boolean, compacting?: boolean) {
       this.statusBySession[id] = status;
+      if (status !== "running") delete this.capacityRetryBySession[id];
       if (webuiAlive) this.webuiAliveBySession[id] = true;
       else delete this.webuiAliveBySession[id];
       if (compacting) this.compactingBySession[id] = true;
@@ -286,6 +380,16 @@ export const useSessionsStore = defineStore("sessions", {
       this.statusBySession = {};
       this.webuiAliveBySession = {};
       this.compactingBySession = {};
+      this.capacityRetryBySession = {};
+    },
+    setCapacityRetry(id: string, retry: {
+      turnId: string;
+      attempt: number;
+      maxAttempts: number;
+      delayMs: number;
+      retryAt: string;
+    }) {
+      this.capacityRetryBySession[id] = retry;
     },
     setTitle(id: string, title: string | null, source?: "auto" | "manual" | null, emoji?: string | null) {
       const e = this.byId[id];
@@ -356,10 +460,13 @@ export const useSessionsStore = defineStore("sessions", {
       let unreadChanged = false;
       let draftsChanged = false;
       for (const id of ids) {
+        this.metadataRevision += 1;
+        this.revisionBySession[id] = this.metadataRevision;
         delete this.byId[id];
         delete this.statusBySession[id];
         delete this.webuiAliveBySession[id];
         delete this.compactingBySession[id];
+        delete this.capacityRetryBySession[id];
         delete this.goalBySession[id];
         if (id in this.unreadBySession) { delete this.unreadBySession[id]; unreadChanged = true; }
         if (id in this.pendingDrafts) { delete this.pendingDrafts[id]; draftsChanged = true; }

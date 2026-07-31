@@ -343,10 +343,74 @@ describe("session mutations/search/export", () => {
     expect(jsonlIndexIoCounters()).toEqual({ fullBytes: 0, appendedBytes: 0 });
     expect(state.titleGenerator).toHaveBeenCalledWith({
       text: expect.stringMatching(
-        /^CURRENT REQUEST \(highest priority\):\nlarge historical prompt/,
+        /^CONVERSATION-WIDE USER REQUEST SAMPLE[\s\S]*large historical prompt/,
       ),
       language: "auto",
       previousSummary: "Improve the streaming watcher without reading full transcripts.",
     });
+
+    vi.mocked(state.titleGenerator).mockRejectedValueOnce(new Error("titler unavailable"));
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    await expect(autoTitle(index, state, "session", true)).resolves.toBe("large historical prompt");
+    errorLog.mockRestore();
+
+    let finishTitle: ((value: {
+      title: string;
+      emoji: string;
+      summary: string;
+    }) => void) | undefined;
+    state.titleGenerator = vi.fn(() => new Promise(resolve => {
+      finishTitle = resolve;
+    }));
+    const delayedAutoTitle = autoTitleFromText(
+      index,
+      state,
+      "session",
+      "Generate a stale automatic title",
+      true,
+    );
+    await vi.waitFor(() => expect(state.titleGenerator).toHaveBeenCalledOnce());
+    await state.titles.update(all => {
+      all.session = { title: "User manual title", source: "manual", emoji: "✍️" };
+    });
+    finishTitle?.({
+      title: "Stale generated title",
+      emoji: "🤖",
+      summary: "This result must not overwrite a later manual rename.",
+    });
+    await expect(delayedAutoTitle).resolves.toBe("User manual title");
+    expect((await state.titles.get()).session).toEqual({
+      title: "User manual title",
+      source: "manual",
+      emoji: "✍️",
+    });
+
+    await state.titles.update(all => {
+      all.session = { title: "Existing automatic title", source: "auto" };
+    });
+    await state.prefs.update(prefs => {
+      prefs.autoTitleEnabled = true;
+    });
+    finishTitle = undefined;
+    state.titleGenerator = vi.fn(() => new Promise(resolve => {
+      finishTitle = resolve;
+    }));
+    const disabledWhileRunning = autoTitleFromText(
+      index,
+      state,
+      "session",
+      "Do not commit after auto-title is disabled",
+    );
+    await vi.waitFor(() => expect(state.titleGenerator).toHaveBeenCalledOnce());
+    await state.prefs.update(prefs => {
+      prefs.autoTitleEnabled = false;
+    });
+    finishTitle?.({
+      title: "Late disabled title",
+      emoji: "⏰",
+      summary: "This result must be discarded.",
+    });
+    await expect(disabledWhileRunning).resolves.toBe("Existing automatic title");
+    expect((await state.titles.get()).session?.title).toBe("Existing automatic title");
   });
 });

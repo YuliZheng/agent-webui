@@ -9,6 +9,11 @@ import { rephrasePrompt } from "../../api/sessions.js";
 import { useUiStore } from "../../stores/ui.js";
 import { useDraftsStore } from "../../stores/drafts.js";
 import { useNotificationsStore } from "../../stores/notifications.js";
+import { splitInlineVisualizations } from "../../util/inline-visualization.js";
+import { extractToolResultImages } from "../../util/tool-result-images.js";
+import InlineVisualization from "./InlineVisualization.vue";
+import ChatImage from "./ChatImage.vue";
+import { useLightboxStore } from "../../stores/lightbox.js";
 
 const props = defineProps<{
   node: Extract<TimelineNode, { kind: "event" }>;
@@ -16,8 +21,15 @@ const props = defineProps<{
 const ui = useUiStore();
 const drafts = useDraftsStore();
 const notifications = useNotificationsStore();
+const lightbox = useLightboxStore();
 
-interface Item { kind: "text" | "tool" | "thinking"; text?: string; pair?: ToolPair }
+interface Item {
+  kind: "text" | "tool" | "thinking" | "visualization" | "image";
+  text?: string;
+  pair?: ToolPair;
+  file?: string;
+  url?: string;
+}
 
 interface Usage {
   input_tokens?: number;
@@ -37,10 +49,21 @@ const items = computed<Item[]>(() => {
   let useIdx = 0;
   for (const b of m) {
     const o = b as any;
-    if (o?.type === "text") out.push({ kind: "text", text: o.text ?? "" });
+    if (o?.type === "text") {
+      for (const part of splitInlineVisualizations(o.text ?? "")) {
+        out.push(part.kind === "text"
+          ? { kind: "text", text: part.text }
+          : { kind: "visualization", file: part.file });
+      }
+    }
     else if (o?.type === "tool_use") {
       const pair = props.node.toolPairs?.[useIdx++];
-      if (pair) out.push({ kind: "tool", pair });
+      if (pair) {
+        out.push({ kind: "tool", pair });
+        for (const image of extractToolResultImages(pair.result)) {
+          out.push({ kind: "image", url: image.url });
+        }
+      }
     }
     // Skip signature-only thinking blocks (thinking:"") — they'd render a
     // pointless "Thinking… (0 chars)" row.
@@ -180,6 +203,21 @@ watch(dark, () => rehighlight(), { flush: "post" });
         v-html="renderMarkdown(it.text || '')"
       />
       <ToolCall v-else-if="it.kind === 'tool' && it.pair" :pair="it.pair" />
+      <InlineVisualization
+        v-else-if="it.kind === 'visualization' && it.file && ui.selectedSessionId"
+        :session-id="ui.selectedSessionId"
+        :file="it.file"
+      />
+      <div
+        v-else-if="it.kind === 'image' && it.url"
+        class="cw-assistant-image-bubble px-4 py-2 border-l-4 border-[var(--cw-success)] bg-[color-mix(in_srgb,var(--cw-success)_8%,transparent)]"
+      >
+        <ChatImage
+          :src="it.url"
+          alt="Generated image"
+          @open="lightbox.open(it.url || '', 'Generated image')"
+        />
+      </div>
     </template>
   </div>
 </template>

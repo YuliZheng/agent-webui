@@ -195,12 +195,12 @@ export class ClaudeDriver extends EventEmitter {
       const line = proc.buffer.slice(0, newline).trim(); proc.buffer = proc.buffer.slice(newline + 1);
       if (!line) continue;
       let event: Record<string, unknown> | null = null;
-      try { event = asRecord(JSON.parse(line)); } catch { this.emit("error", { sessionId: proc.sessionId, message: "Malformed Claude stream record" }); }
+      try { event = asRecord(JSON.parse(line)); } catch { this.emit("driver-error", { sessionId: proc.sessionId, message: "Malformed Claude stream record" }); }
       if (event) this.handle(proc, event);
     }
     if (proc.buffer.length > 4 * 1024 * 1024) {
       proc.buffer = "";
-      this.emit("error", { sessionId: proc.sessionId, message: "Claude produced an oversized unframed response; stream buffer was reset" });
+      this.emit("driver-error", { sessionId: proc.sessionId, message: "Claude produced an oversized unframed response; stream buffer was reset" });
     }
   }
 

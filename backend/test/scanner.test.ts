@@ -419,6 +419,89 @@ describe("session scanning", () => {
     expect(index.get("partial_append")?.lastTurnAt).toBe("2026-01-02T00:00:00Z");
   });
 
+  it("uses a newer user request instead of retaining an older assistant preview", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-webui-refresh-user-preview-"));
+    const claudeRoot = join(root, "claude");
+    const codexRoot = join(root, "codex");
+    await mkdir(claudeRoot);
+    await mkdir(codexRoot);
+    const session = join(claudeRoot, "latest_user.jsonl");
+    await writeFile(session, `${JSON.stringify({
+      type: "assistant",
+      cwd: root,
+      timestamp: "2026-01-01T00:00:00Z",
+      message: { content: "older assistant answer" },
+    })}\n`);
+    const index = new SessionIndex({ claudeRoot, codexRoot });
+    await index.scan();
+    await appendFile(session, `${JSON.stringify({
+      type: "user",
+      cwd: root,
+      timestamp: "2026-01-02T00:00:00Z",
+      message: { content: "newest user request" },
+    })}\n`);
+    await (index as unknown as { refreshPath(path: string): Promise<void> }).refreshPath(session);
+    expect(index.get("latest_user")?.preview).toBe("newest user request");
+    expect(index.get("latest_user")?.lastTurnAt).toBe("2026-01-02T00:00:00Z");
+  });
+
+  it("rescans once when another append arrives during an in-flight refresh", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-webui-refresh-coalesced-"));
+    const claudeRoot = join(root, "claude");
+    const codexRoot = join(root, "codex");
+    await mkdir(claudeRoot);
+    await mkdir(codexRoot);
+    const session = join(claudeRoot, "coalesced_append.jsonl");
+    await writeFile(session, `${JSON.stringify({
+      type: "assistant",
+      cwd: root,
+      timestamp: "2026-01-01T00:00:00Z",
+      message: { content: "old answer" },
+    })}\n`);
+    const index = new SessionIndex({ claudeRoot, codexRoot });
+    await index.scan();
+    const internals = index as unknown as {
+      refreshPath(path: string): Promise<void>;
+      refreshPathOnce(path: string, attempt: number): Promise<void>;
+    };
+    const originalRefreshOnce = internals.refreshPathOnce.bind(index);
+    let releaseFirst!: () => void;
+    let markFirstApplied!: () => void;
+    const firstApplied = new Promise<void>(resolve => { markFirstApplied = resolve; });
+    const holdFirst = new Promise<void>(resolve => { releaseFirst = resolve; });
+    let refreshCount = 0;
+    internals.refreshPathOnce = async (path, attempt) => {
+      refreshCount++;
+      await originalRefreshOnce(path, attempt);
+      if (refreshCount === 1) {
+        markFirstApplied();
+        await holdFirst;
+      }
+    };
+
+    await appendFile(session, `${JSON.stringify({
+      type: "assistant",
+      cwd: root,
+      timestamp: "2026-01-02T00:00:00Z",
+      message: { content: "first append" },
+    })}\n`);
+    const firstRefresh = internals.refreshPath(session);
+    await firstApplied;
+    await appendFile(session, `${JSON.stringify({
+      type: "assistant",
+      cwd: root,
+      timestamp: "2026-01-03T00:00:00Z",
+      message: { content: "second append" },
+    })}\n`);
+    const coalescedRefresh = internals.refreshPath(session);
+    releaseFirst();
+    await Promise.all([firstRefresh, coalescedRefresh]);
+
+    expect(refreshCount).toBe(2);
+    expect(index.get("coalesced_append")?.preview).toBe("second append");
+    expect(index.get("coalesced_append")?.lastTurnAt).toBe("2026-01-03T00:00:00Z");
+  });
+
   it("caps hot append preview work while still finding the latest bounded-tail message", async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-webui-refresh-capped-"));
     const claudeRoot = join(root, "claude");
@@ -490,6 +573,7 @@ describe("session scanning", () => {
     await writeFile(codex, [
       JSON.stringify({ timestamp: "2026-07-23T00:00:00.000Z", type: "session_meta", payload: { id: "codex_preview", cwd: root } }),
       JSON.stringify({ timestamp: "2026-07-23T00:00:01.000Z", type: "response_item", payload: { type: "message", role: "developer", content: [{ type: "text", text: "hidden developer instructions" }] } }),
+      JSON.stringify({ timestamp: "2026-07-23T00:00:01.500Z", type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "older assistant answer" }] } }),
       JSON.stringify({ timestamp: "2026-07-23T00:00:02.000Z", type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "visible user request" }] } }),
       "",
     ].join("\n"));
