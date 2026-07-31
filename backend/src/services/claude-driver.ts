@@ -124,7 +124,7 @@ export class ClaudeDriver extends EventEmitter {
         try { process.kill(pid, 0); } catch { continue; }
         if (this.owned.get(sessionId)?.child.pid === pid) continue;
         // On Linux, reject a stale registration if its recorded /proc start tick differs.
-        if (process.platform !== "win32" && value?.startTime !== undefined) {
+        if (process.platform === "linux" && value?.startTime !== undefined) {
           try {
             const statLine = await readFile(`/proc/${pid}/stat`, "utf8");
             const actual = statLine.slice(statLine.lastIndexOf(")") + 2).split(" ")[19];

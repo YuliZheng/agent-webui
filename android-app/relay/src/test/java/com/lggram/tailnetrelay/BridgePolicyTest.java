@@ -12,6 +12,8 @@ public final class BridgePolicyTest {
 
         assertTrue(pac.contains("target === \"" + RelayPolicy.ALLOWED_DOMAIN + "\""));
         assertTrue(pac.contains("target === \"" + RelayPolicy.TARGET_TAILNET_IP + "\""));
+        assertTrue(pac.contains("target === \"" + RelayTarget.MACBOOK.domain + "\""));
+        assertTrue(pac.contains("target === \"" + RelayTarget.MACBOOK.tailnetIp + "\""));
         assertTrue(pac.contains(
                 "PROXY " + BridgePolicy.LISTEN_HOST + ":" + BridgePolicy.LISTEN_PORT));
         assertTrue(pac.contains("return \"DIRECT\""));
@@ -33,6 +35,8 @@ public final class BridgePolicyTest {
     public void connectPolicyReusesTheNarrowWorkRelayAllowlist() {
         assertTrue(BridgePolicy.isAllowedConnectTarget(RelayPolicy.ALLOWED_DOMAIN, 443));
         assertTrue(BridgePolicy.isAllowedConnectTarget(RelayPolicy.TARGET_TAILNET_IP, 443));
+        assertTrue(BridgePolicy.isAllowedConnectTarget(RelayTarget.MACBOOK.domain, 443));
+        assertTrue(BridgePolicy.isAllowedConnectTarget(RelayTarget.MACBOOK.tailnetIp, 443));
         assertFalse(BridgePolicy.isAllowedConnectTarget("example.com", 443));
         assertFalse(BridgePolicy.isAllowedConnectTarget(RelayPolicy.ALLOWED_DOMAIN, 80));
     }

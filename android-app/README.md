@@ -37,18 +37,14 @@ updates incompatible with an already installed copy.
 The `relay` module builds one package that chooses its role from the Android
 profile where it runs:
 
-- the managed work profile exposes a loopback-only SOCKS5 relay on
-  `127.0.0.1:38483` and permits only the Agent WebUI host on port 443;
-- the personal owner profile exposes a loopback-only PAC/HTTP CONNECT bridge on
-  `127.0.0.1:38484`, with its PAC at
-  `http://127.0.0.1:38484/proxy.pac`, and advertises that PAC to Chrome through
-  a Chrome-only split `VpnService`;
-- all other destinations are `DIRECT` in the PAC and are rejected by the
-  bridge itself.
+- the managed work profile runs the only foreground service and exposes a
+  loopback-only SOCKS5 listener on `127.0.0.1:38483`;
+- that same service exposes fixed-origin Web bridges for the Windows Agent at
+  `127.0.0.1:38484` and `agent-macbook` at `127.0.0.1:38485`;
+- the personal owner profile is only a launcher for those two localhost URLs,
+  so it occupies no VPN slot and can coexist with personal-profile FlClash;
+- only the two configured Agent WebUI HTTPS hosts are accepted by the SOCKS,
+  CONNECT, and reverse-proxy paths.
 
-Both roles are foreground services, restart after boot, and share no public
-listener. The personal bridge reaches the work-profile SOCKS listener through
-Android's shared loopback network. Its Chrome-only VPN occupies the personal
-profile's VPN slot, while work-profile Tailscale continues in the work profile's
-separate slot. Stop the personal Agent Bridge before starting a personal-profile
-VPN such as FlClash; start Agent Bridge when FlClash is not in use.
+Keep the work-profile Tailnet Relay and work-profile Tailscale running. The
+service restarts after boot and has no public listener.

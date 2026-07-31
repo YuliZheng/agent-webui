@@ -70,7 +70,7 @@ describe("Claude process registration observer", () => {
     expect(events).toEqual([]);
   });
 
-  it.runIf(process.platform !== "win32")("rejects a reused PID when the recorded process start tick differs", async () => {
+  it.runIf(process.platform === "linux")("rejects a reused PID when the recorded process start tick differs", async () => {
     const { directory, observer } = await fixture();
     const events: ForeignClaudeObservation[] = [];
     observer.on("changed", event => events.push(event));

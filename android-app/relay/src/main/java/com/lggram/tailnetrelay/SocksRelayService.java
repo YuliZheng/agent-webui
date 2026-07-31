@@ -33,28 +33,35 @@ public final class SocksRelayService extends Service {
 
     private static final AtomicBoolean RUNNING = new AtomicBoolean(false);
     private static final AtomicBoolean SOCKS_LISTENING = new AtomicBoolean(false);
-    private static final AtomicBoolean WEB_LISTENING = new AtomicBoolean(false);
+    private static final AtomicInteger WEB_LISTENERS = new AtomicInteger(0);
     private static final AtomicInteger ACTIVE_CONNECTIONS = new AtomicInteger(0);
     private static final AtomicLong TOTAL_CONNECTIONS = new AtomicLong(0);
     private static volatile String lastError = "";
 
-    private final ExecutorService acceptExecutor = Executors.newFixedThreadPool(2);
+    private final ExecutorService acceptExecutor = Executors.newFixedThreadPool(3);
     private final ExecutorService connectionExecutor = Executors.newCachedThreadPool();
-    private final ReverseProxyServer webBridge = new ReverseProxyServer(
-            acceptExecutor,
-            connectionExecutor,
-            new ReverseProxyServer.Events() {
+    private final ReverseProxyServer windowsWebBridge = createWebBridge(RelayTarget.WINDOWS);
+    private final ReverseProxyServer macbookWebBridge = createWebBridge(RelayTarget.MACBOOK);
+    private final ReverseProxyServer[] webBridges = { windowsWebBridge, macbookWebBridge };
+    private volatile ServerSocket socksServerSocket;
+
+    private ReverseProxyServer createWebBridge(RelayTarget target) {
+        return new ReverseProxyServer(
+                acceptExecutor,
+                connectionExecutor,
+                target,
+                new ReverseProxyServer.Events() {
                 @Override
                 public void onListening() {
-                    WEB_LISTENING.set(true);
+                    WEB_LISTENERS.incrementAndGet();
                     Log.i(TAG, "Web bridge listening on " + BridgePolicy.LISTEN_HOST + ":"
-                            + BridgePolicy.LISTEN_PORT);
+                            + target.bridgePort + " for " + target.domain);
                     refreshNotification();
                 }
 
                 @Override
                 public void onStopped() {
-                    WEB_LISTENING.set(false);
+                    WEB_LISTENERS.updateAndGet(count -> Math.max(0, count - 1));
                     refreshNotification();
                 }
 
@@ -70,13 +77,15 @@ public final class SocksRelayService extends Service {
 
                 @Override
                 public void onError(String context, IOException error) {
-                    recordError(context, error);
+                    recordError(target.displayName + " " + context, error);
                 }
             });
-    private volatile ServerSocket socksServerSocket;
+    }
 
     static boolean isRunning() {
-        return RUNNING.get() && SOCKS_LISTENING.get() && WEB_LISTENING.get();
+        return RUNNING.get()
+                && SOCKS_LISTENING.get()
+                && WEB_LISTENERS.get() == RelayTarget.ALL.size();
     }
 
     static int activeConnections() {
@@ -123,7 +132,7 @@ public final class SocksRelayService extends Service {
             lastError = "";
             startSocksListener();
         }
-        webBridge.start();
+        for (ReverseProxyServer webBridge : webBridges) webBridge.start();
     }
 
     private void startSocksListener() {
@@ -162,7 +171,8 @@ public final class SocksRelayService extends Service {
             SocksProtocol.Request request = SocksProtocol.negotiate(
                     localClient.getInputStream(),
                     localClient.getOutputStream());
-            if (!RelayPolicy.isAllowed(request.host, request.port)) {
+            RelayTarget target = RelayPolicy.targetFor(request.host, request.port);
+            if (target == null) {
                 SocksProtocol.writeReply(
                         localClient.getOutputStream(),
                         SocksProtocol.REPLY_NOT_ALLOWED);
@@ -173,8 +183,8 @@ public final class SocksRelayService extends Service {
             try (Socket tailnet = new Socket()) {
                 tailnet.setTcpNoDelay(true);
                 tailnet.connect(new InetSocketAddress(
-                        RelayPolicy.TARGET_TAILNET_IP,
-                        RelayPolicy.TARGET_PORT), CONNECT_TIMEOUT_MS);
+                        target.domain,
+                        target.targetPort), CONNECT_TIMEOUT_MS);
                 SocksProtocol.writeReply(
                         localClient.getOutputStream(),
                         SocksProtocol.REPLY_SUCCEEDED);
@@ -260,8 +270,8 @@ public final class SocksRelayService extends Service {
     private void stopRelay() {
         RUNNING.set(false);
         SOCKS_LISTENING.set(false);
-        WEB_LISTENING.set(false);
-        webBridge.stop();
+        WEB_LISTENERS.set(0);
+        for (ReverseProxyServer webBridge : webBridges) webBridge.stop();
         closeSocksServerSocket();
         stopForeground(true);
     }
@@ -316,9 +326,11 @@ public final class SocksRelayService extends Service {
         String status;
         if (!isRunning()) {
             status = "Starting SOCKS " + RelayPolicy.LISTEN_PORT
-                    + " + Web " + BridgePolicy.LISTEN_PORT;
+                    + " + Web " + BridgePolicy.LISTEN_PORT
+                    + "/" + BridgePolicy.MACBOOK_LISTEN_PORT;
         } else {
-            status = "Web " + BridgePolicy.LISTEN_PORT + " · "
+            status = "Web " + BridgePolicy.LISTEN_PORT + "/"
+                    + BridgePolicy.MACBOOK_LISTEN_PORT + " · "
                     + ACTIVE_CONNECTIONS.get() + " active · "
                     + TOTAL_CONNECTIONS.get() + " total";
         }

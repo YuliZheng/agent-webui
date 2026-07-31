@@ -47,20 +47,24 @@ public final class RelayActivity extends Activity {
         TextView explanation = new TextView(this);
         explanation.setText(managedProfile
                 ? "Single work-profile relay for Agent WebUI.\n\n"
-                        + "Web bridge: " + BridgePolicy.LISTEN_HOST + ":"
-                        + BridgePolicy.LISTEN_PORT + "\n"
+                        + "Windows bridge: " + BridgePolicy.LISTEN_HOST + ":"
+                        + RelayTarget.WINDOWS.bridgePort + "\n"
+                        + "MacBook bridge: " + BridgePolicy.LISTEN_HOST + ":"
+                        + RelayTarget.MACBOOK.bridgePort + "\n"
                         + "SOCKS compatibility: " + RelayPolicy.LISTEN_HOST + ":"
                         + RelayPolicy.LISTEN_PORT + "\n"
-                        + "Tailnet target: " + RelayPolicy.TARGET_TAILNET_IP + ":"
-                        + RelayPolicy.TARGET_PORT + "\n\n"
+                        + "Tailnet targets: Windows + MacBook\n\n"
                         + "Personal Chrome can open http://" + BridgePolicy.LISTEN_HOST
-                        + ":" + BridgePolicy.LISTEN_PORT + "/ directly. Only "
-                        + RelayPolicy.ALLOWED_DOMAIN + ":443 is accepted."
+                        + ":" + RelayTarget.WINDOWS.bridgePort + "/ or :"
+                        + RelayTarget.MACBOOK.bridgePort + "/ directly. Only the two "
+                        + "configured Agent WebUI hosts are accepted."
                 : "No personal-profile relay service is needed in version 1.4.\n\n"
                         + "Keep Tailnet Relay and Tailscale running in the work profile, "
                         + "then open:\n\n"
                         + "http://" + BridgePolicy.LISTEN_HOST + ":"
-                        + BridgePolicy.LISTEN_PORT + "/\n\n"
+                        + RelayTarget.WINDOWS.bridgePort + "/ (Windows)\n"
+                        + "http://" + BridgePolicy.LISTEN_HOST + ":"
+                        + RelayTarget.MACBOOK.bridgePort + "/ (agent-macbook)\n\n"
                         + "This uses no personal VPN slot and can run together "
                         + "with personal-profile FlClash.");
         explanation.setTextSize(16);
@@ -73,15 +77,23 @@ public final class RelayActivity extends Activity {
         root.addView(statusView, matchWrap());
 
         Button start = new Button(this);
-        start.setText(managedProfile ? "Start relay" : "Open Agent WebUI");
+        start.setText(managedProfile ? "Start relay" : "Open Windows Agent");
         start.setOnClickListener(view -> {
             if (managedProfile) {
                 startRelay();
             } else {
-                openAgentWebUi();
+                openAgentWebUi(RelayTarget.WINDOWS);
             }
         });
         root.addView(start, matchWrap());
+
+        Button openMacbook = new Button(this);
+        openMacbook.setText("Open agent-macbook");
+        openMacbook.setOnClickListener(view -> openAgentWebUi(RelayTarget.MACBOOK));
+        if (managedProfile) {
+            openMacbook.setVisibility(View.GONE);
+        }
+        root.addView(openMacbook, matchWrap());
 
         Button stop = new Button(this);
         stop.setText("Stop relay");
@@ -126,9 +138,9 @@ public final class RelayActivity extends Activity {
         handler.postDelayed(this::updateStatus, 250);
     }
 
-    private void openAgentWebUi() {
+    private void openAgentWebUi(RelayTarget target) {
         Uri uri = Uri.parse("http://" + BridgePolicy.LISTEN_HOST + ":"
-                + BridgePolicy.LISTEN_PORT + "/");
+                + target.bridgePort + "/");
         startActivity(new Intent(Intent.ACTION_VIEW, uri));
     }
 
@@ -144,7 +156,7 @@ public final class RelayActivity extends Activity {
         status.append(SocksRelayService.isRunning()
                 ? "Status: running"
                 : "Status: starting or stopped");
-        status.append("\nMode: work SOCKS + Web bridge");
+        status.append("\nMode: work SOCKS + two Web bridges");
         status.append("\nActive connections: ")
                 .append(SocksRelayService.activeConnections());
         status.append("\nTotal connections: ")

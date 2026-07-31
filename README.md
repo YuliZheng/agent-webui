@@ -38,6 +38,20 @@ does not print the bearer token into its logs.
 Use `npm run dev` for the Vite + Fastify development pair. The same token bind
 works through `/api/auth/bind?token=...` in development.
 
+## Run on macOS
+
+Install Node.js 20 or newer, clone the repository, then run:
+
+```sh
+node scripts/install-agent-webui-macos.mjs --name agent-macbook
+```
+
+The installer builds the app, gives this PWA its own install identity and
+`agent-macbook` display name, registers a per-user LaunchAgent on port 3457,
+and configures Tailscale Serve. It binds the backend to loopback; tailnet HTTPS
+is the intended remote entry point. Re-run the same command after pulling an
+update.
+
 Configuration is available through CLI flags and environment variables exposed
 by the backend (`--host`, `--port`, `--token`, `AGENT_WEBUI_HOST`,
 `AGENT_WEBUI_PORT`). Small server preferences are stored under

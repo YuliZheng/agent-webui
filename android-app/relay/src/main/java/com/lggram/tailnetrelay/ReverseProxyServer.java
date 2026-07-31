@@ -32,24 +32,26 @@ final class ReverseProxyServer {
     }
 
     private static final int CONNECT_TIMEOUT_MS = 10_000;
-    private static final String LOCAL_ORIGIN =
-            "http://" + BridgePolicy.LISTEN_HOST + ":" + BridgePolicy.LISTEN_PORT;
-    private static final String UPSTREAM_ORIGIN =
-            "https://" + RelayPolicy.ALLOWED_DOMAIN;
-
     private final ExecutorService acceptExecutor;
     private final ExecutorService connectionExecutor;
     private final Events events;
+    private final RelayTarget target;
+    private final String localOrigin;
+    private final String upstreamOrigin;
     private final AtomicBoolean running = new AtomicBoolean(false);
     private volatile ServerSocket serverSocket;
 
     ReverseProxyServer(
             ExecutorService acceptExecutor,
             ExecutorService connectionExecutor,
+            RelayTarget target,
             Events events) {
         this.acceptExecutor = acceptExecutor;
         this.connectionExecutor = connectionExecutor;
+        this.target = target;
         this.events = events;
+        this.localOrigin = "http://" + BridgePolicy.LISTEN_HOST + ":" + target.bridgePort;
+        this.upstreamOrigin = "https://" + target.domain;
     }
 
     void start() {
@@ -62,7 +64,7 @@ final class ReverseProxyServer {
                 listener.setReuseAddress(true);
                 listener.bind(new InetSocketAddress(
                         InetAddress.getByName(BridgePolicy.LISTEN_HOST),
-                        BridgePolicy.LISTEN_PORT));
+                        target.bridgePort));
                 serverSocket = listener;
                 events.onListening();
                 while (running.get()) {
@@ -140,9 +142,9 @@ final class ReverseProxyServer {
         try (Socket upstream = openTlsUpstream()) {
             String rewrittenRequest = HttpProxyProtocol.rewriteRequestForUpstream(
                     request,
-                    LOCAL_ORIGIN,
-                    UPSTREAM_ORIGIN,
-                    RelayPolicy.ALLOWED_DOMAIN);
+                    localOrigin,
+                    upstreamOrigin,
+                    target.domain);
             upstream.getOutputStream().write(
                     rewrittenRequest.getBytes(StandardCharsets.ISO_8859_1));
             upstream.getOutputStream().flush();
@@ -170,9 +172,9 @@ final class ReverseProxyServer {
                 String responseHeader = HttpProxyProtocol.readHeaderBlock(upstreamInput);
                 String rewrittenResponse = HttpProxyProtocol.rewriteResponseForLocal(
                         responseHeader,
-                        LOCAL_ORIGIN,
-                        UPSTREAM_ORIGIN,
-                        RelayPolicy.ALLOWED_DOMAIN);
+                        localOrigin,
+                        upstreamOrigin,
+                        target.domain);
                 clientOutput.write(rewrittenResponse.getBytes(StandardCharsets.ISO_8859_1));
                 clientOutput.flush();
                 responseStarted.set(true);
@@ -194,7 +196,8 @@ final class ReverseProxyServer {
             HttpProxyProtocol.Request request) throws IOException {
         HttpProxyProtocol.Authority authority =
                 HttpProxyProtocol.parseConnectAuthority(request.target);
-        if (!BridgePolicy.isAllowedConnectTarget(authority.host, authority.port)) {
+        RelayTarget connectTarget = RelayPolicy.targetFor(authority.host, authority.port);
+        if (connectTarget == null) {
             writeTextResponse(
                     localClient.getOutputStream(),
                     "403 Forbidden",
@@ -204,12 +207,12 @@ final class ReverseProxyServer {
         }
 
         boolean counted = false;
-        try (Socket tailnet = openTailnetSocket()) {
+        try (Socket tailnet = openTailnetSocket(connectTarget)) {
             tailnet.setSoTimeout(0);
             localClient.setSoTimeout(0);
             localClient.getOutputStream().write((
                     "HTTP/1.1 200 Connection Established\r\n"
-                            + "Proxy-Agent: AgentBridge/1.4\r\n"
+                            + "Proxy-Agent: AgentBridge/1.5\r\n"
                             + "\r\n").getBytes(StandardCharsets.ISO_8859_1));
             localClient.getOutputStream().flush();
             counted = true;
@@ -222,14 +225,14 @@ final class ReverseProxyServer {
         }
     }
 
-    private Socket openTailnetSocket() throws IOException {
+    private Socket openTailnetSocket(RelayTarget upstreamTarget) throws IOException {
         Socket tailnet = new Socket();
         try {
             tailnet.setTcpNoDelay(true);
             tailnet.connect(
                     new InetSocketAddress(
-                            RelayPolicy.TARGET_TAILNET_IP,
-                            RelayPolicy.TARGET_PORT),
+                            upstreamTarget.domain,
+                            upstreamTarget.targetPort),
                     CONNECT_TIMEOUT_MS);
             tailnet.setSoTimeout(CONNECT_TIMEOUT_MS);
             return tailnet;
@@ -240,18 +243,18 @@ final class ReverseProxyServer {
     }
 
     private Socket openTlsUpstream() throws IOException {
-        Socket tailnet = openTailnetSocket();
+        Socket tailnet = openTailnetSocket(target);
         try {
             SSLSocketFactory factory = (SSLSocketFactory) SSLSocketFactory.getDefault();
             SSLSocket tls = (SSLSocket) factory.createSocket(
                     tailnet,
-                    RelayPolicy.ALLOWED_DOMAIN,
-                    RelayPolicy.TARGET_PORT,
+                    target.domain,
+                    target.targetPort,
                     true);
             SSLParameters parameters = tls.getSSLParameters();
             parameters.setEndpointIdentificationAlgorithm("HTTPS");
             parameters.setServerNames(Collections.singletonList(
-                    new SNIHostName(RelayPolicy.ALLOWED_DOMAIN)));
+                    new SNIHostName(target.domain)));
             tls.setSSLParameters(parameters);
             tls.setUseClientMode(true);
             tls.setSoTimeout(CONNECT_TIMEOUT_MS);
