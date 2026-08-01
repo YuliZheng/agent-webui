@@ -53,4 +53,12 @@ describe("PWA install support", () => {
     expect(serviceWorker).not.toContain("/api/");
     expect(serviceWorker).not.toContain("/attachments/");
   });
+
+  it("bounds navigation freshness waits and reuses immutable hashed assets", () => {
+    expect(serviceWorker).toContain("NAVIGATION_NETWORK_BUDGET_MS = 750");
+    expect(serviceWorker).toContain("Promise.race([networkResponse, cachedAfterBudget])");
+    expect(serviceWorker).toContain("event.waitUntil(networkResponse");
+    expect(serviceWorker).toContain("if (isHashedAsset)");
+    expect(serviceWorker).toContain("cacheFirst(request)");
+  });
 });
