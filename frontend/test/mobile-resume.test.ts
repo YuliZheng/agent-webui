@@ -17,10 +17,16 @@ describe("mobile resume recovery", () => {
     expect(appVue).toContain("wsWake({ forceReconnect })");
     expect(appVue).toContain("if (forceReconnect) sessions.clearAllStatus()");
     expect(appVue).toContain("resyncSessions(true)");
-    // Tail re-subscribe is once-per-sweep and gated on suspend/hidden — not
-    // fired on every retry pass (each refreshEngaged risks the no-tail race).
-    expect(appVue).toContain("const shouldRefreshTail = longSuspend || hiddenMs >= LONG_SUSPEND_MS");
-    expect(appVue).toContain("if (!shouldRefreshTail || refreshedTail || !wsConnected.value) return");
+    // The active chat must catch up on every foreground sweep. HTTP is
+    // independent of the WebSocket and live.ts freshness-coalesces successful
+    // retries, so a short app switch cannot leave the open transcript stale.
+    expect(appVue).toContain("const tryRefreshTail = () =>");
+    expect(appVue).toContain("const sid = ui.selectedSessionId");
+    expect(appVue).toContain("live.refreshSession(sid, true)");
+    expect(appVue).toContain("sessions.isPending(sid)");
+    expect(appVue).toContain("if (refreshedTail || refreshTailWork) return");
+    expect(appVue).not.toContain("const shouldRefreshTail = longSuspend || hiddenMs >= LONG_SUSPEND_MS");
+    expect(appVue).not.toContain("!wsConnected.value");
   });
 
   it("only treats inactivity as suspend when timers actually froze (desktop fix)", () => {
@@ -54,17 +60,21 @@ describe("mobile resume recovery", () => {
     expect(appVue).toContain("window.setInterval(() => syncHomeIfVisible(), HOME_SYNC_INTERVAL_MS)");
   });
 
-  it("prefetches EVERY session tail over HTTP before waiting for WS subscribe", () => {
+  it("syncs EVERY session tail over coalesced HTTP before waiting for WS subscribe", () => {
     // HTTP tail must run for all agents (not codex-only): on mobile resume the
     // WS can be a zombie (OPEN but dead) and a WS subscribe goes nowhere, so a
     // claude session would show stale cache until a full reload. The HTTP GET
     // paints the latest lines regardless of socket health.
-    expect(liveStore).toContain("import { readSessionTail, markReadRemote } from \"../api/sessions.js\"");
+    expect(liveStore).toContain("readSessionTail,");
+    expect(sessionsStore).toContain("markReadRemote(id, at)");
     expect(liveStore).toContain("const ENGAGE_TAIL_N = 200");
-    // engage() fetches a small tail on tap via the shared helper…
-    expect(liveStore).toContain("this.fetchTailIntoCache(id, ENGAGE_HTTP_TAIL_N)");
-    // …which is the only place readSessionTail + appendBatch live now.
-    expect(liveStore).toContain("const tail = await readSessionTail(id, n)");
+    // engage() fetches a small tail on tap through the public retry API…
+    expect(liveStore).toContain("this.refreshSession(id)");
+    // …which shares in-flight work and a short successful-result window.
+    expect(liveStore).toContain("const existing = tailFetchWork.get(id)");
+    expect(liveStore).toContain("const TAIL_FRESH_MS = 20_000");
+    // readSessionTail + cache reconciliation remain in the shared helper.
+    expect(liveStore).toContain("const tail = await readSessionTail(id, n, priority)");
     expect(liveStore).toContain("cache.appendBatch(id, items)");
     // Guard against regressing to the codex-only gate.
     expect(liveStore).not.toContain("?.agent === \"codex\"");
@@ -72,16 +82,52 @@ describe("mobile resume recovery", () => {
 
   it("warms recent session tails via background prefetch", () => {
     expect(liveStore).toContain("async prefetchTails(");
-    expect(liveStore).toContain("fetchTailIntoCache(id, PREFETCH_TAIL_N)");
+    expect(liveStore).toContain("fetchTailIntoCache(id, PREFETCH_TAIL_N, false, \"background\")");
+    expect(liveStore).toContain("for (const id of ids) void cache.restore(id)");
     // Prefetch is wired into boot, reconnect, resume, and the home-list poll.
     expect(appVue).toContain("live.prefetchTails()");
+    // A deep link must engage the selected chat before idle background work can
+    // occupy the backend's serialized cold-index reader.
+    expect(appVue.indexOf("ui.selectFromHistory(initialId)")).toBeLessThan(appVue.indexOf("const warmRecentTails"));
+    expect(appVue).toContain("requestIdleCallback");
+  });
+
+  it("starts the local cache before network sync without blocking either path", () => {
+    const engageStart = liveStore.indexOf("async engage(id: string)");
+    const engageEnd = liveStore.indexOf("refreshSession(id: string", engageStart);
+    const body = liveStore.slice(engageStart, engageEnd);
+    expect(body.indexOf("void cache.restore(id)")).toBeGreaterThan(-1);
+    expect(body.indexOf("void cache.restore(id)")).toBeLessThan(body.indexOf("this.subscribeToSession(id"));
+    expect(body.indexOf("void cache.restore(id)")).toBeLessThan(body.indexOf("this.refreshSession(id)"));
   });
 
   it("flags an in-flight on-tap tail fetch so the chat shows a syncing pill", () => {
     expect(liveStore).toContain("tailFetching: Record<string, boolean>");
+    expect(liveStore).toContain("tailErrors: Record<string, string | undefined>");
     expect(liveStore).toContain("this.tailFetching[id] = true");
     expect(liveStore).toContain("this.tailFetching[id] = false");
+    expect(liveStore).toContain("refreshSession(id: string, force = false): Promise<void>");
     expect(messageListVue).toContain("live.tailFetching[props.sessionId]");
+  });
+
+  it("uses HTTP catch-up instead of rebuilding a healthy per-session tail", () => {
+    const refreshStart = liveStore.indexOf("refreshEngaged(force = false)");
+    const handlerStart = liveStore.indexOf("onSessionMsg(", refreshStart);
+    const body = liveStore.slice(refreshStart, handlerStart);
+    expect(body).toContain("this.refreshSession(id, force)");
+    expect(body).not.toContain("this.disengage(id)");
+    expect(body).not.toContain("subscribe(\"session\"");
+  });
+
+  it("uses the same non-destructive HTTP fallback for the stale-stream watchdog", () => {
+    const watchdogStart = liveStore.indexOf("// Desync watchdog");
+    const watchdogEnd = liveStore.indexOf('} else if (kind === "session-renamed")', watchdogStart);
+    const body = liveStore.slice(watchdogStart, watchdogEnd);
+    expect(body).toContain("this.refreshSession(id, true)");
+    expect(body).toContain("STALE_STREAM_HTTP_MIN_GAP_MS");
+    expect(body).toContain("staleStreamHttpAt.set(id, now)");
+    expect(body).not.toContain("this.disengage(id)");
+    expect(body).not.toContain("this.subscribeToSession(id");
   });
 
   it("surfaces a sidebar syncing state while resume HTTP refreshes are running", () => {
@@ -91,5 +137,15 @@ describe("mobile resume recovery", () => {
     expect(sidebarVue).toContain("cw-sidebar-syncing");
     expect(sidebarVue).toContain("sessions.syncInFlight > 0");
     expect(sidebarVue).toContain("Syncing…");
+  });
+
+  it("hydrates the homepage from the post-scan refresh snapshot", () => {
+    const refreshStart = sidebarVue.indexOf("async function runPullRefresh()");
+    const refreshEnd = sidebarVue.indexOf("onMounted(() =>", refreshStart);
+    const body = sidebarVue.slice(refreshStart, refreshEnd);
+    expect(body).toContain("const refreshed = await refreshBackend()");
+    expect(body).toContain("sessions.hydrateList(refreshed.sessions, startedAtRevision)");
+    expect(body).not.toContain("sessions.fetchAll()");
+    expect(body).not.toContain("forceReconnect");
   });
 });

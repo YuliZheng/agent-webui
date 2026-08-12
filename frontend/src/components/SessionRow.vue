@@ -8,12 +8,15 @@ import { useDraftsStore } from "../stores/drafts.js";
 import { useImageDraftsStore } from "../stores/image-drafts.js";
 import { usePromptPendingStore } from "../stores/prompt-pending.js";
 import { useBackgroundTasksStore } from "../stores/background-tasks.js";
+import { useLiveStore } from "../stores/live.js";
 import { displayCwd } from "../util/cwd-display.js";
 import { avatarGradient, avatarText, gradientForIndex, paletteColor } from "../util/avatar.js";
 import { imTime } from "../util/time.js";
 import { nowMs, formatElapsed } from "../util/now-tick.js";
 import { currentTurnBackgroundTasks } from "../util/runtime-work.js";
 import { effectiveSessionActivityIso } from "../util/session-recency.js";
+import { isReadOnlySubagentSession } from "../util/session-access.js";
+import { latestSidebarPendingPrompt } from "../util/pending-prompt-reconciliation.js";
 import { APP_BACK_PRIORITY, registerAppBackHandler } from "../util/app-back.js";
 import { setPwaLayerActive } from "../util/pwa-history.js";
 import { retitleSession, setSessionTitle } from "../api/sessions.js";
@@ -39,7 +42,9 @@ const drafts = useDraftsStore();
 const imageDrafts = useImageDraftsStore();
 const promptPending = usePromptPendingStore();
 const backgroundTasks = useBackgroundTasksStore();
+const live = useLiveStore();
 const item = computed(() => sessions.byId[props.id]);
+const isReadOnlySubagent = computed(() => isReadOnlySubagentSession(item.value));
 // Count of running background tasks (subagents / workflows / background
 // shells) for this session — small ⟳N badge next to the status dot.
 const bgRunning = computed(() => currentTurnBackgroundTasks(
@@ -142,18 +147,14 @@ const livePreview = computed<LivePreview>(() => {
     };
   }
 
-  const pending = promptPending.pending(props.id);
-  const pp = pending[pending.length - 1];
+  const pp = latestSidebarPendingPrompt(promptPending.pending(props.id), {
+    backendPreview: preview.value,
+    now: nowMs.value,
+    sessionSize: item.value?.size ?? 0,
+  });
   if (pp?.text) {
     return { text: pp.text, kind: "pending" };
   }
-
-  // A running turn is status, not conversation content. Once the backend has
-  // observed a visible user/assistant message, keep that newest message in the
-  // row instead of hiding it behind a generic "thinking" placeholder. This is
-  // especially important just after the user's optimistic prompt reconciles
-  // with its durable JSONL/rollout record.
-  if (preview.value) return { text: preview.value, kind: "preview" };
 
   if (isRunning.value) {
     // Anchor on lastBoundaryAt — the moment THIS turn started (user message
@@ -169,12 +170,16 @@ const livePreview = computed<LivePreview>(() => {
     // row says "thinking" for minutes with nothing visibly happening.
     const verb = sessions.compactingBySession[props.id]
       ? "🗜 Compacting context…"
-      : `${item.value?.agent === "codex" ? "Codex" : "Claude"} is thinking…`;
+      : (item.value?.previewRole === "assistant" ? preview.value : "")
+        || live.turnProgress[props.id]
+        || `${item.value?.agent === "codex" ? "Codex is starting work…" : "Claude is thinking…"}`;
     return {
       text: elapsed ? `${verb} ${elapsed}` : verb,
       kind: "thinking",
     };
   }
+
+  if (preview.value) return { text: preview.value, kind: "preview" };
 
   return { text: "", kind: "none" };
 });
@@ -859,6 +864,11 @@ function onTitleKey(e: KeyboardEvent) {
             class="text-[9px] opacity-40 leading-none shrink-0"
             title="Manually renamed — auto-retitle skips this session until you click Auto"
           >✎</span>
+          <span
+            v-if="isReadOnlySubagent"
+            class="shrink-0 rounded bg-[color-mix(in_srgb,var(--cw-info)_14%,transparent)] px-1 py-0.5 text-[9px] font-medium leading-none text-[var(--cw-info)]"
+            title="子 Agent 记录，只读"
+          >只读</span>
         </div>
         <span
           v-if="timeLabel"

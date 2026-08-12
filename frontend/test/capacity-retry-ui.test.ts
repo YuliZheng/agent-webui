@@ -13,6 +13,10 @@ const sessionRowVue = readFileSync(
   join(process.cwd(), "src/components/SessionRow.vue"),
   "utf8",
 );
+const messageListVue = readFileSync(
+  join(process.cwd(), "src/components/MessageList.vue"),
+  "utf8",
+);
 
 describe("capacity retry UI", () => {
   beforeEach(() => {
@@ -93,5 +97,11 @@ describe("capacity retry UI", () => {
     expect(sessionRowVue).toContain("Model busy · retry ${capacityRetry.value.attempt}/${capacityRetry.value.maxAttempts}");
     expect(sessionRowVue).toContain("next in ${capacityRetryWaitSeconds.value}s");
     expect(sessionRowVue).toContain("⟳{{ capacityRetry.attempt }}/{{ capacityRetry.maxAttempts }}");
+  });
+
+  it("shows retry progress in the transcript and suppresses the temporary empty ending", () => {
+    expect(messageListVue).toContain("suppressLatestEmptyCompletion: capacityRetry.value !== null");
+    expect(messageListVue).toContain("Model busy · automatically retrying");
+    expect(messageListVue).toContain("capacityRetry ? capacityRetryLabel");
   });
 });

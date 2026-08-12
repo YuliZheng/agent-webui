@@ -1,33 +1,53 @@
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { copyFile, mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { buildApp } from "../backend/dist/app.js";
 
 const root = await mkdtemp(join(tmpdir(), "agent-webui-visual-"));
 const claudeRoot = join(root, "claude");
 const codexRoot = join(root, "codex");
 const stateDir = join(root, "state");
+const demoCwd = join(root, "workspace", "agent-webui-demo");
+const demoFiles = join(demoCwd, "reference_assets");
 await Promise.all([
   mkdir(claudeRoot, { recursive: true }),
   mkdir(codexRoot, { recursive: true }),
   mkdir(stateDir, { recursive: true }),
+  mkdir(join(demoFiles, "portraits"), { recursive: true }),
+]);
+
+// Optional real-session visual regression input. The source is copied into the
+// disposable fixture root, so QA can exercise a pathological transcript
+// without pointing mutation-capable routes at the user's live Codex archive.
+const visualCodexSession = process.env.AGENT_WEBUI_VISUAL_CODEX_SESSION;
+if (visualCodexSession) {
+  const importedCodexRoot = join(codexRoot, "imported");
+  await mkdir(importedCodexRoot, { recursive: true });
+  await copyFile(visualCodexSession, join(importedCodexRoot, basename(visualCodexSession)));
+}
+await Promise.all([
+  writeFile(join(demoFiles, "README.md"), "# Reference assets\n\nA fixture for the remote file browser.\n"),
+  writeFile(join(demoFiles, "preview.html"), "<!doctype html><meta charset=\"utf-8\"><style>body{font:16px system-ui;padding:2rem}h1{color:#0f766e}</style><h1>Sandboxed HTML preview</h1><p>This file renders without scripts.</p>"),
+  writeFile(join(demoFiles, "notes.txt"), "Mobile and desktop file-browser fixture.\n"),
+  writeFile(join(demoFiles, "clip.mp4"), "download-only fixture"),
+  writeFile(join(demoFiles, "portraits", "selection.txt"), "Nested folder fixture.\n"),
 ]);
 
 const now = new Date("2026-07-23T08:30:00.000Z");
 const titles = {};
 const samples = [
-  ["reference_main", "Optimize transcript rendering", "🤖", "C:\\workspace\\agent-webui-demo"],
-  ["reconnect", "Debug WebSocket reconnect", "🔧", "C:\\workspace\\agent-webui-demo"],
-  ["auth_flow", "Review token authentication flow", "🔐", "C:\\workspace\\agent-webui-demo"],
-  ["tailer", "Validate JSONL tail indexes", "📜", "C:\\workspace\\agent-webui-demo"],
-  ["cache", "Bound the transcript cache", "🗃️", "C:\\workspace\\agent-webui-demo"],
-  ["mobile", "Polish mobile chat layout", "📱", "C:\\workspace\\agent-webui-demo"],
-  ["search", "Test full-content search", "🔎", "C:\\workspace\\agent-webui-demo"],
-  ["markdown", "Improve Markdown export", "📝", "C:\\workspace\\agent-webui-demo"],
-  ["tasks", "Reconstruct background tasks", "⚙️", "C:\\workspace\\agent-webui-demo"],
-  ["preview", "Harden preview sandbox", "🛡️", "C:\\workspace\\agent-webui-demo"],
-  ["tools", "Group consecutive tool calls", "🧰", "C:\\workspace\\agent-webui-demo"],
-  ["new_session", "Refine new-session workflow", "🧩", "C:\\workspace\\agent-webui-demo"],
+  ["reference_main", "Optimize transcript rendering", "🤖", demoCwd],
+  ["reconnect", "Debug WebSocket reconnect", "🔧", demoCwd],
+  ["auth_flow", "Review token authentication flow", "🔐", demoCwd],
+  ["tailer", "Validate JSONL tail indexes", "📜", demoCwd],
+  ["cache", "Bound the transcript cache", "🗃️", demoCwd],
+  ["mobile", "Polish mobile chat layout", "📱", demoCwd],
+  ["search", "Test full-content search", "🔎", demoCwd],
+  ["markdown", "Improve Markdown export", "📝", demoCwd],
+  ["tasks", "Reconstruct background tasks", "⚙️", demoCwd],
+  ["preview", "Harden preview sandbox", "🛡️", demoCwd],
+  ["tools", "Group consecutive tool calls", "🧰", demoCwd],
+  ["new_session", "Refine new-session workflow", "🧩", demoCwd],
 ];
 
 function record(type, uuid, parentUuid, cwd, message, timestamp) {
@@ -80,6 +100,8 @@ for (let index = 0; index < samples.length; index += 1) {
         "```",
         "",
         "This keeps memory bounded while preserving stable source indexes and upward navigation.",
+        "",
+        `[Browse the reference assets](<${demoFiles}>)`,
       ].join("\n") }],
     }, new Date(Date.parse(timestamp) + 25_000).toISOString()));
     lines.push(record("user", "reference_main_u2", "reference_main_a2", cwd, {
@@ -93,6 +115,67 @@ for (let index = 0; index < samples.length; index += 1) {
   }
   await writeFile(join(claudeRoot, `${id}.jsonl`), `${lines.join("\n")}\n`);
 }
+
+// A compact Codex worker thread for the read-only sub-agent surface. Its
+// parent is one of the interactive fixture sessions above so the recovery
+// button can be exercised end-to-end without touching a real conversation.
+const readonlyWorkerId = "readonly_worker";
+const readonlyWorkerTimestamp = "2026-07-23T08:32:00.000Z";
+titles[readonlyWorkerId] = { title: "Research Dolomites media", emoji: "🏔️", source: "auto" };
+const readonlyWorkerLines = [
+  JSON.stringify({
+    timestamp: readonlyWorkerTimestamp,
+    type: "session_meta",
+    payload: {
+      id: readonlyWorkerId,
+      session_id: "reference_main",
+      parent_thread_id: "reference_main",
+      forked_from_id: "reference_main",
+      timestamp: readonlyWorkerTimestamp,
+      cwd: demoCwd,
+      originator: "agent-webui",
+      source: {
+        subagent: {
+          thread_spawn: {
+            parent_thread_id: "reference_main",
+            depth: 1,
+            agent_path: "/root/visual_worker",
+            agent_nickname: "Visual",
+            agent_role: null,
+          },
+        },
+      },
+      thread_source: "subagent",
+      agent_path: "/root/visual_worker",
+      agent_nickname: "Visual",
+      model_provider: "openai",
+      history_mode: "legacy",
+      multi_agent_version: "v2",
+    },
+  }),
+  JSON.stringify({
+    timestamp: readonlyWorkerTimestamp,
+    type: "response_item",
+    payload: {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "Find high-quality media connected to the Dolomites route." }],
+    },
+  }),
+  JSON.stringify({
+    timestamp: "2026-07-23T08:32:12.000Z",
+    type: "response_item",
+    payload: {
+      type: "message",
+      role: "assistant",
+      content: [{ type: "output_text", text: "I will compare documentaries and local productions for the exact stops on the route." }],
+    },
+  }),
+];
+await writeFile(
+  join(codexRoot, `rollout-2026-07-23T08-32-00-${readonlyWorkerId}.jsonl`),
+  `${readonlyWorkerLines.join("\n")}\n`,
+);
 
 await writeFile(join(stateDir, "titles.json"), JSON.stringify(titles));
 await writeFile(join(stateDir, "prefs.json"), JSON.stringify({
@@ -122,12 +205,13 @@ const app = await buildApp({
   stateDir,
   claudeRoot,
   codexRoot,
-  frontendDist: join(process.cwd(), "frontend", "dist"),
+  frontendDist: process.env.AGENT_WEBUI_VISUAL_FRONTEND_DIST || join(process.cwd(), "frontend", "dist"),
   token: "visual-test-token",
   logger: false,
   startWatchers: false,
 });
-await app.listen({ host: "127.0.0.1", port: 3457 });
+const port = Number(process.env.AGENT_WEBUI_VISUAL_PORT || 3457);
+await app.listen({ host: "127.0.0.1", port });
 console.log(`visual fixture ready: ${root}`);
 for (const signal of ["SIGINT", "SIGTERM"]) {
   process.once(signal, () => void app.close().finally(() => process.exit(0)));

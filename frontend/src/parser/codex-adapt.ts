@@ -21,17 +21,31 @@
 // we emit a claude tool_use + tool_result with the same id and let groupTimeline
 // collapse them into one ToolCall row (exactly how claude tool pairs work).
 
-function claudeUser(uuid: string, text: string): string {
+import { toolResultImageUrl } from "../util/tool-result-images.js";
+
+function sourceIndexField(lineIndex: number | undefined): Record<string, number> {
+  return typeof lineIndex === "number" && Number.isSafeInteger(lineIndex)
+    ? { __agentWebuiSourceIndex: lineIndex }
+    : {};
+}
+
+function claudeUser(uuid: string, text: string, lineIndex?: number): string {
   return JSON.stringify({
     type: "user",
     uuid,
+    ...sourceIndexField(lineIndex),
     message: { role: "user", content: text },
   });
 }
 
 interface PendingCodexImages {
   sourceLineIndex: number;
-  mediaTypes: string[];
+  images: Array<{ mediaType: string; imageIndex: number; url?: string }>;
+}
+
+interface PendingOmittedRecord {
+  sourceLineIndex: number;
+  bytes: number;
 }
 
 interface CodexUserImageRecord {
@@ -48,26 +62,48 @@ function codexUserImageRecord(rawLine: string, lineIndex: number): CodexUserImag
   const payload = (rec.payload ?? {}) as Record<string, unknown>;
   if (payload.type !== "message" || payload.role !== "user") return null;
   const content = Array.isArray(payload.content) ? payload.content : [];
-  const mediaTypes = content.flatMap(raw => {
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
+  const images: Array<{ mediaType: string; imageIndex: number; url?: string }> = [];
+  for (const raw of content) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
     const block = raw as Record<string, unknown>;
     if (block.type === "input_image") {
       const url = typeof block.image_url === "string"
         ? block.image_url
         : typeof block.imageUrl === "string" ? block.imageUrl : "";
       const match = /^data:(image\/[a-z0-9.+-]+);base64,/i.exec(url);
-      return match?.[1] ? [match[1].toLowerCase()] : [];
+      const declared = typeof block.media_type === "string"
+        ? block.media_type
+        : typeof block.mediaType === "string" ? block.mediaType : "";
+      const mediaType = match?.[1]?.toLowerCase() ?? declared;
+      if (mediaType.startsWith("image/")) {
+        const markerIndex = Number(block.__agentWebuiImageIndex);
+        images.push({
+          mediaType,
+          imageIndex: Number.isSafeInteger(markerIndex) && markerIndex >= 0 ? markerIndex : images.length,
+          ...(url.startsWith("/api/sessions/") ? { url } : {}),
+        });
+      }
+      continue;
     }
-    if (block.type !== "image" || !block.source || typeof block.source !== "object" || Array.isArray(block.source)) return [];
+    if (block.type !== "image" || !block.source || typeof block.source !== "object" || Array.isArray(block.source)) continue;
     const source = block.source as Record<string, unknown>;
     const mediaType = typeof source.media_type === "string"
       ? source.media_type
       : typeof source.mediaType === "string" ? source.mediaType : "";
-    return source.type === "base64" && mediaType.startsWith("image/") ? [mediaType] : [];
-  });
+    if ((source.type === "base64" || source.type === "url" || source.type === "agent-webui-transcript") && mediaType.startsWith("image/")) {
+      const markerIndex = Number(source.imageIndex);
+      images.push({
+        mediaType,
+        imageIndex: Number.isSafeInteger(markerIndex) && markerIndex >= 0 ? markerIndex : images.length,
+        ...(typeof source.url === "string" && source.url.startsWith("/api/sessions/")
+          ? { url: source.url }
+          : {}),
+      });
+    }
+  }
   return {
     isUserMessage: true,
-    pending: mediaTypes.length ? { sourceLineIndex: lineIndex, mediaTypes } : null,
+    pending: images.length ? { sourceLineIndex: lineIndex, images } : null,
   };
 }
 
@@ -90,15 +126,16 @@ function attachCodexImages(rawUser: string, pending: PendingCodexImages): string
   // leading placeholders when a real image record was paired successfully.
   const text = rawText.replace(/^(?:\s*\[Image #\d+\])+\s*/iu, "");
   message.content = [
-    ...pending.mediaTypes.map((mediaType, imageIndex) => ({
+    ...pending.images.map(({ mediaType, imageIndex, url }, displayIndex) => ({
       type: "image",
       source: {
         type: "agent-webui-transcript",
         lineIndex: pending.sourceLineIndex,
         imageIndex,
         media_type: mediaType,
+        ...(url ? { url } : {}),
       },
-      name: `image-${imageIndex + 1}.${imageExtension(mediaType)}`,
+      name: `image-${displayIndex + 1}.${imageExtension(mediaType)}`,
     })),
     ...(text ? [{ type: "text", text }] : []),
   ];
@@ -108,31 +145,88 @@ function attachCodexImages(rawUser: string, pending: PendingCodexImages): string
   return JSON.stringify(record);
 }
 
-function claudeAssistantText(uuid: string, text: string): string {
+function omittedRecord(rawLine: string, lineIndex: number): PendingOmittedRecord | null {
+  if (!rawLine.includes("agent-webui-record-omitted")) return null;
+  try {
+    const record = JSON.parse(rawLine) as { type?: unknown; bytes?: unknown };
+    const bytes = Number(record.bytes);
+    return record.type === "agent-webui-record-omitted" && Number.isFinite(bytes) && bytes > 0
+      ? { sourceLineIndex: lineIndex, bytes }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function attachOmittedRecord(rawUser: string, pending: PendingOmittedRecord): string {
+  let record: Record<string, any>;
+  try { record = JSON.parse(rawUser) as Record<string, any>; } catch { return rawUser; }
+  const message = record.message && typeof record.message === "object"
+    ? record.message as Record<string, any>
+    : null;
+  if (!message) return rawUser;
+  const text = typeof message.content === "string" ? message.content : "";
+  message.content = [
+    {
+      type: "agent-webui-record-omitted",
+      bytes: pending.bytes,
+      sourceLineIndex: pending.sourceLineIndex,
+    },
+    ...(text ? [{ type: "text", text }] : []),
+  ];
+  return JSON.stringify(record);
+}
+
+function claudeAssistantText(uuid: string, text: string, lineIndex?: number): string {
   return JSON.stringify({
     type: "assistant",
     uuid,
+    ...sourceIndexField(lineIndex),
     message: { role: "assistant", model: "codex", content: [{ type: "text", text }] },
   });
 }
 
-function claudeToolUse(callId: string, name: string, input: unknown): string {
+function claudeAssistantImages(uuid: string, content: unknown[], lineIndex?: number): string | null {
+  const images = content.flatMap(block => {
+    const url = toolResultImageUrl(block);
+    return url ? [{ type: "image_url", image_url: url }] : [];
+  });
+  if (!images.length) return null;
+  return JSON.stringify({
+    type: "assistant",
+    uuid,
+    ...sourceIndexField(lineIndex),
+    message: { role: "assistant", model: "codex", content: images },
+  });
+}
+
+function claudeToolUse(callId: string, name: string, input: unknown, lineIndex?: number): string {
   return JSON.stringify({
     type: "assistant",
     uuid: callId,
+    ...sourceIndexField(lineIndex),
     message: { role: "assistant", model: "codex", content: [{ type: "tool_use", id: callId, name, input: input ?? {} }] },
   });
 }
 
-function claudeToolResult(callId: string, output: unknown): string {
+function claudeToolResult(callId: string, output: unknown, lineIndex?: number): string {
   return JSON.stringify({
     type: "user",
     uuid: `${callId}:result`,
+    ...sourceIndexField(lineIndex),
     message: { role: "user", content: [{ type: "tool_result", tool_use_id: callId, content: output }] },
   });
 }
 
 function normalizedCodexToolOutput(output: unknown): unknown {
+  if (typeof output === "string" && /^[\s]*[\[{]/.test(output)) {
+    try {
+      const parsed = JSON.parse(output);
+      if (Array.isArray(parsed) || (parsed && typeof parsed === "object" && Array.isArray(parsed.content))) {
+        output = parsed;
+      }
+    } catch { /* ordinary textual tool output */ }
+  }
   const candidate = (
     output
     && typeof output === "object"
@@ -152,27 +246,26 @@ function normalizedCodexToolOutput(output: unknown): unknown {
   return candidate.map(raw => {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
     const block = raw as Record<string, unknown>;
-    if (
-      (block.type === "input_text" || block.type === "output_text" || block.type === "text")
-      && typeof block.text === "string"
-    ) {
-      return { type: "text", text: cleanExecOutput(block.text) };
-    }
-    if (block.type === "input_image") {
-      const url = typeof block.image_url === "string"
-        ? block.image_url
-        : typeof block.imageUrl === "string" ? block.imageUrl : "";
-      const match = /^data:(image\/(?:png|jpe?g|gif|webp));base64,([a-z0-9+/]*={0,2})$/i.exec(url);
+    const url = toolResultImageUrl(block);
+    if (url) {
+      const match = /^data:(image\/[a-z0-9.+-]+);base64,([a-z0-9+/\r\n]*={0,2})$/i.exec(url);
       if (match?.[1] && match[2]) {
         return {
           type: "image",
           source: {
             type: "base64",
             media_type: match[1].toLowerCase().replace("jpg", "jpeg"),
-            data: match[2],
+            data: match[2].replace(/[\r\n]/g, ""),
           },
         };
       }
+      return { type: "image_url", image_url: url };
+    }
+    if (
+      (block.type === "input_text" || block.type === "output_text" || block.type === "text")
+      && typeof block.text === "string"
+    ) {
+      return { type: "text", text: cleanExecOutput(block.text) };
     }
     return raw;
   });
@@ -236,10 +329,14 @@ function adaptLineCached(rawLine: string, lineIndex: number): string[] {
   return out;
 }
 
-export function codexRolloutToClaudeLines(rawLines: string[]): string[] {
+export function codexRolloutToClaudeLines(
+  rawLines: string[],
+  options: { suppressLatestEmptyCompletion?: boolean } = {},
+): string[] {
   const turns: string[][] = [];
   let current: string[] | null = null;
   let pendingImages: PendingCodexImages | null = null;
+  let pendingOmitted: PendingOmittedRecord | null = null;
   const add = (line: string) => {
     if (!current) { current = []; turns.push(current); }
     current.push(line);
@@ -255,7 +352,10 @@ export function codexRolloutToClaudeLines(rawLines: string[]): string[] {
     }
     const imageRecord = codexUserImageRecord(rawLine, lineIndex);
     if (imageRecord) pendingImages = imageRecord.pending;
+    const omitted = omittedRecord(rawLine, lineIndex);
+    if (omitted) pendingOmitted = omitted;
     if (pendingImages && lineIndex - pendingImages.sourceLineIndex > 4) pendingImages = null;
+    if (pendingOmitted && lineIndex - pendingOmitted.sourceLineIndex > 4) pendingOmitted = null;
     for (const line of adaptLineCached(rawLine, lineIndex)) {
       if (line === ROLLBACK_SENTINEL) {
         const drop = rollbackCount(rawLine);
@@ -264,7 +364,9 @@ export function codexRolloutToClaudeLines(rawLines: string[]): string[] {
       } else if (line.startsWith(USER_SENTINEL)) {
         let user = line.slice(USER_SENTINEL.length);
         if (pendingImages) user = attachCodexImages(user, pendingImages);
+        else if (pendingOmitted) user = attachOmittedRecord(user, pendingOmitted);
         pendingImages = null;
+        pendingOmitted = null;
         current = [user];
         turns.push(current);
       } else {
@@ -272,6 +374,16 @@ export function codexRolloutToClaudeLines(rawLines: string[]): string[] {
       }
     }
   });
+
+  // A capacity failure is durably written as an empty task completion before
+  // Agent WebUI starts the replacement attempt. While the controller says a
+  // retry is pending, that boundary is progress rather than a terminal state.
+  // Keep ordinary/exhausted empty completions visible by making suppression an
+  // explicit, wire-driven choice from the caller.
+  const latestTurn = turns.at(-1);
+  if (options.suppressLatestEmptyCompletion && latestTurn && isEmptyCompleteLine(latestTurn.at(-1))) {
+    latestTurn.pop();
+  }
 
   return turns.flat();
 }
@@ -284,10 +396,10 @@ export function codexToClaudeLines(rawLine: string, lineIndex?: number): string[
   if (rec.type === "event_msg") {
     if (p.type === "user_message" && typeof p.message === "string") {
       const id = typeof p.id === "string" ? p.id : codexLineId(lineIndex);
-      return [USER_SENTINEL + claudeUser(id, p.message)];
+      return [USER_SENTINEL + claudeUser(id, p.message, lineIndex)];
     }
     if (p.type === "agent_message" && typeof p.message === "string") {
-      return [claudeAssistantText(stableId("a", lineIndex), p.message)];
+      return [claudeAssistantText(stableId("a", lineIndex), p.message, lineIndex)];
     }
     if (p.type === "thread_rolled_back") {
       return [ROLLBACK_SENTINEL];
@@ -301,12 +413,13 @@ export function codexToClaudeLines(rawLine: string, lineIndex?: number): string[
       // starting a new one: keeps display-turn count aligned with codex's
       // user-message turns (rollback/rewind splices by that count) and lets it
       // be dropped together with the turn it belongs to on rewind.
-      return [claudeUser(stableId("abort", lineIndex), "[Request interrupted by user]")];
+      return [claudeUser(stableId("abort", lineIndex), "[Request interrupted by user]", lineIndex)];
     }
     if (p.type === "task_complete" && p.last_agent_message === null) {
       return [claudeAssistantText(
         stableId("empty-complete", lineIndex),
         "Turn ended without a final response. Send another message to retry or continue.",
+        lineIndex,
       )];
     }
     return [];
@@ -314,19 +427,27 @@ export function codexToClaudeLines(rawLine: string, lineIndex?: number): string[
 
   if (rec.type === "response_item") {
     const callId = typeof p.call_id === "string" ? p.call_id : "";
-    if (p.type === "function_call" && callId) {
+    if ((p.type === "function_call" || p.type === "custom_tool_call") && callId) {
       const name = typeof p.name === "string" ? p.name : "tool";
       let args: unknown = {};
-      try { args = typeof p.arguments === "string" ? JSON.parse(p.arguments) : (p.arguments ?? {}); } catch { args = { raw: p.arguments }; }
+      const rawArgs = p.arguments ?? p.input;
+      try { args = typeof rawArgs === "string" ? JSON.parse(rawArgs) : (rawArgs ?? {}); } catch { args = { raw: rawArgs }; }
       if (name === "exec_command" || name === "shell") {
         const cmd = (args as { cmd?: string; command?: string }).cmd ?? (args as { command?: string }).command ?? "";
-        return [claudeToolUse(callId, "Bash", { command: cmd })];
+        return [claudeToolUse(callId, "Bash", { command: cmd }, lineIndex)];
       }
       // apply_patch / web_search / mcp / custom tools → generic tool-call row.
-      return [claudeToolUse(callId, name, args)];
+      return [claudeToolUse(callId, name, args, lineIndex)];
     }
-    if (p.type === "function_call_output" && callId) {
-      return [claudeToolResult(callId, normalizedCodexToolOutput(p.output))];
+    if ((p.type === "function_call_output" || p.type === "custom_tool_call_output") && callId) {
+      return [claudeToolResult(callId, normalizedCodexToolOutput(p.output), lineIndex)];
+    }
+    // Text from assistant response_item/message is duplicated by the clean
+    // agent_message event, but native image blocks are not. Preserve images
+    // alone so generated/tool-forwarded media can reach AssistantBlock.
+    if (p.type === "message" && p.role === "assistant" && Array.isArray(p.content)) {
+      const imageRecord = claudeAssistantImages(stableId("assistant-images", lineIndex), p.content, lineIndex);
+      return imageRecord ? [imageRecord] : [];
     }
     // response_item/message (developer + injected env_context + assistant
     // duplicates) and reasoning are dropped — event_msg carries clean text.

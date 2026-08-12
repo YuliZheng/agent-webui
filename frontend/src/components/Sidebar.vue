@@ -9,13 +9,14 @@ import { searchContent, refreshBackend } from "../api/sessions.js";
 import { useScrollTargetStore } from "../stores/scroll-target.js";
 import { useSearchHighlightStore } from "../stores/search-highlight.js";
 import { displayCwd } from "../util/cwd-display.js";
+import { isSessionSearchable } from "../util/session-access.js";
 import { isOrdinarySidebarSessionVisible } from "../util/session-visibility.js";
 import { effectiveSessionActivityMs } from "../util/session-recency.js";
 import { shouldRunContentSearch } from "../util/search-query.js";
 import { withoutPinnedSessions } from "../util/sidebar-pinning.js";
 import { APP_BACK_PRIORITY, registerAppBackHandler } from "../util/app-back.js";
 import { setPwaLayerActive } from "../util/pwa-history.js";
-import { wake as wsWake } from "../api/ws.js";
+import { useNotificationsStore } from "../stores/notifications.js";
 import SessionRow from "./SessionRow.vue";
 import NewSessionModal from "./modals/NewSessionModal.vue";
 import SettingsModal from "./modals/SettingsModal.vue";
@@ -109,7 +110,7 @@ onBeforeUnmount(() => {
 
 // ─── Pull-to-refresh on the sidebar ──────────────────────────────────────
 // WeChat-style: at the very top of the chat list, drag down past the
-// threshold then release to wake the WS and re-fetch the sessions list.
+// threshold then release to rescan and re-fetch the sessions list.
 // Avoids reloading the whole page through the corporate proxy when the
 // sidebar previews / live updates feel out of sync after a long suspend.
 //
@@ -173,35 +174,31 @@ async function runPullRefresh() {
   pullState.value = "refreshing";
   pullDistance.value = PULL_REFRESH_HOLD;
   try {
-    // Kick the WS first so any pending stream-line / status broadcasts
-    // we missed (suspend, network blip) start flowing before we re-pull
-    // the source of truth.
-    wsWake({ forceReconnect: true });
-    // Force-reconnect handles the engaged tail through ws.ts's onopen
-    // re-subscribe path. Calling refreshEngaged() immediately while the new
-    // socket is still CONNECTING can queue unsubscribe/subscribe frames in the
-    // wrong order and tear down the just-restored tail.
     // Wipe stale per-session statuses BEFORE fetchAll repopulates them.
     // hydrateList only sets statuses for sessions still in the returned
     // list — without the wipe, a session that finished while we were
     // offline AND dropped off the recent-N list would stay stuck on a
     // stale "running" forever.
     sessions.clearAllStatus();
+    const startedAtRevision = sessions.metadataRevision;
     await Promise.all([
-      // Backend rescan: re-adopt any TUI / orphan claudes that started
-      // after webui boot, and re-walk every jsonl to recompute
-      // isResponding (chokidar drops events under load / on resume).
-      refreshBackend().catch(() => undefined),
-      // Frontend source-of-truth refetch: titles, mtime, previews, fork
-      // tree, AND the freshly-recomputed status for each session.
-      sessions.fetchAll().catch(() => undefined),
+      (async () => {
+        // /api/refresh already returns the post-scan session snapshot. Using
+        // it directly avoids a second request and makes it impossible for a
+        // pre-scan list response to win the race.
+        const refreshed = await refreshBackend();
+        sessions.hydrateList(refreshed.sessions, startedAtRevision);
+      })(),
       // Per-user preferences: hidden sessions, groups, thinking trigger,
       // theme. Less commonly stale but cheap to refetch.
-      prefs.load().catch(() => undefined),
+      prefs.load(),
       // Floor: keep the spinner up long enough to feel intentional
       // even when everything resolves in <100 ms.
       new Promise((r) => setTimeout(r, 350)),
     ]);
+    notifications.pushInfo("已刷新最新会话");
+  } catch (err) {
+    notifications.pushError(err instanceof Error ? err.message : String(err), { title: "刷新失败" });
   } finally {
     pullDistance.value = 0;
     pullState.value = "idle";
@@ -233,6 +230,7 @@ const pullIndicatorLabel = computed(() => {
 });
 
 const sessions = useSessionsStore();
+const notifications = useNotificationsStore();
 const promptPending = usePromptPendingStore();
 const prefs = usePrefsStore();
 const drafts = useDraftsStore();
@@ -478,6 +476,7 @@ const idMatch = computed<string | null>(() => {
   let prefix: string | null = null;
   let sub: string | null = null;
   for (const id of allIds.value) {
+    if (!isSessionSearchable(sessions.byId[id])) continue;
     const f = id.toLowerCase();
     if (f === q) return id;
     if (!prefix && f.startsWith(q)) prefix = id;
@@ -492,6 +491,7 @@ function scoreFor(id: string): number | null {
   const tokens = searchTokens.value;
   if (tokens.length === 0) return null;
   const item = sessions.byId[id];
+  if (!isSessionSearchable(item)) return null;
   const title = (item?.title ?? "").toLowerCase();
   const cwdRaw = (item?.cwd ?? "").toLowerCase();
   const cwdDisp = displayCwd(item?.cwd, ui.home).toLowerCase();

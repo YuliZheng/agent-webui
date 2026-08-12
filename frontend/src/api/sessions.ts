@@ -357,8 +357,16 @@ export async function searchContent(query: string): Promise<ContentMatch[]> {
 }
 
 export interface LineEntry { index: number; raw: string }
-export interface TailResponse { totalLines: number; fromIndex: number; lines: LineEntry[] }
+export interface TailResponse {
+  totalLines: number;
+  fromIndex: number;
+  lines: LineEntry[];
+  /** Absent on older servers; automatic gap repair must stay disabled there. */
+  supportsCompactRange?: boolean;
+}
 export interface RangeResponse { totalLines: number; lines: LineEntry[] }
+export type SessionTailPriority = "interactive" | "background";
+export interface SessionRangeOptions { mode?: "compact" }
 export interface FullContextUsageResponse extends ContextUsage {
   completeHistoryScan: true;
   recordsScanned: number;
@@ -371,8 +379,12 @@ const SESSION_TAIL_TIMEOUT_MS = 8_000;
 // Fast initial-load: returns just the last `n` lines of a session jsonl.
 // Used on first visit to avoid streaming every line of long conversations
 // over WebSocket before paint.
-export async function readSessionTail(id: string, n: number): Promise<TailResponse> {
-  const q = new URLSearchParams({ n: String(n) });
+export async function readSessionTail(
+  id: string,
+  n: number,
+  priority: SessionTailPriority = "interactive",
+): Promise<TailResponse> {
+  const q = new URLSearchParams({ n: String(n), priority });
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), SESSION_TAIL_TIMEOUT_MS);
   try {
@@ -389,14 +401,27 @@ export async function readSessionTail(id: string, n: number): Promise<TailRespon
 }
 
 // Used by "Load earlier" to fetch a contiguous older index range.
-export async function readSessionRange(id: string, from: number, to: number): Promise<RangeResponse> {
+export async function readSessionRange(
+  id: string,
+  from: number,
+  to: number,
+  options: SessionRangeOptions = {},
+): Promise<RangeResponse> {
   const q = new URLSearchParams({ from: String(from), to: String(to) });
-  const res = await fetch(`/api/sessions/${encodeURIComponent(id)}/range?${q.toString()}`, {
-    credentials: "include",
-    cache: "no-store",
-  });
-  if (!res.ok) throw new Error(`read range failed: ${res.status}`);
-  return res.json() as Promise<RangeResponse>;
+  if (options.mode) q.set("mode", options.mode);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SESSION_TAIL_TIMEOUT_MS);
+  try {
+    const res = await fetch(`/api/sessions/${encodeURIComponent(id)}/range?${q.toString()}`, {
+      credentials: "include",
+      cache: "no-store",
+      signal: controller.signal,
+    });
+    if (!res.ok) throw new Error(`read range failed: ${res.status}`);
+    return res.json() as Promise<RangeResponse>;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 // Full-rollout, server-side streaming attribution. The response stays tiny:
@@ -419,10 +444,10 @@ export async function readFullCodexContextUsage(
 // Hit the backend's manual rescan endpoint. Pull-to-refresh on the sidebar
 // fires this so the foreign-claude-scanner and responding-tracker re-walk
 // state from disk, catching anything chokidar dropped.
-export async function refreshBackend(): Promise<{ ok: boolean; foreignAdopted: number }> {
+export async function refreshBackend(): Promise<{ sessions: SessionListItem[] }> {
   const r = await fetch("/api/refresh", { method: "POST", credentials: "include" });
   if (!r.ok) throw new Error(`refresh failed: ${r.status}`);
-  return r.json() as Promise<{ ok: boolean; foreignAdopted: number }>;
+  return r.json() as Promise<{ sessions: SessionListItem[] }>;
 }
 
 export { WsError as HttpError };

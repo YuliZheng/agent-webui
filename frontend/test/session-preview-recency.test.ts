@@ -43,14 +43,22 @@ describe("sidebar preview recency", () => {
     expect(store.byId.session?.mtime).toBe("2026-07-30T01:00:02.000Z");
   });
 
-  it("shows a durable latest message instead of hiding it behind running status", () => {
+  it("lets running progress replace a stale user preview in the sidebar", () => {
     const previewIndex = sessionRow.indexOf(
       'if (preview.value) return { text: preview.value, kind: "preview" };',
     );
     const runningIndex = sessionRow.indexOf("if (isRunning.value) {");
+    const assistantPreviewIndex = sessionRow.indexOf(
+      '(item.value?.previewRole === "assistant" ? preview.value : "")',
+    );
+    const turnProgressIndex = sessionRow.indexOf("live.turnProgress[props.id]");
 
     expect(previewIndex).toBeGreaterThan(-1);
-    expect(runningIndex).toBeGreaterThan(previewIndex);
+    expect(runningIndex).toBeGreaterThan(-1);
+    expect(assistantPreviewIndex).toBeGreaterThan(-1);
+    expect(turnProgressIndex).toBeGreaterThan(-1);
+    expect(runningIndex).toBeLessThan(previewIndex);
+    expect(assistantPreviewIndex).toBeLessThan(turnProgressIndex);
   });
 
   it("uses file size to order touched events with the same mtime", () => {

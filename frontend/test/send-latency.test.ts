@@ -34,6 +34,15 @@ describe("send feedback latency", () => {
     expect(promptInput).not.toContain("const showOptimistic = !draftCwd");
   });
 
+  it("advances the read baseline before an outbound prompt can race a watcher event", () => {
+    const markReadAt = promptInput.indexOf("if (!sessions.isPending(sid)) sessions.markRead(sid)");
+    const optimisticAt = promptInput.indexOf("pendId = promptPending.add");
+    const firstYieldAt = promptInput.indexOf("await nextTick()", optimisticAt);
+    expect(markReadAt).toBeGreaterThan(-1);
+    expect(markReadAt).toBeLessThan(optimisticAt);
+    expect(markReadAt).toBeLessThan(firstYieldAt);
+  });
+
   it("renders pending sends as real user bubbles before the thinking indicator", () => {
     const pendingBubbleAt = messageList.indexOf('class="cw-message-entry cw-message-entry-pending"');
     const thinkingAt = messageList.indexOf('v-else-if="running || compacting || optimisticallyStarting"');
@@ -41,10 +50,23 @@ describe("send feedback latency", () => {
     expect(thinkingAt).toBeGreaterThan(-1);
     expect(pendingBubbleAt).toBeLessThan(thinkingAt);
     expect(messageList).toContain('data-block="UserPromptBlock"');
-    expect(messageList).toContain("pp.phase === 'sending' ? 'sending'");
+    expect(messageList).toContain("row.prompt.phase === 'sending' ? 'sending'");
+    expect(messageList).toContain("interleavePendingPrompts(entries, pendingPrompts.value");
+    expect(messageList).toContain("__agentWebuiSourceIndex");
     expect(messageList).not.toContain('class="cw-queue-chip cw-queue-chip-optimistic');
     expect(userPromptBlock).toContain('pendingStatus?: "sending" | "steered"');
+    expect(userPromptBlock).toContain('"sent to current turn"');
     expect(userPromptBlock).toContain("cw-pending-prompt-status");
+  });
+
+  it("describes Codex steering separately from Claude queueing", () => {
+    expect(promptInput).toContain('const isCodexRunning = computed');
+    expect(promptInput).toContain('"Running… (Send into current turn)"');
+    expect(promptInput).toContain('"Send into current turn"');
+    expect(promptInput).toContain('"Running… (Send to queue)"');
+    expect(promptInput).toContain('"Send to queue"');
+    expect(promptInput).toContain(':placeholder="promptPlaceholder"');
+    expect(promptInput).toContain(':aria-label="sendActionTitle"');
   });
 
   it("stops showing sending and starts optimistic activity as soon as WebSocket dispatches", () => {

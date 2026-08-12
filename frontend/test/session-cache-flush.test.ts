@@ -5,6 +5,7 @@ interface Snapshot {
   id: string;
   lines: string[];
   nextLineIndex: number;
+  loadedFromIndex: number | null;
 }
 
 interface Gate {
@@ -56,6 +57,7 @@ describe("session cache flush serialization", () => {
       id: "append-race",
       lines: ["first"],
       nextLineIndex: 1,
+      loadedFromIndex: 0,
     }]);
 
     cache.appendLine("append-race", 1, "second");
@@ -64,8 +66,8 @@ describe("session cache flush serialization", () => {
     await drainMicrotasks();
 
     expect(storage.saves).toEqual([
-      { id: "append-race", lines: ["first"], nextLineIndex: 1 },
-      { id: "append-race", lines: ["first", "second"], nextLineIndex: 2 },
+      { id: "append-race", lines: ["first"], nextLineIndex: 1, loadedFromIndex: 0 },
+      { id: "append-race", lines: ["first", "second"], nextLineIndex: 2, loadedFromIndex: 0 },
     ]);
 
     storage.gates[1]!.resolve();
@@ -89,8 +91,8 @@ describe("session cache flush serialization", () => {
     storage.gates[0]!.resolve();
     await drainMicrotasks();
     expect(storage.saves).toEqual([
-      { id: "clear-race", lines: ["stale"], nextLineIndex: 1 },
-      { id: "clear-race", lines: [], nextLineIndex: 0 },
+      { id: "clear-race", lines: ["stale"], nextLineIndex: 1, loadedFromIndex: 0 },
+      { id: "clear-race", lines: [], nextLineIndex: 0, loadedFromIndex: null },
     ]);
 
     storage.gates[1]!.resolve();
@@ -113,22 +115,22 @@ describe("session cache flush serialization", () => {
     // first snapshot is still blocked.
     await vi.advanceTimersByTimeAsync(200);
     expect(storage.saves).toEqual([
-      { id: "recreate-race", lines: ["old"], nextLineIndex: 1 },
+      { id: "recreate-race", lines: ["old"], nextLineIndex: 1, loadedFromIndex: 0 },
     ]);
 
     storage.gates[0]!.resolve();
     await drainMicrotasks();
     expect(storage.saves).toEqual([
-      { id: "recreate-race", lines: ["old"], nextLineIndex: 1 },
-      { id: "recreate-race", lines: [], nextLineIndex: 0 },
+      { id: "recreate-race", lines: ["old"], nextLineIndex: 1, loadedFromIndex: 0 },
+      { id: "recreate-race", lines: [], nextLineIndex: 0, loadedFromIndex: null },
     ]);
 
     storage.gates[1]!.resolve();
     await drainMicrotasks();
     expect(storage.saves).toEqual([
-      { id: "recreate-race", lines: ["old"], nextLineIndex: 1 },
-      { id: "recreate-race", lines: [], nextLineIndex: 0 },
-      { id: "recreate-race", lines: ["new"], nextLineIndex: 1 },
+      { id: "recreate-race", lines: ["old"], nextLineIndex: 1, loadedFromIndex: 0 },
+      { id: "recreate-race", lines: [], nextLineIndex: 0, loadedFromIndex: null },
+      { id: "recreate-race", lines: ["new"], nextLineIndex: 1, loadedFromIndex: 0 },
     ]);
 
     storage.gates[2]!.resolve();

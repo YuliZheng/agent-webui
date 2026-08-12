@@ -238,6 +238,7 @@ export function mergeSessionListItem(
     mtime: existing.mtime,
     size: existing.size,
     preview: existing.preview ?? null,
+    previewRole: existing.previewRole ?? null,
     lastTurnAt: existing.lastTurnAt ?? null,
     lastBoundaryAt: existing.lastBoundaryAt ?? null,
   };
@@ -329,7 +330,7 @@ export const useSessionsStore = defineStore("sessions", {
       this.loaded = true;
       this.lastError = null;
     },
-    async fetchAll() {
+    async fetchAll(): Promise<boolean> {
       this.syncInFlight++;
       const generation = ++this.fetchGeneration;
       const startedAtRevision = this.metadataRevision;
@@ -338,10 +339,12 @@ export const useSessionsStore = defineStore("sessions", {
         if (generation === this.fetchGeneration) {
           this.hydrateList(list, startedAtRevision);
         }
+        return true;
       } catch (err) {
         if (generation === this.fetchGeneration) {
           this.lastError = (err as Error).message;
         }
+        return false;
       } finally {
         this.syncInFlight = Math.max(0, this.syncInFlight - 1);
       }
@@ -425,13 +428,20 @@ export const useSessionsStore = defineStore("sessions", {
     // the read watermark to the server so every other device clears too. The
     // watermark is the session's lastTurnAt at read time (falls back to mtime).
     markRead(id: string) {
-      this.markReadLocal(id);
       const e = this.byId[id];
       const at = e?.lastTurnAt || e?.mtime;
-      if (at) {
-        if (e) e.readAt = at; // keep the local row consistent for later reconciles
-        markReadRemote(id, at);
-      }
+      if (at) this.markReadAt(id, at);
+      else this.markReadLocal(id);
+    },
+    // Advance monotonically. Delayed completion notifications can arrive
+    // after the user has already sent the next prompt; they must never move a
+    // newer read watermark backwards and resurrect an unread badge.
+    markReadAt(id: string, at: string) {
+      this.markReadLocal(id);
+      const e = this.byId[id];
+      if (!e || validTime(at) <= validTime(e.readAt)) return;
+      e.readAt = at;
+      markReadRemote(id, at);
     },
     // Clear the local unread count WITHOUT broadcasting. Used when a
     // `session-read` arrives from another device (avoids an echo loop) and by

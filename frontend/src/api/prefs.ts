@@ -120,6 +120,7 @@ export function adaptBackendPrefs(value: unknown): PrefsBlob {
         ? "default"
         : stringValue(source.defaultPermissionMode) as PrefsBlob["defaultPermissionMode"],
       defaultCodexModel: stringValue(source.defaultCodexModel),
+      defaultClaudeEffort: stringValue(source.defaultClaudeEffort),
       defaultCodexEffort: stringValue(source.defaultCodexEffort),
       defaultCodexServiceTier: source.defaultCodexServiceTier === "priority" ? "priority" : "",
       defaultCodexApproval: stringValue(source.defaultCodexApproval),
@@ -161,6 +162,7 @@ export function adaptBackendPrefs(value: unknown): PrefsBlob {
     defaultModel: stringValue(source.defaultClaudeModel),
     defaultPermissionMode: stringValue(source.defaultClaudePermissionMode) as PrefsBlob["defaultPermissionMode"],
     defaultCodexModel: stringValue(source.defaultCodexModel),
+    defaultClaudeEffort: stringValue(source.defaultClaudeEffort),
     defaultCodexEffort: stringValue(source.defaultCodexEffort),
     defaultCodexServiceTier: source.defaultCodexServiceTier === "priority" ? "priority" : "",
     defaultCodexApproval: codexApprovalFromBackend(source),
@@ -250,6 +252,7 @@ export function adaptFrontendPrefs(blob: PrefsBlob): UnknownRecord {
     defaultClaudeModel: blob.defaultModel,
     defaultClaudePermissionMode: blob.defaultPermissionMode === "default" ? "" : blob.defaultPermissionMode,
     defaultCodexModel: blob.defaultCodexModel,
+    defaultClaudeEffort: blob.defaultClaudeEffort,
     defaultCodexEffort: blob.defaultCodexEffort,
     defaultCodexServiceTier: blob.defaultCodexServiceTier,
     ...codex,

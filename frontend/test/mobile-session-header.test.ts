@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 const mainPane = readFileSync(join(process.cwd(), "src/components/MainPane.vue"), "utf8");
+const mobileGoalPopover = readFileSync(join(process.cwd(), "src/components/MobileGoalPopover.vue"), "utf8");
 const statusPage = readFileSync(join(process.cwd(), "src/components/SessionStatusPage.vue"), "utf8");
 const assistantBlock = readFileSync(join(process.cwd(), "src/components/blocks/AssistantBlock.vue"), "utf8");
 const localCommands = readFileSync(join(process.cwd(), "src/util/local-commands.ts"), "utf8");
@@ -17,7 +18,7 @@ describe("mobile WeChat-style session header", () => {
     expect(mainPane).toContain('class="hidden md:inline"');
     expect(mainPane).toContain("grid-cols-[2.25rem_minmax(0,1fr)_2.25rem]");
     expect(mainPane).toContain("cw-main-header-copy min-w-0 text-center md:flex-1 md:text-left");
-    expect(mainPane).toContain("flex items-center justify-center gap-2 truncate text-[11px]");
+    expect(mainPane).toContain("flex min-w-0 items-center justify-center gap-2 text-[11px]");
     expect(mainPane).toContain("md:justify-start");
     expect(mainPane).toContain("Click to copy working directory");
     expect(mainPane).toContain("Click to copy full session id");
@@ -40,6 +41,36 @@ describe("mobile WeChat-style session header", () => {
     expect(statusPage).toContain('aria-label="返回会话"');
     expect(statusPage).not.toContain("与 <span");
     expect(statusPage).not.toContain("rounded-t-[22px]");
+  });
+
+  it("keeps the first title row clear and places the compact goal popover in the metadata row", () => {
+    const metaStart = mainPane.indexOf("cw-main-header-meta");
+    const goalStart = mainPane.indexOf("<MobileGoalPopover");
+    const desktopActionsStart = mainPane.indexOf("<BackgroundTasksPill");
+    const metaOpeningStart = mainPane.lastIndexOf("<div", metaStart);
+    const metaOpeningEnd = mainPane.indexOf(">", metaStart);
+    const metaOpening = mainPane.slice(metaOpeningStart, metaOpeningEnd + 1);
+    expect(mainPane).toContain("MobileGoalPopover");
+    expect(metaStart).toBeGreaterThan(-1);
+    expect(goalStart).toBeGreaterThan(metaStart);
+    expect(goalStart).toBeLessThan(desktopActionsStart);
+    expect(metaOpening).not.toContain("truncate");
+    expect(metaOpening).not.toContain("overflow-hidden");
+    expect(metaOpening).not.toContain("opacity-60");
+    expect(mainPane.slice(metaStart, goalStart)).toContain("overflow-hidden opacity-60");
+    expect(mainPane).toContain('v-if="goal && !isDraft"');
+    expect(mainPane).toContain(':session-id="sessionId"');
+    expect(mainPane).toContain(':goal="goal"');
+    expect(mainPane).toContain("Click to copy working directory");
+    expect(mainPane).toContain("Click to copy full session id");
+    expect(mobileGoalPopover).toContain('aria-label="查看 Goal"');
+    expect(mobileGoalPopover).toContain(':aria-expanded="open"');
+    expect(mobileGoalPopover).toContain('role="dialog"');
+    expect(mobileGoalPopover).toContain("{{ goal.objective }}");
+    expect(mobileGoalPopover).toContain("{{ tokenSummary }}");
+    expect(mobileGoalPopover).toContain('document.addEventListener("click", onDocumentClick)');
+    expect(mobileGoalPopover).toContain('event.key !== "Escape"');
+    expect(mobileGoalPopover).toContain("APP_BACK_PRIORITY.menu");
   });
 
   it("shares the slash-status model and exposes the process kill rather than a duplicate stop", () => {

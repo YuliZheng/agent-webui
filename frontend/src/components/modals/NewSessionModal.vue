@@ -162,6 +162,7 @@ async function submit() {
       text: promptText,
       imageCount: 0,
       startedAtLineCount: 0,
+      startedAtSessionSize: 0,
       agent: selectedAgent,
     });
     const clientFingerprint = idempotencyFingerprint(JSON.stringify([

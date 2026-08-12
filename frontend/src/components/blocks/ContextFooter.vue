@@ -179,7 +179,13 @@ async function startContinuationSession() {
   const draftId = sessions.createPending(cwd, nextAgent);
   continuationError.value = "";
   continuationStarting.value = true;
-  const pendingId = promptPending.add(draftId, { text: prompt, imageCount: 0, startedAtLineCount: 0, agent: nextAgent });
+  const pendingId = promptPending.add(draftId, {
+    text: prompt,
+    imageCount: 0,
+    startedAtLineCount: 0,
+    startedAtSessionSize: 0,
+    agent: nextAgent,
+  });
   // The continuation RPC may spend a long time booting Codex/Claude. Lock the
   // newly selected draft before exposing its composer so a second Send cannot
   // race this newSession and promote the same draft into two real sessions.

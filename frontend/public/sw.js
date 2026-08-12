@@ -1,5 +1,8 @@
 const CACHE_PREFIX = "agent-webui-static-";
-const CACHE_NAME = `${CACHE_PREFIX}v1`;
+// v2 drops shells that can keep a long-lived mobile PWA on an old frontend
+// after an atomic publish. The page now performs its own network build check
+// and safely reloads once transient composer state is clear.
+const CACHE_NAME = `${CACHE_PREFIX}v2`;
 const SHELL_KEY = "/";
 const NAVIGATION_NETWORK_BUDGET_MS = 750;
 const STATIC_PATHS = new Set([

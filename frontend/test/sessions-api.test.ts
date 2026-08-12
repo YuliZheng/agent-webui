@@ -144,21 +144,34 @@ describe("sessions API HTTP reads", () => {
     })) as unknown as typeof fetch;
     vi.stubGlobal("fetch", fetchMock);
 
-    await readSessionTail("abc/def", 200);
+    await readSessionTail("abc/def", 200, "interactive");
     await readSessionRange("abc/def", 10, 20);
+    await readSessionRange("abc/def", 10, 20, { mode: "compact" });
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "/api/sessions/abc%2Fdef/tail?n=200",
+      "/api/sessions/abc%2Fdef/tail?n=200&priority=interactive",
       expect.objectContaining({
         credentials: "include",
         cache: "no-store",
         signal: expect.any(AbortSignal),
       }),
     );
-    expect(fetchMock).toHaveBeenCalledWith("/api/sessions/abc%2Fdef/range?from=10&to=20", {
-      credentials: "include",
-      cache: "no-store",
-    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/sessions/abc%2Fdef/range?from=10&to=20",
+      expect.objectContaining({
+        credentials: "include",
+        cache: "no-store",
+        signal: expect.any(AbortSignal),
+      }),
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/sessions/abc%2Fdef/range?from=10&to=20&mode=compact",
+      expect.objectContaining({
+        credentials: "include",
+        cache: "no-store",
+        signal: expect.any(AbortSignal),
+      }),
+    );
   });
 
   it("aborts a wedged mobile tail request instead of showing syncing forever", async () => {
@@ -170,6 +183,22 @@ describe("sessions API HTTP reads", () => {
       vi.stubGlobal("fetch", fetchMock);
 
       const result = expect(readSessionTail("slow", 60)).rejects.toThrow("tail aborted");
+      await vi.advanceTimersByTimeAsync(8_000);
+      await result;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("aborts a wedged history-range request so loading earlier stays retryable", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = vi.fn((_url: RequestInfo | URL, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new Error("range aborted")), { once: true });
+      })) as unknown as typeof fetch;
+      vi.stubGlobal("fetch", fetchMock);
+
+      const result = expect(readSessionRange("slow", 0, 200)).rejects.toThrow("range aborted");
       await vi.advanceTimersByTimeAsync(8_000);
       await result;
     } finally {

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, onMounted, nextTick, watch } from "vue";
 import type { AgentCapabilities } from "@claude-webui/shared/api";
-import { MODEL_CHOICES, CODEX_MODEL_CHOICES, CODEX_DEFAULT_MODEL, CODEX_APPROVAL_PRESETS, CODEX_DEFAULT_APPROVAL, PERMISSION_MODES } from "@claude-webui/shared/prefs";
+import { MODEL_CHOICES, CODEX_MODEL_CHOICES, CODEX_DEFAULT_MODEL, CODEX_APPROVAL_PRESETS, CODEX_DEFAULT_APPROVAL, PERMISSION_MODES, CLAUDE_REASONING_EFFORTS } from "@claude-webui/shared/prefs";
 import { useSessionSettingsStore } from "../stores/session-settings.js";
 import { useSessionsStore } from "../stores/sessions.js";
 import { usePrefsStore } from "../stores/prefs.js";
@@ -32,14 +32,17 @@ const isCodex = computed(() => sessions.byId[props.sessionId]?.agent === "codex"
 const modelChoices = computed<readonly string[]>(() => isCodex.value ? CODEX_MODEL_CHOICES : MODEL_CHOICES);
 const codexEff = computed(() => settings.effectiveCodex(props.sessionId));
 
-// Effort pill — only for Codex (Claude uses the Extended Thinking trigger instead).
+// Effort pill. Codex resolves through the codex capability chain; Claude
+// through the backend push (set-effort) with the webui pref, then the
+// external CLAUDE_CODE_EFFORT_LEVEL (surfaced via claude capabilities), as
+// fallbacks.
 const currentEffort = computed(() => {
   // Resolve effective effort: session override → global pref default → null
   const raw = isDraft.value
-    ? (draft.value?.effort ?? (prefs.defaultCodexEffort || null))
+    ? (draft.value?.effort ?? (isCodex.value ? (prefs.defaultCodexEffort || null) : (prefs.defaultClaudeEffort || null)))
     : isCodex.value
       ? (codexEff.value.effort || null)
-      : null;
+      : (eff.value.effort || prefs.defaultClaudeEffort || codexCapabilities.value?.defaults.effort || null);
   return raw;
 });
 // While a service-tier request is in flight, keep the user's newest choice as
@@ -81,7 +84,10 @@ const fastKnown = computed(() =>
 );
 const fastStateLabel = computed(() => fastKnown.value ? (fastMode.value ? "on" : "off") : "unknown");
 const effortLabel = computed(() => {
-  return currentEffort.value || "(default)";
+  // Claude always shows the effective value (never "(default)") — the
+  // fallback chain ends at the external settings.json default.
+  if (currentEffort.value) return currentEffort.value;
+  return isCodex.value ? "(default)" : "?";
 });
 // stashed on the pending draft (localStorage) and ride along with the
 // first newSession call instead of going through the set-model RPC.
@@ -105,7 +111,9 @@ const currentModelCapability = computed(() =>
   codexCapabilities.value?.models.find(model => model.value === currentModel.value),
 );
 const effortChoices = computed(() =>
-  resolveCodexEffortChoices(currentModelCapability.value?.supportedEfforts),
+  isCodex.value
+    ? resolveCodexEffortChoices(currentModelCapability.value?.supportedEfforts)
+    : CLAUDE_REASONING_EFFORTS,
 );
 const fastSupportKnown = computed(() => currentModelCapability.value?.serviceTiers !== undefined);
 const fastSupported = computed(() =>
@@ -170,7 +178,7 @@ function positionPop(anchor: HTMLElement | null) {
 function toggle(which: "model" | "effort" | "perm") {
   if (open.value === which) { close(); return; }
   open.value = which;
-  if (isCodex.value && (which === "model" || which === "effort")) void loadCodexCapabilities();
+  if (which === "model" || which === "effort") void loadCapabilities();
   void nextTick(() => positionPop(
     which === "model" ? modelBtn.value :
     which === "effort" ? effortBtn.value :
@@ -193,12 +201,12 @@ function onKey(e: KeyboardEvent) {
   if (e.key === "Escape" && open.value) { e.preventDefault(); close(); }
 }
 function onResize() { if (open.value) close(); }
-async function loadCodexCapabilities() {
-  if (!isCodex.value || capabilitiesLoading.value || codexCapabilities.value) return;
+async function loadCapabilities() {
+  if (capabilitiesLoading.value || codexCapabilities.value) return;
   capabilitiesLoading.value = true;
   try {
     codexCapabilities.value = await getAgentCapabilities(
-      "codex",
+      isCodex.value ? "codex" : "claude",
       sessions.byId[props.sessionId]?.cwd,
     );
   } catch {
@@ -346,14 +354,13 @@ async function interrupt() {
         <span class="chev">▾</span>
       </button>
 
-      <!-- Effort pill — Codex only -->
+      <!-- Effort pill — Codex has Fast tier marks, Claude plain effort -->
       <button
-        v-if="isCodex"
         ref="effortBtn"
         type="button"
         class="pill-btn shrink-0"
         :class="{ 'pill-active': open === 'effort', 'pill-fast-on': fastMode }"
-        :title="`effort = ${currentEffort || '(default)'} · Fast ${fastStateLabel} — click to switch`"
+        :title="isCodex ? `effort = ${currentEffort || '(default)'} · Fast ${fastStateLabel} — click to switch` : `effort = ${currentEffort || '(default)'} — click to switch`"
         @click="toggle('effort')"
       >
         <span v-if="fastMode" class="fast-inline-mark" aria-hidden="true">⚡</span>
@@ -416,7 +423,7 @@ async function interrupt() {
     </div>
     </Teleport>
 
-    <!-- Effort popover — Codex only -->
+    <!-- Effort popover -->
     <Teleport to="body">
     <div
       v-if="open === 'effort'"
@@ -424,6 +431,7 @@ async function interrupt() {
       :style="popStyle"
     >
       <button
+        v-if="isCodex"
         type="button"
         class="pill-pop-item pill-pop-fast"
         :class="{ 'pill-pop-fast-active': fastMode, 'pill-pop-fast-syncing': fastBusy }"
