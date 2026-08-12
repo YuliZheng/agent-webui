@@ -133,7 +133,7 @@ onMounted(async () => {
   <button
     v-else
     type="button"
-    class="block rounded overflow-hidden border border-[color:color-mix(in_srgb,var(--cw-accent)_30%,transparent)] bg-[var(--cw-panel-bg)] hover:opacity-90 active:opacity-80 transition cursor-zoom-in"
+    class="flex h-40 w-[12rem] items-center justify-center rounded overflow-hidden border border-[color:color-mix(in_srgb,var(--cw-accent)_30%,transparent)] bg-[var(--cw-panel-bg)] hover:opacity-90 active:opacity-80 transition cursor-zoom-in"
     @click="emit('open')"
     :title="alt"
   >
@@ -142,7 +142,7 @@ onMounted(async () => {
       :alt="alt"
       loading="lazy"
       decoding="async"
-      class="block max-h-40 max-w-[12rem] object-contain"
+      class="block max-h-full max-w-full object-contain"
       @error="onError"
       @load="onLoad"
     />

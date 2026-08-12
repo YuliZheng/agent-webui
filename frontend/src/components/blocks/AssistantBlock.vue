@@ -10,7 +10,7 @@ import { useUiStore } from "../../stores/ui.js";
 import { useDraftsStore } from "../../stores/drafts.js";
 import { useNotificationsStore } from "../../stores/notifications.js";
 import { splitInlineVisualizations } from "../../util/inline-visualization.js";
-import { extractToolResultImages } from "../../util/tool-result-images.js";
+import { extractToolResultImages, toolResultImageUrl } from "../../util/tool-result-images.js";
 import InlineVisualization from "./InlineVisualization.vue";
 import ChatImage from "./ChatImage.vue";
 import { useLightboxStore } from "../../stores/lightbox.js";
@@ -49,6 +49,11 @@ const items = computed<Item[]>(() => {
   let useIdx = 0;
   for (const b of m) {
     const o = b as any;
+    const directImageUrl = toolResultImageUrl(o);
+    if (directImageUrl) {
+      out.push({ kind: "image", url: directImageUrl });
+      continue;
+    }
     if (o?.type === "text") {
       for (const part of splitInlineVisualizations(o.text ?? "")) {
         out.push(part.kind === "text"
@@ -202,7 +207,11 @@ watch(dark, () => rehighlight(), { flush: "post" });
           : 'border-[var(--cw-success)] bg-[color-mix(in_srgb,var(--cw-success)_8%,transparent)]'"
         v-html="renderMarkdown(it.text || '')"
       />
-      <ToolCall v-else-if="it.kind === 'tool' && it.pair" :pair="it.pair" />
+      <ToolCall
+        v-else-if="it.kind === 'tool' && it.pair"
+        :pair="it.pair"
+        hide-result-images
+      />
       <InlineVisualization
         v-else-if="it.kind === 'visualization' && it.file && ui.selectedSessionId"
         :session-id="ui.selectedSessionId"

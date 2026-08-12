@@ -60,10 +60,10 @@ const lightbox = useLightboxStore();
           v-for="(img, i) in visibleImages"
           :key="i"
           type="button"
-          class="block rounded overflow-hidden border border-[var(--cw-border)]  bg-[var(--cw-panel-bg)] hover:opacity-90 active:opacity-80 transition cursor-zoom-in"
+          class="flex h-[200px] w-[200px] max-w-full items-center justify-center rounded overflow-hidden border border-[var(--cw-border)]  bg-[var(--cw-panel-bg)] hover:opacity-90 active:opacity-80 transition cursor-zoom-in"
           @click.stop="lightbox.open(img.url, '[image]')"
         >
-          <img :src="img.url" alt="[image]" loading="lazy" decoding="async" class="block max-h-[200px] object-contain" />
+          <img :src="img.url" alt="[image]" loading="lazy" decoding="async" class="block max-h-full max-w-full object-contain" />
         </button>
       </div>
     </template>

@@ -74,10 +74,18 @@ const structuredImages = computed(() => {
     const filename = typeof block.name === "string" && block.name.trim()
       ? block.name
       : `image-${ordinal + 1}.${extension}`;
+    const sessionImagePrefix = `/api/sessions/${encodeURIComponent(sessionId)}/`;
+    const sourceUrl = typeof source.url === "string"
+      && (
+        source.url.startsWith(`${sessionImagePrefix}transcript-image/`)
+        || source.url.startsWith(`${sessionImagePrefix}input-image/`)
+      )
+      ? source.url
+      : null;
     out.push({
       sid: sessionId,
       filename,
-      url: `/api/sessions/${encodeURIComponent(sessionId)}/input-image/${lineIndex}/${sourceImageIndex}`,
+      url: sourceUrl ?? `${sessionImagePrefix}input-image/${lineIndex}/${sourceImageIndex}`,
     });
   }
   return out;
@@ -92,10 +100,19 @@ const images = computed(() => {
 });
 const pdfs = computed(() => extracted.value.pdfs);
 const pendingImageCount = computed(() => Math.max(0, Math.floor(props.pendingImageCount ?? 0)));
+const omittedRecordBytes = computed(() => {
+  const content = (props.node.record.message as { content?: unknown } | undefined)?.content;
+  if (!Array.isArray(content)) return 0;
+  const block = content.find((item: any) => item?.type === "agent-webui-record-omitted") as { bytes?: unknown } | undefined;
+  const bytes = Number(block?.bytes);
+  return Number.isFinite(bytes) && bytes > 0 ? bytes : 0;
+});
+const omittedRecordLabel = computed(() => `${(omittedRecordBytes.value / 1024 / 1024).toFixed(2)} MiB record not loaded`);
 const hasAttachments = computed(() =>
   images.value.length > 0 ||
   pdfs.value.length > 0 ||
-  pendingImageCount.value > 0
+  pendingImageCount.value > 0 ||
+  omittedRecordBytes.value > 0
 );
 // WeChat skin splits an image+text prompt into two bubbles (like two WeChat
 // messages), but MessageList's entry-level avatar only aligns with the first
@@ -348,6 +365,11 @@ function toggleCollapsed(event: MouseEvent) {
           v-if="pendingImageCount"
           class="cw-pending-attachment-chip"
         ><span aria-hidden="true">📷</span><span>{{ pendingImageCount }} image{{ pendingImageCount === 1 ? "" : "s" }}</span></span>
+        <span
+          v-if="omittedRecordBytes"
+          class="cw-pending-attachment-chip border border-[var(--cw-warning)]"
+          title="The transcript record exceeded the server display limit. Its original data remains on disk."
+        ><span aria-hidden="true">⚠️</span><span>{{ omittedRecordLabel }}</span></span>
       </div>
     </div>
     <div
@@ -381,7 +403,7 @@ function toggleCollapsed(event: MouseEvent) {
     />
     <div v-if="pendingStatus" class="cw-pending-prompt-status" role="status">
       <span class="cw-pending-prompt-dot" aria-hidden="true" />
-      <span>{{ pendingStatus === "steered" ? "steered" : "sending…" }}</span>
+      <span>{{ pendingStatus === "steered" ? "sent to current turn" : "sending…" }}</span>
     </div>
     <div
       v-if="!preview && sessionId && uuid"

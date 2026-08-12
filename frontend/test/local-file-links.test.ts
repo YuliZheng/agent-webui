@@ -91,6 +91,8 @@ describe("local file links", () => {
     expect(localFilePreviewKind("ticket.pdf")).toBe("pdf");
     expect(localFilePreviewKind("notes.txt")).toBe("text");
     expect(localFilePreviewKind("photo.avif")).toBe("image");
+    expect(localFilePreviewKind("recording.m4a")).toBe("audio");
+    expect(localFilePreviewKind("movie.MP4")).toBe("video");
     expect(localFilePreviewKind("archive.zip")).toBe("binary");
   });
 });

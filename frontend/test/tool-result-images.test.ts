@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { extractToolResultImages } from "../src/util/tool-result-images.js";
 
 describe("tool-result image bubbles", () => {
-  it("extracts only valid base64 image blocks", () => {
+  it("extracts Claude, MCP, URL, and serialized Codex image blocks", () => {
     expect(extractToolResultImages([
       { type: "text", text: "ready" },
       {
@@ -10,8 +10,18 @@ describe("tool-result image bubbles", () => {
         source: { type: "base64", media_type: "image/png", data: "aGVsbG8=" },
       },
       { type: "image", source: { type: "url", url: "https://example.test/x.png" } },
+      { type: "image", mimeType: "image/webp", data: "d29ybGQ=" },
+      { type: "image_url", image_url: { url: "https://example.test/y.png" } },
+      { type: "image_url", image_url: "/api/sessions/session-1/transcript-image/27/3" },
     ])).toEqual([
       { url: "data:image/png;base64,aGVsbG8=" },
+      { url: "https://example.test/x.png" },
+      { url: "data:image/webp;base64,d29ybGQ=" },
+      { url: "https://example.test/y.png" },
+      { url: "/api/sessions/session-1/transcript-image/27/3" },
     ]);
+    expect(extractToolResultImages(JSON.stringify({
+      content: [{ type: "input_image", image_url: "data:image/png;base64,aA==" }],
+    }))).toEqual([{ url: "data:image/png;base64,aA==" }]);
   });
 });

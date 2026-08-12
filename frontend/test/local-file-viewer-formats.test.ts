@@ -20,4 +20,13 @@ describe("local file format previews", () => {
     expect(backend).toContain('Content-Disposition');
     expect(backend).toContain('Only PDF files can be embedded through this endpoint');
   });
+
+  it("browses directories and keeps media download-only", () => {
+    expect(viewer).toContain("listLocalDirectory");
+    expect(viewer).toContain("directory.entries");
+    expect(viewer).toContain("Open folder links on PC");
+    expect(viewer).toContain("Media stays download-only");
+    expect(backend).toContain('case "inspect-local-path"');
+    expect(backend).toContain('case "list-local-directory"');
+  });
 });

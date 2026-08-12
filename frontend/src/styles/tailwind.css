@@ -534,6 +534,23 @@ body { @apply bg-white text-; }
   }
 }
 
+/* MessageList owns scroll anchoring so async thumbnails, code highlighting and
+   history prepends cannot race the browser's independent anchor adjustment. */
+.cw-message-scroller {
+  display: flex;
+  flex-direction: column;
+  overflow-anchor: none;
+}
+
+.cw-message-scroller > :not(.cw-message-top-spacer) {
+  flex-shrink: 0;
+}
+
+.cw-message-top-spacer {
+  flex: 1 1 0%;
+  min-height: 0;
+}
+
 /* Message display variants. `current` intentionally has no overrides: it is
    the production/classic rendering. Other variants reuse the same parser and
    Vue block components, then restyle via semantic classes/data attributes. */
@@ -3382,6 +3399,21 @@ html:not(.cw-style-current) {
     height: 42px !important;
   }
 
+  .cw-app-shell.cw-shell-wechat .cw-attachment-size-summary {
+    flex: 0 0 auto;
+    padding-right: 6px;
+    font-size: 10px;
+  }
+
+  .cw-app-shell.cw-shell-wechat .cw-attachment-action-active {
+    color: var(--cw-accent);
+  }
+
+  .cw-app-shell.cw-shell-wechat .cw-attachment-action-active .cw-attachment-action-icon {
+    background: color-mix(in srgb, var(--cw-accent) 14%, var(--cw-panel-2));
+    border-color: color-mix(in srgb, var(--cw-accent) 45%, var(--cw-border));
+  }
+
   .cw-app-shell.cw-shell-wechat .cw-composer-row {
     flex: 1 1 auto;
     min-height: 0;
@@ -3530,7 +3562,7 @@ html:not(.cw-style-current) {
 
   .cw-app-shell.cw-shell-wechat .cw-composer-textarea,
   .cw-app-shell.cw-shell-wechat .cw-voice-bar {
-    min-height: 38px;
+    min-height: 44px;
     height: auto !important;
     max-height: 192px !important;
     border-radius: 8px !important;
@@ -3555,8 +3587,10 @@ html:not(.cw-style-current) {
   .cw-app-shell.cw-shell-wechat .cw-mic-toggle,
   .cw-app-shell.cw-shell-wechat .cw-attach-button {
     display: inline-flex !important;
-    width: 38px !important;
-    height: 38px !important;
+    width: 44px !important;
+    height: 44px !important;
+    min-width: 44px;
+    min-height: 44px;
     border-radius: 999px !important;
     background: var(--cw-control-bg) !important;
   }
@@ -3571,7 +3605,7 @@ html:not(.cw-style-current) {
 
   .cw-attachment-tray {
     display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(3, minmax(0, 1fr));
     align-content: start;
     gap: 24px 14px;
     box-sizing: border-box;
@@ -3581,6 +3615,14 @@ html:not(.cw-style-current) {
     padding: 24px 14px calc(24px + env(safe-area-inset-bottom));
     border-top: 1px solid color-mix(in srgb, var(--cw-border) 70%, transparent);
     background: color-mix(in srgb, var(--cw-shell-bg) 82%, var(--cw-panel-bg));
+  }
+
+  .cw-attachment-action-group {
+    display: flex;
+    min-width: 0;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
   }
 
   .cw-attachment-action {
@@ -3618,10 +3660,47 @@ html:not(.cw-style-current) {
     background: var(--cw-control-hover);
   }
 
+  .cw-gallery-original-option {
+    display: flex;
+    min-height: 44px;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    padding: 8px 10px;
+    color: var(--cw-muted);
+    font-size: 13px;
+    line-height: 18px;
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .cw-gallery-original-option > input {
+    width: 18px;
+    height: 18px;
+    margin: 0;
+    accent-color: var(--cw-accent);
+  }
+
   .cw-app-shell.cw-shell-wechat .cw-send-button {
-    height: 38px !important;
+    height: 44px !important;
+    min-height: 44px;
     border-radius: 8px !important;
     padding-inline: 14px !important;
+  }
+
+  /* The non-WeChat mobile skins share the same composer markup. Keep their
+     primary controls touch-safe too instead of relying on the 36px desktop
+     utility dimensions embedded in the component. */
+  .cw-prompt-input .cw-attach-button {
+    width: 44px !important;
+    height: 44px !important;
+    min-width: 44px;
+    min-height: 44px;
+  }
+
+  .cw-prompt-input .cw-send-button,
+  .cw-prompt-input .cw-composer-textarea {
+    min-height: 44px;
   }
 }
 

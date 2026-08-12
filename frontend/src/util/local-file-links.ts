@@ -10,9 +10,11 @@ const LOCAL_IMAGE_EXT_RE = /\.(?:png|jpe?g|gif|webp|bmp|avif)$/i;
 const LOCAL_MARKDOWN_EXT_RE = /\.(?:md|markdown|mdown)$/i;
 const LOCAL_HTML_EXT_RE = /\.html?$/i;
 const LOCAL_PDF_EXT_RE = /\.pdf$/i;
+const LOCAL_AUDIO_EXT_RE = /\.(?:aac|flac|m4a|mp3|ogg|opus|wav)$/i;
+const LOCAL_VIDEO_EXT_RE = /\.(?:avi|m4v|mkv|mov|mp4|mpeg|mpg|webm)$/i;
 const LOCAL_TEXT_EXT_RE = /\.(?:txt|text|log|csv|tsv|json|jsonl|ya?ml|toml|ini|conf|cfg|xml|css|scss|sass|less|js|jsx|mjs|cjs|ts|tsx|vue|svelte|py|rb|php|java|kt|kts|c|cc|cpp|h|hpp|cs|go|rs|sh|bash|zsh|fish|ps1|sql|graphql|gql|env|gitignore|dockerfile)$/i;
 
-export type LocalFilePreviewKind = "image" | "markdown" | "html" | "pdf" | "text" | "binary";
+export type LocalFilePreviewKind = "image" | "markdown" | "html" | "pdf" | "text" | "audio" | "video" | "binary";
 
 export function localFilePreviewKind(path: string): LocalFilePreviewKind {
   if (LOCAL_IMAGE_EXT_RE.test(path)) return "image";
@@ -20,6 +22,8 @@ export function localFilePreviewKind(path: string): LocalFilePreviewKind {
   if (LOCAL_HTML_EXT_RE.test(path)) return "html";
   if (LOCAL_PDF_EXT_RE.test(path)) return "pdf";
   if (LOCAL_TEXT_EXT_RE.test(path)) return "text";
+  if (LOCAL_AUDIO_EXT_RE.test(path)) return "audio";
+  if (LOCAL_VIDEO_EXT_RE.test(path)) return "video";
   return "binary";
 }
 

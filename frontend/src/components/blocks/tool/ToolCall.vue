@@ -11,13 +11,22 @@ import SubagentBlock from "../SubagentBlock.vue";
 import PreviewChip from "./PreviewChip.vue";
 import AskUserQuestionInteractive from "./AskUserQuestionInteractive.vue";
 import InteractionCard from "../../InteractionCard.vue";
-import { extractToolResultImages } from "../../../util/tool-result-images.js";
 
-const props = defineProps<{ pair: ToolPair }>();
-const open = ref(false);
+const props = defineProps<{
+  pair: ToolPair;
+  hideResultImages?: boolean;
+  expanded?: boolean | undefined;
+}>();
+const emit = defineEmits<{ (event: "update:expanded", value: boolean): void }>();
+const localOpen = ref(false);
+const open = computed({
+  get: () => props.expanded ?? localOpen.value,
+  set: (value: boolean) => {
+    localOpen.value = value;
+    emit("update:expanded", value);
+  },
+});
 const header = () => `▶ ${toolSummary(props.pair.use.name, props.pair.use.input)}`;
-
-const hasResultImages = computed(() => extractToolResultImages(props.pair.result).length > 0);
 
 const isErr = (v: unknown) => Array.isArray(v) ? false : typeof v === "object" && v !== null && (v as any).is_error === true;
 
@@ -79,7 +88,7 @@ const pendingPermission = computed(() => {
         v-if="pair.result !== undefined"
         :value="pair.result"
         :is-error="isErr(pair.result)"
-        :hide-images="hasResultImages"
+        :hide-images="hideResultImages === true"
       />
     </div>
   </div>

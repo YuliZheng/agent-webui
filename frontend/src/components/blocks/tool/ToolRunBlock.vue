@@ -9,8 +9,23 @@ export interface ToolRunItem {
   uuid: string;
 }
 
-const props = defineProps<{ items: ToolRunItem[] }>();
-const open = ref(false);
+const props = defineProps<{
+  items: ToolRunItem[];
+  expanded?: boolean;
+  expandedItemIds?: ReadonlySet<string>;
+}>();
+const emit = defineEmits<{
+  (event: "update:expanded", value: boolean): void;
+  (event: "update:item-expanded", value: { uuid: string; expanded: boolean }): void;
+}>();
+const localOpen = ref(false);
+const open = computed({
+  get: () => props.expanded ?? localOpen.value,
+  set: (value: boolean) => {
+    localOpen.value = value;
+    emit("update:expanded", value);
+  },
+});
 
 const count = computed(() => props.items.length);
 const toolName = computed(() => {
@@ -28,6 +43,10 @@ const summary = computed(() => {
   if (!lastSummary.value || lastSummary.value === firstSummary.value) return firstSummary.value;
   return `${firstSummary.value} -> ${lastSummary.value}`;
 });
+
+function setItemExpanded(uuid: string, expanded: boolean) {
+  emit("update:item-expanded", { uuid, expanded });
+}
 </script>
 
 <template>
@@ -58,7 +77,11 @@ const summary = computed(() => {
         class="cw-tool-run-item"
         :data-uuid="item.uuid || undefined"
       >
-        <ToolCall :pair="item.pair" />
+        <ToolCall
+          :pair="item.pair"
+          :expanded="expandedItemIds ? expandedItemIds.has(item.uuid) : undefined"
+          @update:expanded="setItemExpanded(item.uuid, $event)"
+        />
       </div>
     </div>
   </div>
