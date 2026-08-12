@@ -25,10 +25,28 @@ interface ThreadState {
   steers: SteeredInput[];
   cwd?: string;
   attached?: boolean;
+  modelProvider?: string;
   capacityRetry?: CapacityRetryState;
 }
 interface PromptResult { sessionId: string; steered: boolean }
 interface TurnReadyWaiter { resolve: () => void; reject: (error: Error) => void; timer: NodeJS.Timeout }
+
+export const DEFAULT_CODEX_APP_SERVER_MAX_RECORD_BYTES = 128 * 1024 * 1024;
+const MIN_CODEX_APP_SERVER_MAX_RECORD_BYTES = 1024 * 1024;
+
+function configuredMaxRecordBytes(): number {
+  const raw = process.env.AGENT_WEBUI_CODEX_MAX_RECORD_BYTES?.trim();
+  if (!raw) return DEFAULT_CODEX_APP_SERVER_MAX_RECORD_BYTES;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) && value >= MIN_CODEX_APP_SERVER_MAX_RECORD_BYTES
+    ? value
+    : DEFAULT_CODEX_APP_SERVER_MAX_RECORD_BYTES;
+}
+
+function mebibytes(bytes: number): string {
+  return (bytes / (1024 * 1024)).toFixed(bytes % (1024 * 1024) === 0 ? 0 : 1);
+}
+
 export interface CodexTurnOptions {
   model?: string;
   effort?: string;
@@ -86,6 +104,23 @@ const reasoningEfforts = (values: readonly string[]): AgentSelectOption[] =>
 const GPT_56_ULTRA_EFFORTS = ["low", "medium", "high", "xhigh", "max", "ultra"] as const;
 const GPT_56_MAX_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 const GPT_XHIGH_EFFORTS = ["low", "medium", "high", "xhigh"] as const;
+const DEEPSEEK_MODELS = new Set(["deepseek-v4-pro", "deepseek-v4-flash"]);
+const DEEPSEEK_EFFORTS = new Set(["low", "high", "max"]);
+
+function modelProviderFor(model: string | undefined): string | undefined {
+  return model && DEEPSEEK_MODELS.has(model) ? "deepseek" : undefined;
+}
+
+function crossesDeepSeekProvider(current: string | undefined, model: string | undefined): boolean {
+  if (!current || !model) return false;
+  const next = modelProviderFor(model);
+  return current === "deepseek" ? next !== "deepseek" : next === "deepseek";
+}
+
+function deepSeekEffort(provider: string | undefined, effort: string | undefined): string | undefined {
+  if (provider !== "deepseek") return effort;
+  return effort && DEEPSEEK_EFFORTS.has(effort) ? effort : "high";
+}
 
 const FALLBACK_CODEX_MODELS: AgentModelOption[] = [
   {
@@ -252,6 +287,7 @@ export class CodexDriver extends EventEmitter {
   private child?: ChildProcessWithoutNullStreams;
   private initializedChild?: ChildProcessWithoutNullStreams;
   private buffer = "";
+  private bufferBytes = 0;
   private nextId = 1;
   private pending = new Map<number, Pending>();
   private inbound = new Map<string, { rpcId: string | number; sessionId: string; method: string; params: Record<string, unknown> | null }>();
@@ -270,6 +306,7 @@ export class CodexDriver extends EventEmitter {
     private binary: string,
     private state: AppState,
     private spawnProcess: typeof spawn = spawn,
+    private maxRecordBytes = configuredMaxRecordBytes(),
   ) { super(); }
 
   isActive(id: string): boolean { return this.threads.get(id)?.active === true; }
@@ -303,6 +340,7 @@ export class CodexDriver extends EventEmitter {
       const child = this.spawnProcess(binary, ["app-server", "--listen", "stdio://"], { shell: false, stdio: ["pipe", "pipe", "pipe"], windowsHide: true, env: { ...process.env, AGENT_WEBUI: "1" } });
       this.child = child;
       this.initializedChild = undefined;
+      child.stdout.setEncoding("utf8");
       child.stdout.on("data", chunk => { if (this.child === child) this.stdout(String(chunk)); });
       child.stderr.on("data", chunk => { if (this.child === child) this.emit("stderr", String(chunk).slice(-4096)); });
       child.on("error", error => {
@@ -360,14 +398,33 @@ export class CodexDriver extends EventEmitter {
   async request(method: string, params: unknown): Promise<unknown> { await this.ensure(); return this.rawRequest(method, params); }
 
   private stdout(chunk: string): void {
-    this.buffer += chunk;
-    if (this.buffer.length > 16 * 1024 * 1024) { this.buffer = ""; this.child?.kill(); return; }
-    let newline: number;
-    while ((newline = this.buffer.indexOf("\n")) >= 0) {
-      const line = this.buffer.slice(0, newline).trim(); this.buffer = this.buffer.slice(newline + 1);
+    let offset = 0;
+    while (offset < chunk.length) {
+      const newline = chunk.indexOf("\n", offset);
+      const end = newline >= 0 ? newline : chunk.length;
+      const fragment = chunk.slice(offset, end);
+      this.buffer += fragment;
+      this.bufferBytes += Buffer.byteLength(fragment, "utf8");
+      if (this.bufferBytes > this.maxRecordBytes) {
+        this.failOversizedRecord();
+        return;
+      }
+      if (newline < 0) return;
+      const line = this.buffer.trim();
+      this.buffer = "";
+      this.bufferBytes = 0;
+      offset = newline + 1;
       if (!line) continue;
       try { const msg = asRecord(JSON.parse(line)); if (msg) this.message(msg); } catch { this.emit("driver-error", "Malformed Codex app-server record"); }
     }
+  }
+
+  private failOversizedRecord(): void {
+    const child = this.child;
+    const message = `Codex app-server response exceeded the ${mebibytes(this.maxRecordBytes)} MiB safety limit (${mebibytes(this.bufferBytes)} MiB received without a record boundary). This session is too large to resume with the current limit. Start a new session or raise AGENT_WEBUI_CODEX_MAX_RECORD_BYTES and restart Agent WebUI.`;
+    this.emit("driver-error", message);
+    this.failed(new Error(message), child);
+    if (child?.exitCode === null) child.kill("SIGTERM");
   }
 
   private message(msg: Record<string, unknown>): void {
@@ -517,18 +574,29 @@ export class CodexDriver extends EventEmitter {
   }
 
   async newSession(cwd: string, prompt: string, options: CodexTurnOptions = {}, images: string[] = []): Promise<{ sessionId: string }> {
+    const modelProvider = modelProviderFor(options.model);
+    const effort = deepSeekEffort(modelProvider, options.effort);
     const result = asRecord(await this.request("thread/start", {
       cwd,
       ...(options.model ? { model: options.model } : {}),
-      ...(options.effort ? { effort: options.effort } : {}),
-      ...(options.serviceTier !== undefined ? { serviceTier: options.serviceTier } : {}),
+      ...(modelProvider ? { modelProvider } : {}),
+      ...(effort ? { effort } : {}),
+      ...(modelProvider === "deepseek"
+        ? { serviceTier: null }
+        : options.serviceTier !== undefined ? { serviceTier: options.serviceTier } : {}),
       ...(options.approvalPolicy ? { approvalPolicy: options.approvalPolicy } : {}),
       ...(options.sandboxMode ? { sandbox: options.sandboxMode } : {}),
     }));
     const thread = asRecord(result?.thread);
     const id = asString(thread?.id) ?? asString(result?.threadId) ?? asString(result?.id);
     if (!id) throw new RpcError(502, "Codex did not return a thread ID");
-    this.threads.set(id, { active: false, steers: [], cwd, attached: true });
+    this.threads.set(id, {
+      active: false,
+      steers: [],
+      cwd,
+      attached: true,
+      modelProvider: asString(result?.modelProvider) ?? asString(thread?.modelProvider) ?? modelProvider,
+    });
     if (prompt || images.length) await this.startTurn(id, prompt, { ...options, cwd }, images);
     return { sessionId: id };
   }
@@ -553,6 +621,7 @@ export class CodexDriver extends EventEmitter {
     const thread = asRecord(result?.thread);
     const existing = this.threads.get(sessionId) ?? { active: false, steers: [] };
     existing.cwd ??= asString(thread?.cwd);
+    existing.modelProvider ??= asString(result?.modelProvider) ?? asString(thread?.modelProvider);
     existing.attached = true; this.threads.set(sessionId, existing);
   }
 
@@ -581,7 +650,12 @@ export class CodexDriver extends EventEmitter {
     capacityRetry = false,
   ): Promise<unknown> {
     const state = this.threads.get(sessionId) ?? { active: false, steers: [] };
+    if (crossesDeepSeekProvider(state.modelProvider, options.model)) {
+      throw new RpcError(409, "Codex model providers cannot be changed inside an existing session; create a new session with the requested model");
+    }
     state.cwd ??= options.cwd;
+    const modelProvider = state.modelProvider ?? modelProviderFor(options.model);
+    const effort = deepSeekEffort(modelProvider, options.effort);
     const continueFromProgress = capacityRetry && state.capacityRetry?.hadActivity === true;
     if (capacityRetry) {
       if (state.capacityRetry) {
@@ -605,8 +679,10 @@ export class CodexDriver extends EventEmitter {
         threadId: sessionId,
         input,
         ...(options.model ? { model: options.model } : {}),
-        ...(options.effort ? { effort: options.effort } : {}),
-        ...(options.serviceTier !== undefined ? { serviceTier: options.serviceTier } : {}),
+        ...(effort ? { effort } : {}),
+        ...(modelProvider === "deepseek"
+          ? { serviceTier: null }
+          : options.serviceTier !== undefined ? { serviceTier: options.serviceTier } : {}),
         ...(options.approvalPolicy ? { approvalPolicy: options.approvalPolicy } : {}),
         ...(options.sandboxMode ? { sandboxPolicy: this.sandboxPolicy(options.sandboxMode, options.cwd ?? state.cwd) } : {}),
         ...(clientUserMessageId ? { clientUserMessageId } : {}),
@@ -742,6 +818,18 @@ export class CodexDriver extends EventEmitter {
         if (!cursor) break;
       }
     } catch { /* older app-server: use the locally accurate fallback below */ }
+    // Codex supports a user-supplied model catalog in addition to its built-in
+    // cache. DeepSeek's official Codex setup writes this conventional path.
+    // Merge it so the WebUI picker sees custom provider models without hiding
+    // the OpenAI models already present in models_cache.json.
+    try {
+      const root = process.env.CODEX_HOME?.trim() || join(homedir(), ".codex");
+      const parsed: unknown = JSON.parse(await readFile(join(root, "models.json"), "utf8"));
+      const catalog = asRecord(parsed);
+      if (Array.isArray(parsed)) rows.push(...parsed);
+      else if (Array.isArray(catalog?.models)) rows.push(...catalog.models);
+      else if (Array.isArray(catalog?.data)) rows.push(...catalog.data);
+    } catch { /* custom catalog is optional */ }
     models = rows.flatMap(raw => {
       const value = asRecord(raw);
       const id = asString(value?.id) ?? asString(value?.model) ?? asString(value?.slug);
@@ -809,6 +897,7 @@ export class CodexDriver extends EventEmitter {
         isDefault: value?.isDefault === true || value?.is_default === true,
       }];
     });
+    models = [...new Map(models.map(model => [model.value, model])).values()];
 
     // Reading the local model cache above is intentionally sufficient for the
     // selector: merely opening a dropdown must not launch the relatively heavy
@@ -857,6 +946,10 @@ export class CodexDriver extends EventEmitter {
   }
   async updateSettings(sessionId: string, values: CodexSettingsUpdate): Promise<void> {
     await this.resume(sessionId);
+    const currentProvider = this.threads.get(sessionId)?.modelProvider;
+    if (crossesDeepSeekProvider(currentProvider, values.model ?? undefined)) {
+      throw new RpcError(409, "Codex model providers cannot be changed inside an existing session; create a new session with the requested model");
+    }
     const { sandboxMode, cwd, ...settings } = values;
     const payload: Record<string, unknown> = { threadId: sessionId, ...settings };
     if (sandboxMode !== undefined) payload.sandboxPolicy = sandboxMode === null ? null : this.sandboxPolicy(sandboxMode, cwd ?? this.threads.get(sessionId)?.cwd);
@@ -1003,6 +1096,7 @@ export class CodexDriver extends EventEmitter {
     this.child = undefined;
     this.initializedChild = undefined;
     this.buffer = "";
+    this.bufferBytes = 0;
     this.clientIds.clear();
     this.clientRequests.clear();
     this.resumingThreads.clear();

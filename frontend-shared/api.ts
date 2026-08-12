@@ -67,6 +67,9 @@ export interface SessionListItem {
   // jsonl (last assistant text, or last user prompt for brand-new sessions).
   // Whitespace-collapsed and truncated to 80 chars + "…" if longer.
   preview?: string | null;
+  // Role that produced `preview`; lets the sidebar distinguish a pending user
+  // prompt from an assistant reply without guessing from the text itself.
+  previewRole?: "user" | "assistant" | null;
   // ISO timestamp of the record `preview` was extracted from. Frontends should
   // prefer this over `mtime` for the row's right-side time, since file mtime
   // can be touched by sidechain writes that don't represent user-visible

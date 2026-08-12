@@ -265,6 +265,7 @@ async function readBackLines(path: string, size: number, maxBytes = BACK_SCAN_MA
 
 interface LatestMeaning {
   preview: string | null;
+  previewRole: "user" | "assistant" | null;
   lastTurnAt: string | null;
   priority: 0 | 1 | 2;
 }
@@ -278,16 +279,17 @@ function latestMeaningDetail(lines: string[], agent: AgentKind): LatestMeaning {
       if (value.priority > 0 && value.text) {
         return {
           preview: cleanPreview(value.text),
+          previewRole: value.priority === 2 ? "assistant" : "user",
           lastTurnAt: value.timestamp ?? null,
           priority: value.priority as 1 | 2,
         };
       }
     } catch { /* keep scanning */ }
   }
-  return { preview: null, lastTurnAt: null, priority: 0 };
+  return { preview: null, previewRole: null, lastTurnAt: null, priority: 0 };
 }
 
-function latestMeaning(lines: string[], agent: AgentKind): { preview: string | null; lastTurnAt: string | null } {
+function latestMeaning(lines: string[], agent: AgentKind): { preview: string | null; previewRole: "user" | "assistant" | null; lastTurnAt: string | null } {
   const { priority: _priority, ...summary } = latestMeaningDetail(lines, agent);
   return summary;
 }
@@ -432,6 +434,7 @@ function normalizeCachedSession(value: unknown): SessionRecord | null {
     agent,
     ...(agent === "codex" ? { subagent: record.subagent === true } : {}),
     preview: optionalString(record, "preview"),
+    previewRole: record.previewRole === "user" || record.previewRole === "assistant" ? record.previewRole : null,
     lastTurnAt: optionalString(record, "lastTurnAt"),
     parentSessionId: optionalString(record, "parentSessionId"),
   };
@@ -572,6 +575,7 @@ export class SessionIndex extends EventEmitter {
                 size: info.size,
                 mtime: info.mtime.toISOString(),
                 preview: useLatest ? latest.preview : existing.preview,
+                previewRole: useLatest ? latest.previewRole : existing.previewRole,
                 lastTurnAt: useLatest && latest.preview ? latest.lastTurnAt : existing.lastTurnAt,
               };
             }
@@ -902,6 +906,7 @@ export class SessionIndex extends EventEmitter {
             size: entry.size,
             mtime: nextMtime,
             preview: useLatest ? latest.preview : cached.preview,
+            previewRole: useLatest ? latest.previewRole : cached.previewRole,
             lastTurnAt: useLatest && latest.preview ? latest.lastTurnAt : cached.lastTurnAt,
           };
           this.upsert(updated);

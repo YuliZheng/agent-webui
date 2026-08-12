@@ -112,8 +112,8 @@ describe("Claude ownership and interactions", () => {
     expect(driver.owned.has("resumed")).toBe(false);
   });
 
-  it("uses the supported Claude stream flags and never passes effort", () => {
-    const args = claudeSpawnArgs("session", "opus", "acceptEdits");
+  it("uses the supported Claude stream flags and passes effort when given", () => {
+    const args = claudeSpawnArgs("session", "opus", "acceptEdits", "max");
     expect(args).toEqual([
       "--print",
       "--input-format", "stream-json",
@@ -123,8 +123,10 @@ describe("Claude ownership and interactions", () => {
       "--resume", "session",
       "--model", "opus",
       "--permission-mode", "acceptEdits",
+      "--effort", "max",
     ]);
-    expect(args).not.toContain("--effort");
+    const noEffort = claudeSpawnArgs("session", "opus", "acceptEdits", undefined);
+    expect(noEffort).not.toContain("--effort");
   });
 
   it("classifies normal numeric signal exits neutrally", () => {

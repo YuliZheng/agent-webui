@@ -4,7 +4,11 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
-import { CODEX_REASONING_EFFORTS, CodexDriver } from "../src/services/codex-driver.js";
+import {
+  CODEX_REASONING_EFFORTS,
+  CodexDriver,
+  DEFAULT_CODEX_APP_SERVER_MAX_RECORD_BYTES,
+} from "../src/services/codex-driver.js";
 import { AppState } from "../src/services/state.js";
 
 function fakeCodexChild() {
@@ -26,6 +30,43 @@ describe("Codex steer semantics", () => {
 
     expect(() => driver.stdout("not-json\n")).not.toThrow();
     expect(warning).toHaveBeenCalledWith("Malformed Codex app-server record");
+  });
+
+  it("uses a 128 MiB app-server record limit and parses fragmented records", async () => {
+    expect(DEFAULT_CODEX_APP_SERVER_MAX_RECORD_BYTES).toBe(128 * 1024 * 1024);
+    const state = new AppState(await mkdtemp(join(tmpdir(), "agent-webui-codex-record-")));
+    const child = fakeCodexChild();
+    const driver = new CodexDriver("codex", state, vi.fn(() => child) as any, 256) as any;
+    driver.child = child;
+    driver.initializedChild = child;
+
+    const request = driver.rawRequest("thread/resume", { threadId: "thread" });
+    const id = [...driver.pending.keys()][0];
+    const record = `${JSON.stringify({ id, result: { thread: { id: "thread", name: "x".repeat(80) } } })}\n`;
+    driver.stdout(record.slice(0, 47));
+    driver.stdout(record.slice(47));
+
+    await expect(request).resolves.toMatchObject({ thread: { id: "thread" } });
+    expect(child.kill).not.toHaveBeenCalled();
+  });
+
+  it("surfaces a specific error before terminating an oversized app-server record", async () => {
+    const state = new AppState(await mkdtemp(join(tmpdir(), "agent-webui-codex-oversized-")));
+    const child = fakeCodexChild();
+    const driver = new CodexDriver("codex", state, vi.fn(() => child) as any, 1024 * 1024) as any;
+    driver.child = child;
+    driver.initializedChild = child;
+    const warning = vi.fn();
+    driver.on("driver-error", warning);
+
+    const request = driver.rawRequest("thread/resume", { threadId: "thread" });
+    const rejected = expect(request).rejects.toThrow(/response exceeded the 1 MiB safety limit/);
+    driver.stdout("x".repeat(1024 * 1024 + 1));
+
+    await rejected;
+    expect(warning).toHaveBeenCalledWith(expect.stringContaining("AGENT_WEBUI_CODEX_MAX_RECORD_BYTES"));
+    expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+    expect(driver.child).toBeUndefined();
   });
 
   it("reconciles a matching durable terminal exactly once without clearing a newer turn", async () => {
@@ -277,6 +318,47 @@ describe("Codex steer semantics", () => {
       serviceTier: null,
     }));
   });
+  it("routes new DeepSeek sessions through the DeepSeek provider", async () => {
+    const state = new AppState(await mkdtemp(join(tmpdir(), "agent-webui-codex-deepseek-")));
+    const driver = new CodexDriver("codex", state) as any;
+    const request = vi.fn(async (method: string) => method === "thread/start"
+      ? { thread: { id: "deepseek-thread" }, modelProvider: "deepseek" }
+      : {});
+    driver.request = request;
+
+    await driver.newSession("C:\\work", "", {
+      model: "deepseek-v4-flash",
+      effort: "medium",
+      serviceTier: "priority",
+    });
+
+    expect(request).toHaveBeenCalledWith("thread/start", expect.objectContaining({
+      cwd: "C:\\work",
+      model: "deepseek-v4-flash",
+      modelProvider: "deepseek",
+      effort: "high",
+      serviceTier: null,
+    }));
+    expect(driver.threads.get("deepseek-thread")).toMatchObject({
+      modelProvider: "deepseek",
+      attached: true,
+    });
+  });
+  it("rejects provider changes inside an existing Codex session", async () => {
+    const state = new AppState(await mkdtemp(join(tmpdir(), "agent-webui-codex-provider-switch-")));
+    const driver = new CodexDriver("codex", state) as any;
+    driver.threads.set("thread", {
+      active: false,
+      attached: true,
+      steers: [],
+      modelProvider: "openai_http",
+    });
+    driver.request = vi.fn(async () => ({}));
+
+    await expect(driver.updateSettings("thread", { model: "deepseek-v4-flash" }))
+      .rejects.toThrow(/cannot be changed inside an existing session/);
+    expect(driver.request).not.toHaveBeenCalled();
+  });
   it("exposes live and legacy Fast service-tier capabilities", async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-webui-codex-capabilities-"));
     await writeFile(join(root, "models_cache.json"), JSON.stringify({
@@ -316,6 +398,20 @@ describe("Codex steer semantics", () => {
         },
       ],
     }), "utf8");
+    await writeFile(join(root, "models.json"), JSON.stringify({
+      models: [{
+        slug: "deepseek-v4-flash",
+        display_name: "DeepSeek-V4-Flash",
+        description: "Latest frontier agentic coding model.",
+        default_reasoning_level: "high",
+        supported_reasoning_levels: [
+          { effort: "low" },
+          { effort: "high" },
+          { effort: "max" },
+        ],
+        service_tiers: [],
+      }],
+    }), "utf8");
     const prior = process.env.CODEX_HOME;
     process.env.CODEX_HOME = root;
     try {
@@ -339,6 +435,16 @@ describe("Codex steer semantics", () => {
           { value: "low", label: "low", description: "Fast responses" },
           { value: "ultra", label: "ultra", description: "Maximum reasoning with delegation" },
         ],
+      });
+      expect(capabilities.models.find(model => model.value === "deepseek-v4-flash")).toMatchObject({
+        label: "DeepSeek-V4-Flash",
+        defaultEffort: "high",
+        supportedEfforts: [
+          { value: "low", label: "low", description: null },
+          { value: "high", label: "high", description: null },
+          { value: "max", label: "max", description: null },
+        ],
+        serviceTiers: [],
       });
       expect(CODEX_REASONING_EFFORTS.at(-1)).toBe("ultra");
     } finally {

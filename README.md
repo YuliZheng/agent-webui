@@ -54,7 +54,10 @@ update.
 
 Configuration is available through CLI flags and environment variables exposed
 by the backend (`--host`, `--port`, `--token`, `AGENT_WEBUI_HOST`,
-`AGENT_WEBUI_PORT`). Small server preferences are stored under
+`AGENT_WEBUI_PORT`). Codex app-server records are limited to 128 MiB by default
+to prevent malformed output from growing memory without bound; unusually large
+sessions can override the byte limit with
+`AGENT_WEBUI_CODEX_MAX_RECORD_BYTES`. Small server preferences are stored under
 `~/.agent-webui/`; transcript data remains in the Claude and Codex session
 directories.
 
@@ -64,6 +67,12 @@ For example, override the production port with:
 $env:AGENT_WEBUI_PORT = "4567"
 npm start
 ```
+
+Authenticated local-path links open in the built-in file browser. Directories
+can be navigated remotely; images, Markdown, HTML, PDF, text, and source files
+have in-app views, while audio, video, and unknown binaries remain
+download-only. Fine-pointer browsers can remember a per-browser preference to
+open future folder links in the host computer's file manager instead.
 
 ## Security model
 

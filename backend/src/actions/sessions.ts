@@ -1179,7 +1179,10 @@ export async function searchSessions(index: SessionIndex, query: string, options
   const normalizedQuery = query.trim().toLocaleLowerCase(); if (!normalizedQuery) return { matches: [] };
   const parsedTokens = normalizedQuery.match(/[\p{L}\p{N}_-]+/gu) ?? [];
   const tokens = [...new Set(parsedTokens.length ? parsedTokens : [normalizedQuery])];
-  const sessions = index.list();
+  // Multi-agent v2 workers are parent-controlled implementation threads, not
+  // user-addressable chats. Ordinary forks can also have a parentSessionId,
+  // so exclude only the explicit subagent marker.
+  const sessions = index.list().filter(session => session.subagent !== true);
   const candidateToken = tokens.reduce((longest, token) => token.length > longest.length ? token : longest, tokens[0] ?? normalizedQuery);
   const archiveBytes = sessions.reduce((total, session) => total + session.size, 0);
 

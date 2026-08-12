@@ -28,11 +28,13 @@ export function claudeSpawnArgs(
   resumeId: string | undefined,
   model: string | undefined,
   permissionMode: string | undefined,
+  effort: string | undefined,
 ): string[] {
   const args = ["--print", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--permission-prompt-tool", "stdio"];
   if (resumeId) args.push("--resume", resumeId);
   if (model) args.push("--model", model);
   if (permissionMode) args.push("--permission-mode", permissionMode);
+  if (effort) args.push("--effort", effort);
   return args;
 }
 
@@ -163,7 +165,8 @@ export class ClaudeDriver extends EventEmitter {
     const prefs = await this.state.prefs.get();
     const model = this.effective(options.model) ?? this.effective(settings?.model) ?? this.effective(prefs.defaultClaudeModel as string | undefined);
     const permission = this.effective(options.permissionMode) ?? this.effective(settings?.permissionMode) ?? this.effective(prefs.defaultClaudePermissionMode as string | undefined);
-    const args = claudeSpawnArgs(resumeId, model, permission);
+    const effort = this.effective(options.effort) ?? this.effective(settings?.effort) ?? this.effective(prefs.defaultClaudeEffort as string | undefined);
+    const args = claudeSpawnArgs(resumeId, model, permission, effort);
     const child = this.spawnProcess(this.binary, args, {
       cwd, shell: false, stdio: ["pipe", "pipe", "pipe"], windowsHide: true,
       env: { ...process.env, AGENT_WEBUI: "1", ...(resumeId ? { AGENT_WEBUI_RESUME_SESSION_ID: resumeId } : {}) },

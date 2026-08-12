@@ -159,6 +159,16 @@ describe("token authentication", () => {
           ],
         },
       }),
+      JSON.stringify({
+        type: "response_item",
+        payload: {
+          type: "custom_tool_call_output",
+          call_id: "generated-image",
+          output: {
+            content: [{ type: "image", mimeType: "image/png", data: png }],
+          },
+        },
+      }),
       "",
     ].join("\n"));
     const app = await buildApp({ home, token: "a".repeat(64), startWatchers: false });
@@ -181,10 +191,100 @@ describe("token authentication", () => {
     expect(codex.statusCode).toBe(200);
     expect(codex.headers["content-type"]).toContain("image/png");
     expect(codex.rawPayload.subarray(1, 4).toString()).toBe("PNG");
+    const generated = await app.inject({
+      url: "/api/sessions/codex-image/transcript-image/2/0",
+      headers: { cookie },
+    });
+    expect(generated.statusCode).toBe(200);
+    expect(generated.headers["content-type"]).toContain("image/png");
+    expect(generated.headers["cache-control"]).toContain("immutable");
+    expect(generated.rawPayload.subarray(1, 4).toString()).toBe("PNG");
+
+    const tail = await app.inject({
+      url: "/api/sessions/codex-image/tail?n=10&priority=interactive",
+      headers: { cookie },
+    });
+    expect(tail.statusCode).toBe(200);
+    const tailBody = tail.json() as {
+      lines: Array<{ index: number; raw: string }>;
+      supportsCompactRange?: boolean;
+    };
+    expect(tailBody.supportsCompactRange).toBe(true);
+    const wire = JSON.stringify(tailBody);
+    expect(wire).not.toContain(png);
+    expect(wire).toContain("/api/sessions/codex-image/transcript-image/1/0");
+    expect(wire).toContain("/api/sessions/codex-image/transcript-image/2/0");
+    const range = await app.inject({
+      url: "/api/sessions/codex-image/range?from=1&to=3",
+      headers: { cookie },
+    });
+    expect(range.statusCode).toBe(200);
+    expect(range.body).not.toContain(png);
+    expect(range.body).toContain("/api/sessions/codex-image/transcript-image/2/0");
+
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    const address = app.server.address();
+    if (!address || typeof address === "string") throw new Error("no address");
+    const streamed = await new Promise<string>((resolve, reject) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${address.port}/ws/main`, {
+        headers: { Cookie: cookie },
+      });
+      const timeout = setTimeout(() => {
+        ws.close();
+        reject(new Error("timed out waiting for transcript batch"));
+      }, 5_000);
+      ws.on("open", () => ws.send(JSON.stringify({
+        type: "subscribe",
+        reqId: "image-stream",
+        channel: "session",
+        sessionId: "claude-image",
+        from: 0,
+      })));
+      ws.on("message", data => {
+        const message = JSON.parse(String(data)) as { type?: string; sessionId?: string };
+        if (message.type !== "stream-batch" || message.sessionId !== "claude-image") return;
+        clearTimeout(timeout);
+        ws.close();
+        resolve(JSON.stringify(message));
+      });
+      ws.on("error", error => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+    });
+    expect(streamed).not.toContain(png);
+    expect(streamed).toContain("/api/sessions/claude-image/transcript-image/0/0");
     expect((await app.inject({
       url: "/api/sessions/codex-image/input-image/1/1",
       headers: { cookie },
     })).statusCode).toBe(404);
+  });
+  it("serves compact ranges with physical indexes without sending large record fields", async () => {
+    const home = await mkdtemp(join(tmpdir(), "agent-webui-compact-range-"));
+    const codexRoot = join(home, ".codex", "sessions");
+    await mkdir(codexRoot, { recursive: true });
+    const oversized = `COMPACT_RANGE_SHOULD_NOT_WIRE_${"x".repeat(180_000)}`;
+    await writeFile(join(codexRoot, "rollout-compact-range.jsonl"), [
+      JSON.stringify({ type: "session_meta", payload: { id: "compact-range", cwd: home } }),
+      JSON.stringify({
+        type: "response_item",
+        payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: oversized }] },
+      }),
+      "",
+    ].join("\n"));
+    const app = await buildApp({ home, token: "a".repeat(64), startWatchers: false });
+    apps.push(app);
+    const bind = await app.inject({ url: `/api/auth/bind?token=${"a".repeat(64)}` });
+    const cookie = String(bind.headers["set-cookie"]).split(";")[0]!;
+    const response = await app.inject({
+      url: "/api/sessions/compact-range/range?from=1&to=2&mode=compact",
+      headers: { cookie },
+    });
+    expect(response.statusCode).toBe(200);
+    const body = response.json() as { totalLines: number; lines: Array<{ index: number; raw: string }> };
+    expect(body.totalLines).toBe(2);
+    expect(body.lines.map(line => line.index)).toEqual([1]);
+    expect(JSON.stringify(body)).not.toContain("COMPACT_RANGE_SHOULD_NOT_WIRE");
   });
   it("serves only the owning Codex session's sandboxed inline visualization", async () => {
     const home = await mkdtemp(join(tmpdir(), "agent-webui-inline-vis-"));

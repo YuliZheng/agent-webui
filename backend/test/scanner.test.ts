@@ -579,6 +579,7 @@ describe("session scanning", () => {
     ].join("\n"));
     const item = await scanCodexFile(codex);
     expect(item?.preview).toBe("visible user request");
+    expect(item?.previewRole).toBe("user");
     expect(item?.lastTurnAt).toBe("2026-07-23T00:00:02.000Z");
   });
 

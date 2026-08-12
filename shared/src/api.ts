@@ -5,6 +5,13 @@ export type ProcessStatus = "running" | "exited" | "failed";
 export type ColorPreference = "light" | "dark" | "system";
 export type { MessageDisplayStyle } from "./prefs.js";
 
+// Keep browser preflight and backend enforcement on one contract. The decoded
+// byte ceiling leaves room for base64/JSON overhead under the 64 MiB WebSocket
+// frame limit.
+export const MAX_CLAUDE_PROMPT_ATTACHMENTS = 8;
+export const MAX_CODEX_PROMPT_ATTACHMENTS = 32;
+export const MAX_PROMPT_ATTACHMENT_BYTES = 40 * 1024 * 1024;
+
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue =
   | JsonPrimitive
@@ -26,6 +33,7 @@ export interface SessionListItem {
   parentSessionId?: string | null;
   status?: ProcessStatus | null;
   preview?: string | null;
+  previewRole?: "user" | "assistant" | null;
   lastTurnAt?: string | null;
   lastBoundaryAt?: string | null;
   readAt?: string | null;
@@ -513,6 +521,7 @@ export function isSessionListItem(value: unknown): value is SessionListItem {
   }
   return (
     isNullableString(value.preview) &&
+    (value.previewRole === undefined || value.previewRole === null || value.previewRole === "user" || value.previewRole === "assistant") &&
     isNullableString(value.lastTurnAt) &&
     isNullableString(value.lastBoundaryAt) &&
     isNullableString(value.readAt)

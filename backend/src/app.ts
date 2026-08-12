@@ -21,20 +21,23 @@ import {
   flushLineIndexPersistence,
   JsonlTailer,
   isRenderableClaudeLine,
+  MAX_JSONL_RECORD_BYTES,
   preserveIndexes,
   readRecordAt,
   readRange,
   readTail,
+  readTailSnapshot,
 } from "./services/jsonl.js";
 import { AppState, normalizePrefs } from "./services/state.js";
 import { PubSub } from "./services/pubsub.js";
 import { ClaudeDriver } from "./services/claude-driver.js";
 import { CODEX_REASONING_EFFORTS, CodexDriver } from "./services/codex-driver.js";
-import { openLocalPath, PreviewStore, readLocalSource, resolveLocalFile, resolveLocalPath } from "./services/files.js";
+import { inspectLocalPath, listLocalDirectory, openLocalPath, PreviewStore, readLocalSource, resolveLocalFile, resolveLocalPath } from "./services/files.js";
 import { autoTitle, autoTitleFromText, deleteSessions, forkSession, getUserMessages, markdownExport, rewindSession, searchSessions } from "./actions/sessions.js";
 import { expandHome, isWithin, safeFilename } from "./util/paths.js";
 import { resolveCodexExecutable } from "./util/executable.js";
 import { codexDurableTerminal, isMeaningfulEndTurnRecord, NotificationDeduper } from "./services/notifications.js";
+import { assertDirectPromptAllowed, normalizeDirectPromptError } from "./services/session-prompt.js";
 import {
   failRunningClaudeBackgroundTasks,
   mergeClaudeBackgroundTasks,
@@ -47,6 +50,11 @@ import { ContentSearchIndex } from "./services/content-search-index.js";
 import { fullCodexContextUsage } from "./services/codex-context-usage.js";
 import { sendJson } from "./services/ws-send.js";
 import { themedVisualizationHtml } from "./services/visualization.js";
+import {
+  sanitizeTranscriptLines,
+  sanitizeTranscriptRaw,
+  transcriptImagePayload,
+} from "./services/transcript-images.js";
 import {
   formatTitleWithEmoji,
   resolveSessionTitle,
@@ -63,9 +71,22 @@ import {
 } from "./services/session-title-context.js";
 import { CodexSessionTitleGenerator } from "./services/session-title-generator.js";
 import type { SessionTitleGenerator } from "./services/session-title-generator.js";
-import type { AgentCapabilities, AgentSelectOption, PrefsBlob } from "@agent-webui/shared";
+import {
+  MAX_CLAUDE_PROMPT_ATTACHMENTS,
+  MAX_CODEX_PROMPT_ATTACHMENTS,
+  MAX_PROMPT_ATTACHMENT_BYTES,
+  type AgentCapabilities,
+  type AgentSelectOption,
+  type PrefsBlob,
+} from "@agent-webui/shared";
 
 const execFileAsync = promisify(execFile);
+// Automatic mobile gap repair should never pull a multi-megabyte tool record.
+// Full-fidelity range reads remain available when the user explicitly loads
+// older history; this compact mode is only for quietly reconnecting a recent
+// sparse suffix to the already-cached turn.
+const COMPACT_RANGE_MAX_BYTES = 512 * 1024;
+const COMPACT_RANGE_MAX_RECORD_BYTES = 128 * 1024;
 
 export interface BuildAppOptions {
   home?: string;
@@ -340,7 +361,9 @@ function claudeCapabilities(prefs: PrefsBlob): AgentCapabilities {
     sandboxModes: [],
     defaults: {
       model: prefs.defaultClaudeModel || null,
-      effort: prefs.defaultClaudeEffort || null,
+      // External default: the CLI's own env (CLAUDE_CODE_EFFORT_LEVEL from
+      // ~/.claude/settings.json) wins when the webui pref is unset.
+      effort: prefs.defaultClaudeEffort || process.env.CLAUDE_CODE_EFFORT_LEVEL || null,
       permissionMode: prefs.defaultClaudePermissionMode || null,
       sandboxMode: null,
     },
@@ -368,34 +391,6 @@ export function decodeAttachmentPayload(raw: unknown): { name?: string; type: st
   const bytes = Buffer.from(data, "base64");
   if (!bytes.length || bytes.length > 10 * 1024 * 1024) throw new RpcError(413, "Attachment exceeds 10 MiB");
   return { name: asString(item?.name), type: declared, data, bytes };
-}
-
-function transcriptImagePayload(
-  record: Record<string, unknown>,
-  agent: "claude" | "codex",
-  imageIndex: number,
-): { type: string; data: string } | null {
-  const content = agent === "claude"
-    ? asRecord(record.message)?.content
-    : asRecord(record.payload)?.content;
-  if (!Array.isArray(content)) return null;
-  const images = content.flatMap(raw => {
-    const block = asRecord(raw);
-    const type = asString(block?.type);
-    if (agent === "codex" && type === "input_image") {
-      const data = asString(block?.image_url) ?? asString(block?.imageUrl);
-      const match = data?.match(/^data:(image\/[a-z0-9.+-]+);base64,/i);
-      return data && match?.[1] ? [{ type: match[1].toLowerCase(), data }] : [];
-    }
-    if (type !== "image") return [];
-    const source = asRecord(block?.source);
-    const sourceType = asString(source?.type);
-    const mediaType = asString(source?.media_type) ?? asString(source?.mediaType);
-    const data = asString(source?.data);
-    if (sourceType !== "base64" || !mediaType?.startsWith("image/") || !data) return [];
-    return [{ type: mediaType, data }];
-  });
-  return images[imageIndex] ?? null;
 }
 
 export function decodeAvatarPayload(raw: unknown): Buffer {
@@ -853,17 +848,36 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   app.get("/api/sessions", sessionView);
   app.get("/api/sessions/:id/tail", async request => {
     const { id } = request.params as { id: string }; assertSessionId(id); const session = await index.resolveLight(id); if (!session) throw new RpcError(404, "Session not found");
-    const lines = await readTail(session.path, Number((request.query as Record<string, unknown>).n ?? 200));
-    const filtered = session.agent === "claude" ? preserveIndexes(lines, isRenderableClaudeLine) : lines;
-    const totalLines = await countJsonlLines(session.path);
-    return { totalLines, fromIndex: filtered[0]?.index ?? totalLines, lines: filtered };
+    const query = request.query as Record<string, unknown>;
+    const priority = query.priority === "interactive" ? "interactive" : "background";
+    const snapshot = await readTailSnapshot(session.path, Number(query.n ?? 200), priority);
+    const filtered = session.agent === "claude" ? preserveIndexes(snapshot.lines, isRenderableClaudeLine) : snapshot.lines;
+    return {
+      totalLines: snapshot.lineCount,
+      fromIndex: filtered[0]?.index ?? snapshot.lineCount,
+      lines: sanitizeTranscriptLines(id, filtered),
+      supportsCompactRange: true,
+    };
   });
   app.get("/api/sessions/:id/range", async request => {
     const { id } = request.params as { id: string }; assertSessionId(id); const session = await index.resolveLight(id); if (!session) throw new RpcError(404, "Session not found");
     const query = request.query as Record<string, unknown>;
-    const lines = await readRange(session.path, Number(query.from ?? 0), query.to === undefined ? undefined : Number(query.to));
+    const compact = query.mode === "compact";
+    const lines = await readRange(
+      session.path,
+      Number(query.from ?? 0),
+      query.to === undefined ? undefined : Number(query.to),
+      compact ? {
+        maxBytes: COMPACT_RANGE_MAX_BYTES,
+        maxRecordBytes: COMPACT_RANGE_MAX_RECORD_BYTES,
+        priority: "background",
+      } : undefined,
+    );
     const filtered = session.agent === "claude" ? preserveIndexes(lines, isRenderableClaudeLine) : lines;
-    return { totalLines: await countJsonlLines(session.path), lines: filtered };
+    return {
+      totalLines: await countJsonlLines(session.path),
+      lines: sanitizeTranscriptLines(id, filtered),
+    };
   });
   app.get("/api/sessions/:id/context-usage", async request => {
     const { id } = request.params as { id: string };
@@ -889,10 +903,11 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   }
   async function attachments(value: unknown, agent: "claude" | "codex"): Promise<PreparedAttachments> {
     if (!Array.isArray(value)) return { files: [] };
-    if (value.length > 8) throw new RpcError(413, "Too many attachments");
+    const maxCount = agent === "codex" ? MAX_CODEX_PROMPT_ATTACHMENTS : MAX_CLAUDE_PROMPT_ATTACHMENTS;
+    if (value.length > maxCount) throw new RpcError(413, `Too many attachments (max ${maxCount})`);
     const decoded = value.map(decodeAttachmentPayload);
     const totalBytes = decoded.reduce((total, item) => total + item.bytes.length, 0);
-    if (totalBytes > 40 * 1024 * 1024) throw new RpcError(413, "Attachments exceed the 40 MiB request limit");
+    if (totalBytes > MAX_PROMPT_ATTACHMENT_BYTES) throw new RpcError(413, "Attachments exceed the 40 MiB request limit");
     if (agent === "claude") {
       return { files: decoded.map(item => ({ name: item.name, type: item.type, data: item.data })) };
     }
@@ -1024,6 +1039,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   }
   async function promptSession(id: string, args: Record<string, unknown>) {
     assertSessionId(id); const session = await index.resolveLight(id); if (!session) throw new RpcError(404, "Session not found");
+    assertDirectPromptAllowed(session);
     const prompt = asString(args.prompt) ?? ""; const prepared = await attachments(args.images, session.agent); const files = prepared.files; if (!prompt.trim() && !files.length) throw new RpcError(400, "Prompt is empty");
     const settings = (await state.settings.get())[id]; const prefs = await state.prefs.get();
     let accepted = false;
@@ -1056,7 +1072,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
       return result;
     } catch (error) {
       if (!accepted) await discardFailedAttachments(prepared.batchId);
-      throw error;
+      throw normalizeDirectPromptError(error);
     }
   }
   async function stopSession(id: string) {
@@ -1086,13 +1102,14 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     const query = request.query as Record<string, unknown>;
     const source = await resolveLocalFile(String(query.path ?? ""), [...extraRoots]);
     const download = query.download === "1";
-    if (source.size > 256 * 1024 * 1024) throw new RpcError(413, "File exceeds 256 MiB");
+    if (!download && source.size > 256 * 1024 * 1024) throw new RpcError(413, "File exceeds 256 MiB");
     if (!download && !/\.pdf$/i.test(source.path)) {
       throw new RpcError(415, "Only PDF files can be embedded through this endpoint");
     }
     reply
       .header("Cache-Control", "private, no-store")
       .header("X-Content-Type-Options", "nosniff")
+      .header("Content-Length", String(source.size))
       .header(
         "Content-Disposition",
         fileContentDisposition(download ? "attachment" : "inline", source.path),
@@ -1117,7 +1134,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     const mime = /\.png$/i.test(path) ? "image/png" : /\.gif$/i.test(path) ? "image/gif" : /\.webp$/i.test(path) ? "image/webp" : "image/jpeg";
     return reply.type(mime).send(await readFile(path));
   });
-  app.get("/api/sessions/:sessionId/input-image/:lineIndex/:imageIndex", async (request, reply) => {
+  const transcriptImage = async (request: FastifyRequest, reply: FastifyReply) => {
     const params = request.params as {
       sessionId: string;
       lineIndex: string;
@@ -1132,17 +1149,23 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     const session = await index.resolveLight(params.sessionId);
     if (!session) throw new RpcError(404, "Session not found");
     // 10 MiB decoded input plus JSON/base64 overhead and a small envelope.
-    const line = await readRecordAt(session.path, lineIndex, 15 * 1024 * 1024);
+    const line = await readRecordAt(session.path, lineIndex, MAX_JSONL_RECORD_BYTES);
     if (!line || line.index !== lineIndex) throw new RpcError(404, "Transcript image record not found");
     let record: Record<string, unknown> | null = null;
     try { record = asRecord(JSON.parse(line.raw)); } catch { /* handled below */ }
-    const payload = record ? transcriptImagePayload(record, session.agent, imageIndex) : null;
+    const payload = record ? transcriptImagePayload(record, imageIndex) : null;
     if (!payload) throw new RpcError(404, "Transcript image not found");
     const decoded = decodeAttachmentPayload(payload);
     if (!decoded.type.startsWith("image/")) throw new RpcError(415, "Transcript attachment is not an image");
-    reply.header("Cache-Control", "private, max-age=31536000, immutable");
+    reply
+      .header("Cache-Control", "private, max-age=31536000, immutable")
+      .header("X-Content-Type-Options", "nosniff");
     return reply.type(decoded.type).send(decoded.bytes);
-  });
+  };
+  // Keep the original route for cached clients while using the broader name
+  // for generated/tool-result images as well as user inputs.
+  app.get("/api/sessions/:sessionId/input-image/:lineIndex/:imageIndex", transcriptImage);
+  app.get("/api/sessions/:sessionId/transcript-image/:lineIndex/:imageIndex", transcriptImage);
   app.get("/api/codex-image", async (request, reply) => {
     const query = request.query as Record<string, unknown>; const path = String(query.path ?? "");
     const source = await resolveLocalFile(path, [...extraRoots]);
@@ -1231,8 +1254,20 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
       tailN,
       filter: session.agent === "claude" ? isRenderableClaudeLine : undefined,
     }, event => {
-      if (event.type === "stream-line") send(socket, { ...event, sessionId });
-      else if (event.type === "stream-batch") send(socket, { ...event, sessionId, lines: event.lines.map(line => ({ index: line.index, data: line.raw })) });
+      if (event.type === "stream-line") {
+        send(socket, {
+          ...event,
+          sessionId,
+          data: sanitizeTranscriptRaw(event.data, sessionId, event.index),
+        });
+      } else if (event.type === "stream-batch") {
+        send(socket, {
+          ...event,
+          sessionId,
+          lines: sanitizeTranscriptLines(sessionId, event.lines)
+            .map(line => ({ index: line.index, data: line.raw })),
+        });
+      }
       else send(socket, { ...event, sessionId });
     });
     map.set(sessionId, tailer);
@@ -1314,6 +1349,8 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
         return { paths };
       }
       case "read-local-file": return readLocalSource(String(args.path ?? ""), [...extraRoots], args.line === undefined ? undefined : Number(args.line));
+      case "inspect-local-path": return inspectLocalPath(String(args.path ?? ""), [...extraRoots]);
+      case "list-local-directory": return listLocalDirectory(String(args.path ?? ""), [...extraRoots]);
       case "reveal-local-path": {
         const target = await resolveLocalPath(String(args.path ?? ""), [...extraRoots]);
         await openLocalPath(target.path, target.kind);
@@ -1557,13 +1594,15 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
         const id = String(args.sessionId ?? ""); assertSessionId(id);
         const session = await index.resolveLight(id); if (!session) throw new RpcError(404, "Session not found");
         const lines = await readTail(session.path, Number(args.n ?? 200));
-        return session.agent === "claude" ? preserveIndexes(lines, isRenderableClaudeLine) : lines;
+        const filtered = session.agent === "claude" ? preserveIndexes(lines, isRenderableClaudeLine) : lines;
+        return sanitizeTranscriptLines(id, filtered);
       }
       case "read-range": {
         const id = String(args.sessionId ?? ""); assertSessionId(id);
         const session = await index.resolveLight(id); if (!session) throw new RpcError(404, "Session not found");
         const lines = await readRange(session.path, Number(args.from ?? 0), Number(args.to ?? Number.MAX_SAFE_INTEGER));
-        return session.agent === "claude" ? preserveIndexes(lines, isRenderableClaudeLine) : lines;
+        const filtered = session.agent === "claude" ? preserveIndexes(lines, isRenderableClaudeLine) : lines;
+        return sanitizeTranscriptLines(id, filtered);
       }
       case "get-prefs": return state.prefs.get();
       case "put-prefs": await state.prefs.put(normalizePrefs(args.prefs)); return undefined;
@@ -1972,6 +2011,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
       size: session.size,
       agent: session.agent,
       preview: session.preview,
+      previewRole: session.previewRole,
       lastTurnAt: session.lastTurnAt,
       parentSessionId: session.parentSessionId,
       subagent: session.subagent,
