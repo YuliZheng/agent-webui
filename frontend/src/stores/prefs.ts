@@ -40,6 +40,7 @@ export const usePrefsStore = defineStore("prefs", {
       this.defaultModel = blob.defaultModel ?? "";
       this.defaultPermissionMode = blob.defaultPermissionMode ?? "";
       this.defaultCodexModel = blob.defaultCodexModel ?? "";
+      this.defaultClaudeEffort = blob.defaultClaudeEffort ?? "";
       this.defaultCodexEffort = blob.defaultCodexEffort ?? "";
       this.defaultCodexServiceTier = blob.defaultCodexServiceTier === "priority" ? "priority" : "";
       this.defaultCodexApproval = blob.defaultCodexApproval ?? "";
@@ -73,6 +74,7 @@ export const usePrefsStore = defineStore("prefs", {
           defaultModel: this.defaultModel,
           defaultPermissionMode: this.defaultPermissionMode,
           defaultCodexModel: this.defaultCodexModel,
+          defaultClaudeEffort: this.defaultClaudeEffort,
           defaultCodexEffort: this.defaultCodexEffort,
           defaultCodexServiceTier: this.defaultCodexServiceTier,
           defaultCodexApproval: this.defaultCodexApproval,
@@ -128,6 +130,10 @@ export const usePrefsStore = defineStore("prefs", {
     },
     setDefaultCodexEffort(m: string) {
       this.defaultCodexEffort = m;
+      this.schedulePut();
+    },
+    setDefaultClaudeEffort(m: string) {
+      this.defaultClaudeEffort = m;
       this.schedulePut();
     },
     setDefaultCodexFast(enabled: boolean) {

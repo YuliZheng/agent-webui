@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { useSessionsStore } from "../stores/sessions.js";
+import { usePromptPendingStore } from "../stores/prompt-pending.js";
 import { usePrefsStore } from "../stores/prefs.js";
 import { useUiStore } from "../stores/ui.js";
 import { useDraftsStore } from "../stores/drafts.js";
@@ -8,10 +9,14 @@ import { searchContent, refreshBackend } from "../api/sessions.js";
 import { useScrollTargetStore } from "../stores/scroll-target.js";
 import { useSearchHighlightStore } from "../stores/search-highlight.js";
 import { displayCwd } from "../util/cwd-display.js";
+import { isSessionSearchable } from "../util/session-access.js";
 import { isOrdinarySidebarSessionVisible } from "../util/session-visibility.js";
+import { effectiveSessionActivityMs } from "../util/session-recency.js";
+import { shouldRunContentSearch } from "../util/search-query.js";
+import { withoutPinnedSessions } from "../util/sidebar-pinning.js";
 import { APP_BACK_PRIORITY, registerAppBackHandler } from "../util/app-back.js";
 import { setPwaLayerActive } from "../util/pwa-history.js";
-import { wake as wsWake } from "../api/ws.js";
+import { useNotificationsStore } from "../stores/notifications.js";
 import SessionRow from "./SessionRow.vue";
 import NewSessionModal from "./modals/NewSessionModal.vue";
 import SettingsModal from "./modals/SettingsModal.vue";
@@ -105,7 +110,7 @@ onBeforeUnmount(() => {
 
 // ─── Pull-to-refresh on the sidebar ──────────────────────────────────────
 // WeChat-style: at the very top of the chat list, drag down past the
-// threshold then release to wake the WS and re-fetch the sessions list.
+// threshold then release to rescan and re-fetch the sessions list.
 // Avoids reloading the whole page through the corporate proxy when the
 // sidebar previews / live updates feel out of sync after a long suspend.
 //
@@ -169,35 +174,31 @@ async function runPullRefresh() {
   pullState.value = "refreshing";
   pullDistance.value = PULL_REFRESH_HOLD;
   try {
-    // Kick the WS first so any pending stream-line / status broadcasts
-    // we missed (suspend, network blip) start flowing before we re-pull
-    // the source of truth.
-    wsWake({ forceReconnect: true });
-    // Force-reconnect handles the engaged tail through ws.ts's onopen
-    // re-subscribe path. Calling refreshEngaged() immediately while the new
-    // socket is still CONNECTING can queue unsubscribe/subscribe frames in the
-    // wrong order and tear down the just-restored tail.
     // Wipe stale per-session statuses BEFORE fetchAll repopulates them.
     // hydrateList only sets statuses for sessions still in the returned
     // list — without the wipe, a session that finished while we were
     // offline AND dropped off the recent-N list would stay stuck on a
     // stale "running" forever.
     sessions.clearAllStatus();
+    const startedAtRevision = sessions.metadataRevision;
     await Promise.all([
-      // Backend rescan: re-adopt any TUI / orphan claudes that started
-      // after webui boot, and re-walk every jsonl to recompute
-      // isResponding (chokidar drops events under load / on resume).
-      refreshBackend().catch(() => undefined),
-      // Frontend source-of-truth refetch: titles, mtime, previews, fork
-      // tree, AND the freshly-recomputed status for each session.
-      sessions.fetchAll().catch(() => undefined),
+      (async () => {
+        // /api/refresh already returns the post-scan session snapshot. Using
+        // it directly avoids a second request and makes it impossible for a
+        // pre-scan list response to win the race.
+        const refreshed = await refreshBackend();
+        sessions.hydrateList(refreshed.sessions, startedAtRevision);
+      })(),
       // Per-user preferences: hidden sessions, groups, thinking trigger,
       // theme. Less commonly stale but cheap to refetch.
-      prefs.load().catch(() => undefined),
+      prefs.load(),
       // Floor: keep the spinner up long enough to feel intentional
       // even when everything resolves in <100 ms.
       new Promise((r) => setTimeout(r, 350)),
     ]);
+    notifications.pushInfo("已刷新最新会话");
+  } catch (err) {
+    notifications.pushError(err instanceof Error ? err.message : String(err), { title: "刷新失败" });
   } finally {
     pullDistance.value = 0;
     pullState.value = "idle";
@@ -229,6 +230,8 @@ const pullIndicatorLabel = computed(() => {
 });
 
 const sessions = useSessionsStore();
+const notifications = useNotificationsStore();
+const promptPending = usePromptPendingStore();
 const prefs = usePrefsStore();
 const drafts = useDraftsStore();
 const scrollTarget = useScrollTargetStore();
@@ -253,9 +256,10 @@ function onSearchResultCaptureClick(id: string) {
 }
 
 // Effective recency used for ALL sidebar ordering. It MUST mirror the exact
-// timestamp SessionRow renders beside each row — `lastTurnAt`, falling back to
-// file mtime — so the visible order can never contradict the visible labels (a
-// row showing "Mon" must not outrank one showing "13:53").
+// timestamp SessionRow renders beside each row — the newest optimistic draft /
+// sent-prompt activity, then `lastTurnAt`, falling back to file mtime — so the
+// visible order can never contradict the visible labels (a row showing "Mon"
+// must not outrank one showing "13:53").
 //
 // We deliberately do NOT factor in `lastBoundaryAt` here. That field is seeded
 // from file mtime during scanAll and bumped to now() on responding-state
@@ -266,18 +270,15 @@ function onSearchResultCaptureClick(id: string) {
 // running sessions still surface: the dedicated "Active" section pins them by
 // status (isRunningSession), and `lastTurnAt` jumps to now() the moment
 // their turn starts, so dropping the boundary term loses no float-to-top.
-// draftMs keeps a just-typed (no jsonl yet) row at the top.
+// Draft and pending-prompt timestamps keep just-typed or just-sent activity at
+// the top before the jsonl write arrives (or permanently for a Codex steer).
 function effectiveMtime(id: string): number {
   const item = sessions.byId[id];
-  const turnMs = item ? Date.parse(item.lastTurnAt || "") : NaN;
-  const fileMs = item ? Date.parse(item.mtime || "") : NaN;
-  const draftMs = drafts.editedAt(id);
-  const turn = Number.isFinite(turnMs) ? turnMs : 0;
-  const file = Number.isFinite(fileMs) ? fileMs : 0;
-  // Mirror SessionRow's `lastTurnAt || mtime`: file mtime is only a fallback
-  // for sessions with no turn timestamp yet (brand-new / drain in progress).
-  const base = turn > 0 ? turn : file;
-  return Math.max(base, draftMs);
+  return effectiveSessionActivityMs(
+    item,
+    drafts.editedAt(id),
+    promptPending.latestStartedAt(id),
+  );
 }
 const ui = useUiStore();
 
@@ -413,15 +414,9 @@ const contentSearchToken = ref(0);
 
 let contentSearchTimer: ReturnType<typeof setTimeout> | null = null;
 const CONTENT_SEARCH_DEBOUNCE_MS = 200;
-// English noise queries ("is", "to") are filtered out at <3 chars. Chinese
-// 2-char words ("排序", "搜索", "重启") are extremely common and meaningful,
-// so allow 2 chars when the query contains any non-ASCII / CJK character.
-const CONTENT_SEARCH_MIN_CHARS_ASCII = 3;
-const CONTENT_SEARCH_MIN_CHARS_CJK = 2;
-const CJK_RE = /[^\x00-\x7F]/;
-function minCharsFor(q: string): number {
-  return CJK_RE.test(q) ? CONTENT_SEARCH_MIN_CHARS_CJK : CONTENT_SEARCH_MIN_CHARS_ASCII;
-}
+// Two-letter English noise queries ("is", "to") stay local-only. Two-character
+// CJK terms and digit-bearing technical terms ("5g", "4k", "3d") are
+// meaningful enough to search in transcript content.
 const MAX_RANKED_RESULTS = 100;
 
 // Per-token score boosts when the term hits in the metadata (always-known on
@@ -448,7 +443,7 @@ watch(searchQuery, (q: string) => {
   // while the user keeps typing.
   contentScores.value = new Map();
   contentSearchInflight.value = false;
-  if (q.trim().length < minCharsFor(q)) return;
+  if (!shouldRunContentSearch(q)) return;
   contentSearchToken.value += 1;
   const myToken = contentSearchToken.value;
   contentSearchTimer = setTimeout(async () => {
@@ -481,6 +476,7 @@ const idMatch = computed<string | null>(() => {
   let prefix: string | null = null;
   let sub: string | null = null;
   for (const id of allIds.value) {
+    if (!isSessionSearchable(sessions.byId[id])) continue;
     const f = id.toLowerCase();
     if (f === q) return id;
     if (!prefix && f.startsWith(q)) prefix = id;
@@ -495,6 +491,7 @@ function scoreFor(id: string): number | null {
   const tokens = searchTokens.value;
   if (tokens.length === 0) return null;
   const item = sessions.byId[id];
+  if (!isSessionSearchable(item)) return null;
   const title = (item?.title ?? "").toLowerCase();
   const cwdRaw = (item?.cwd ?? "").toLowerCase();
   const cwdDisp = displayCwd(item?.cwd, ui.home).toLowerCase();
@@ -721,13 +718,16 @@ const pinnedSessionIds = computed(() =>
     .filter((id) => visibleIds.value.includes(id))
     .sort((a, b) => effectiveMtime(b) - effectiveMtime(a)),
 );
+const pinnedSessionIdSet = computed<ReadonlySet<string>>(
+  () => new Set(pinnedSessionIds.value),
+);
 
 // "Active" pseudo-section at the very top: any visible session that is
 // either mid-turn (statusBySession==="running" covers "processing now"
 // and "drain queued prompts in flight" under M1-M4 queue semantics) OR
 // has unread assistant output the user hasn't seen yet. Same pattern as
-// Pinned — sessions still render in their cwd-group below, so this is
-// an extra surfacing. Running sessions sort before unread-only ones so
+// Pinned sessions already have their permanent top section, so Active only
+// surfaces non-pinned sessions. Running sessions sort before unread-only ones so
 // in-flight work stays at the very top; within each bucket, most-recent
 // activity wins.
 function isRunningSession(id: string): boolean {
@@ -738,7 +738,10 @@ const activeSessionIds = computed(() => {
   // block (and its border) disappears. The sessions still show in their
   // normal cwd-group / flat-list position below.
   if (prefs.showActiveSection === false) return [];
-  const ids = visibleIds.value.filter((id) =>
+  const ids = withoutPinnedSessions(
+    visibleIds.value,
+    pinnedSessionIdSet.value,
+  ).filter((id) =>
     isRunningSession(id) ||
     (sessions.unreadBySession[id] ?? 0) > 0,
   );
@@ -751,17 +754,23 @@ const activeSessionIds = computed(() => {
   return ids;
 });
 
-// Pinning a session adds an extra "Pinned" entry on top, but the session
-// stays in its original cwd auto-group / manual group too. The same row will
-// highlight in both places when selected — that's expected and intentional.
+// A pinned session renders only in the Pinned section, matching chat apps such
+// as WeChat. Unpinning restores it to its manual group or ordinary cwd/list
+// position because preferences retain that underlying membership.
 const ungroupedIds = computed(() =>
-  visibleIds.value.filter((id) => !groupedIds.value.has(id)),
+  withoutPinnedSessions(
+    visibleIds.value.filter((id) => !groupedIds.value.has(id)),
+    pinnedSessionIdSet.value,
+  ),
 );
 
 function idsInGroup(name: string): string[] {
   const g = prefs.groups[name];
   if (!g) return [];
-  return g.sessions.filter((id) => visibleIds.value.includes(id));
+  return withoutPinnedSessions(
+    g.sessions.filter((id) => visibleIds.value.includes(id)),
+    pinnedSessionIdSet.value,
+  );
 }
 
 interface OrderedRow { id: string; depth: number }

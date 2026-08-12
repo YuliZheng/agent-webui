@@ -9,6 +9,32 @@ function visibleText(content: unknown): string {
   }).join("\n").trim();
 }
 
+export interface CodexDurableTerminal {
+  kind: "completed" | "interrupted";
+  timestamp?: string;
+  turnId: string;
+}
+
+/**
+ * Rollout terminal records are durable even when the app-server's matching
+ * turn/completed notification is lost. Keep this separate from the
+ * user-visible notification filter below: an empty final answer still ends a
+ * turn and must clear driver/UI running state.
+ */
+export function codexDurableTerminal(record: Record<string, unknown>): CodexDurableTerminal | null {
+  if (record.type !== "event_msg") return null;
+  const payload = asRecord(record.payload);
+  const type = asString(payload?.type) ?? asString(payload?.kind);
+  if (type !== "task_complete" && type !== "turn_complete" && type !== "turn_aborted") return null;
+  const turnId = asString(payload?.turn_id) ?? asString(payload?.turnId);
+  if (!turnId) return null;
+  return {
+    kind: type === "turn_aborted" ? "interrupted" : "completed",
+    timestamp: asString(record.timestamp),
+    turnId,
+  };
+}
+
 /** Empty Claude end_turn placeholders are bookkeeping, not user-visible completions. */
 export function isMeaningfulEndTurnRecord(record: Record<string, unknown>, agent: AgentKind): boolean {
   if (agent === "claude") {
@@ -19,7 +45,10 @@ export function isMeaningfulEndTurnRecord(record: Record<string, unknown>, agent
   }
   if (record.type !== "event_msg") return false;
   const payload = asRecord(record.payload);
-  return ["turn_complete", "task_complete"].includes(asString(payload?.type) ?? asString(payload?.kind) ?? "");
+  const completionType = asString(payload?.type) ?? asString(payload?.kind) ?? "";
+  if (completionType === "turn_complete") return true;
+  if (completionType !== "task_complete") return false;
+  return (asString(payload?.last_agent_message) ?? "").trim().length > 0;
 }
 
 /** Bounded insertion-order LRU used to suppress duplicate watcher notifications. */

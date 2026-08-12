@@ -12,6 +12,18 @@ const pendingReconciliation = readFileSync(
 );
 
 describe("send feedback latency", () => {
+  it("locks synchronously before any async send preparation", () => {
+    const sendAt = promptInput.indexOf("async function send()");
+    const sendOnceAt = promptInput.indexOf("async function sendOnce");
+    expect(sendAt).toBeGreaterThan(-1);
+    expect(sendOnceAt).toBeGreaterThan(sendAt);
+    const wrapper = promptInput.slice(sendAt, sendOnceAt);
+    expect(wrapper).toContain("drafts.isInflight(sid)");
+    expect(wrapper).toContain("drafts.beginInflight(sid)");
+    expect(wrapper.indexOf("drafts.beginInflight(sid)")).toBeLessThan(wrapper.indexOf("await sendOnce(sid)"));
+    expect(promptInput).toContain(':disabled="!canSend || isInflightHere"');
+  });
+
   it("paints the optimistic prompt before any provider metadata request", () => {
     const optimisticAt = promptInput.indexOf("pendId = promptPending.add");
     const slashLookupAt = promptInput.indexOf("const slashCommands = await providerSlashCommandsFor");
@@ -22,6 +34,15 @@ describe("send feedback latency", () => {
     expect(promptInput).not.toContain("const showOptimistic = !draftCwd");
   });
 
+  it("advances the read baseline before an outbound prompt can race a watcher event", () => {
+    const markReadAt = promptInput.indexOf("if (!sessions.isPending(sid)) sessions.markRead(sid)");
+    const optimisticAt = promptInput.indexOf("pendId = promptPending.add");
+    const firstYieldAt = promptInput.indexOf("await nextTick()", optimisticAt);
+    expect(markReadAt).toBeGreaterThan(-1);
+    expect(markReadAt).toBeLessThan(optimisticAt);
+    expect(markReadAt).toBeLessThan(firstYieldAt);
+  });
+
   it("renders pending sends as real user bubbles before the thinking indicator", () => {
     const pendingBubbleAt = messageList.indexOf('class="cw-message-entry cw-message-entry-pending"');
     const thinkingAt = messageList.indexOf('v-else-if="running || compacting || optimisticallyStarting"');
@@ -29,10 +50,23 @@ describe("send feedback latency", () => {
     expect(thinkingAt).toBeGreaterThan(-1);
     expect(pendingBubbleAt).toBeLessThan(thinkingAt);
     expect(messageList).toContain('data-block="UserPromptBlock"');
-    expect(messageList).toContain("pp.phase === 'sending' ? 'sending'");
+    expect(messageList).toContain("row.prompt.phase === 'sending' ? 'sending'");
+    expect(messageList).toContain("interleavePendingPrompts(entries, pendingPrompts.value");
+    expect(messageList).toContain("__agentWebuiSourceIndex");
     expect(messageList).not.toContain('class="cw-queue-chip cw-queue-chip-optimistic');
     expect(userPromptBlock).toContain('pendingStatus?: "sending" | "steered"');
+    expect(userPromptBlock).toContain('"sent to current turn"');
     expect(userPromptBlock).toContain("cw-pending-prompt-status");
+  });
+
+  it("describes Codex steering separately from Claude queueing", () => {
+    expect(promptInput).toContain('const isCodexRunning = computed');
+    expect(promptInput).toContain('"Running… (Send into current turn)"');
+    expect(promptInput).toContain('"Send into current turn"');
+    expect(promptInput).toContain('"Running… (Send to queue)"');
+    expect(promptInput).toContain('"Send to queue"');
+    expect(promptInput).toContain(':placeholder="promptPlaceholder"');
+    expect(promptInput).toContain(':aria-label="sendActionTitle"');
   });
 
   it("stops showing sending and starts optimistic activity as soon as WebSocket dispatches", () => {
@@ -65,6 +99,8 @@ describe("send feedback latency", () => {
 
   it("uses the optimistic id as the retry-deduplication key", () => {
     expect(promptInput).toMatch(/sendPrompt\([\s\S]*?pendId \?\? undefined,[\s\S]*?slashCommands,/);
+    expect(promptInput).toContain('retrying. Your text is kept.');
+    expect(promptInput).toContain('"Send not confirmed"');
   });
 
   it("advances the source cursor from WS liveness and HTTP tail truth", () => {

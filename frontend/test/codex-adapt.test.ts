@@ -8,7 +8,7 @@ const userMsg = (text: string) => ev("event_msg", { type: "user_message", messag
 const agentMsg = (text: string) => ev("event_msg", { type: "agent_message", message: text });
 const fnCall = (callId: string, cmd: string) =>
   ev("response_item", { type: "function_call", name: "exec_command", call_id: callId, arguments: JSON.stringify({ cmd }) });
-const fnOut = (callId: string, output: string) =>
+const fnOut = (callId: string, output: unknown) =>
   ev("response_item", { type: "function_call_output", call_id: callId, output });
 
 function render(lines: string[]) {
@@ -31,6 +31,31 @@ describe("codexToClaudeLines (rollout shape) + groupTimeline", () => {
     expect(t[0]!.block).toBe("UserPromptBlock");
     expect(t[0]!.record.uuid).toBe("codex-line-0");
     expect(render([agentMsg("done")])[0]!.block).toBe("AssistantBlock");
+  });
+
+  it("preserves physical rollout indexes after non-rendered records are filtered", () => {
+    const t = render([
+      ev("event_msg", { type: "task_started", turn_id: "t1" }),
+      userMsg("hello"),
+      ev("event_msg", { type: "token_count", info: {} }),
+      fnCall("c1", "echo hi"),
+      fnOut("c1", "hi"),
+      agentMsg("done"),
+    ]);
+    expect(t.map(node => node.record.__agentWebuiSourceIndex)).toEqual([1, 3, 5]);
+  });
+
+  it("attaches a visible omitted-record placeholder to the following user bubble", () => {
+    const t = render([
+      JSON.stringify({ type: "agent-webui-record-omitted", bytes: 5_957_207 }),
+      userMsg("nine photos"),
+    ]);
+    expect(t).toHaveLength(1);
+    expect(t[0]!.block).toBe("UserPromptBlock");
+    expect((t[0]!.record.message as { content: unknown }).content).toEqual([
+      { type: "agent-webui-record-omitted", bytes: 5_957_207, sourceLineIndex: 0 },
+      { type: "text", text: "nine photos" },
+    ]);
   });
 
   it("pairs a structured input_image with the clean user event without duplicating the prompt", () => {
@@ -69,6 +94,42 @@ describe("codexToClaudeLines (rollout shape) + groupTimeline", () => {
     });
   });
 
+  it("pairs a sanitized transcript image reference without restoring inline bytes", () => {
+    const imageLine = ev("response_item", {
+      type: "message",
+      role: "user",
+      content: [{
+        type: "input_image",
+        image_url: "/api/sessions/session-1/transcript-image/4/2",
+        media_type: "image/webp",
+        __agentWebuiSourceIndex: 4,
+        __agentWebuiImageIndex: 2,
+      }],
+    });
+    const t = render([
+      ev("turn_context", { turn_id: "turn-image-ref" }),
+      ev("event_msg", { type: "token_count", info: {} }),
+      ev("event_msg", { type: "task_started", turn_id: "turn-image-ref" }),
+      ev("event_msg", { type: "task_started", turn_id: "turn-image-ref" }),
+      imageLine,
+      userMsg("[Image #1]cached"),
+    ]);
+    expect((t[0]!.record.message as { content: unknown }).content).toEqual([
+      {
+        type: "image",
+        source: {
+          type: "agent-webui-transcript",
+          lineIndex: 4,
+          imageIndex: 2,
+          media_type: "image/webp",
+          url: "/api/sessions/session-1/transcript-image/4/2",
+        },
+        name: "image-1.webp",
+      },
+      { type: "text", text: "cached" },
+    ]);
+  });
+
   it("pairs function_call + output into one Bash tool call", () => {
     const t = render([
       fnCall("call_1", "echo hi"),
@@ -80,6 +141,61 @@ describe("codexToClaudeLines (rollout shape) + groupTimeline", () => {
     expect(t[0]!.toolPairs![0]!.use.name).toBe("Bash");
     expect(t[0]!.toolPairs![0]!.use.input.command).toBe("echo hi");
     expect(String(t[0]!.toolPairs![0]!.result)).toContain("hi");
+  });
+
+  it("preserves emitted tool-result images as renderable image blocks", () => {
+    const t = render([
+      fnCall("image_call", "emit image"),
+      fnOut("image_call", [
+        {
+          type: "input_text",
+          text: "Chunk ID: image\nProcess exited with code 0\nOutput:\nready",
+        },
+        { type: "input_image", image_url: "data:image/png;base64,aGVsbG8=", detail: "original" },
+      ]),
+    ]);
+    expect(t[0]!.toolPairs?.[0]!.result).toEqual([
+      { type: "text", text: "ready" },
+      {
+        type: "image",
+        source: {
+          type: "base64",
+          media_type: "image/png",
+          data: "aGVsbG8=",
+        },
+      },
+    ]);
+  });
+
+  it("pairs custom tool calls and normalizes MCP image content", () => {
+    const t = render([
+      ev("response_item", { type: "custom_tool_call", call_id: "custom-image", name: "view_image", input: "{}" }),
+      ev("response_item", {
+        type: "custom_tool_call_output",
+        call_id: "custom-image",
+        output: { content: [{ type: "image", mimeType: "image/png", data: "aGVsbG8=" }] },
+      }),
+    ]);
+    expect(t[0]!.toolPairs?.[0]!.result).toEqual([{
+      type: "image",
+      source: { type: "base64", media_type: "image/png", data: "aGVsbG8=" },
+    }]);
+  });
+
+  it("preserves native assistant image_url blocks without duplicating assistant text", () => {
+    const lines = codexToClaudeLines(ev("response_item", {
+      type: "message",
+      role: "assistant",
+      content: [
+        { type: "output_text", text: "duplicated elsewhere" },
+        { type: "image_url", image_url: "data:image/png;base64,aA==" },
+      ],
+    }), 9);
+    expect(lines).toHaveLength(1);
+    const record = JSON.parse(lines[0]!);
+    expect(record.message.content).toEqual([
+      { type: "image_url", image_url: "data:image/png;base64,aA==" },
+    ]);
   });
 
   it("renders a full turn (user → command → reply) in order", () => {
@@ -94,6 +210,62 @@ describe("codexToClaudeLines (rollout shape) + groupTimeline", () => {
     ]);
     expect(t.map((n) => n.block)).toEqual(["UserPromptBlock", "AssistantBlock", "AssistantBlock"]);
     expect(t[1]!.toolPairs?.[0]!.use.name).toBe("Bash");
+  });
+
+  it("persists an explicit marker when a turn ends without a final response", () => {
+    const t = render([
+      userMsg("continue"),
+      fnCall("c1", "echo working"),
+      fnOut("c1", "Output:\nworking\n"),
+      ev("event_msg", { type: "task_complete", turn_id: "t1", last_agent_message: null }),
+    ]);
+    expect(t.map((n) => n.block)).toEqual(["UserPromptBlock", "AssistantBlock", "AssistantBlock"]);
+    expect(t[2]!.record.message).toEqual(expect.objectContaining({
+      content: [expect.objectContaining({
+        type: "text",
+        text: "Turn ended without a final response. Send another message to retry or continue.",
+      })],
+    }));
+    expect(codexToClaudeLines(ev("event_msg", {
+      type: "task_complete",
+      turn_id: "t2",
+      last_agent_message: "Done",
+    }))).toEqual([]);
+  });
+
+  it("suppresses only the latest empty-completion marker while capacity retry is pending", () => {
+    const raw = [
+      userMsg("continue"),
+      fnCall("c1", "echo working"),
+      fnOut("c1", "Output:\nworking\n"),
+      ev("event_msg", { type: "task_complete", turn_id: "t1", last_agent_message: null }),
+    ];
+
+    const retrying = groupTimeline(codexRolloutToClaudeLines(raw, {
+      suppressLatestEmptyCompletion: true,
+    }));
+    expect(retrying.map((node) => node.block)).toEqual(["UserPromptBlock", "AssistantBlock"]);
+
+    const exhausted = render(raw);
+    expect(exhausted.at(-1)?.record.message).toEqual(expect.objectContaining({
+      content: [expect.objectContaining({
+        text: "Turn ended without a final response. Send another message to retry or continue.",
+      })],
+    }));
+  });
+
+  it("replaces an empty-completion marker when a retry attempt starts", () => {
+    const t = render([
+      userMsg("continue"),
+      ev("event_msg", { type: "task_complete", turn_id: "t1", last_agent_message: null }),
+      ev("event_msg", { type: "task_started", turn_id: "t2" }),
+      agentMsg("Completed on retry."),
+      ev("event_msg", { type: "task_complete", turn_id: "t2", last_agent_message: "Completed on retry." }),
+    ]);
+    expect(t.map((node) => node.block)).toEqual(["UserPromptBlock", "AssistantBlock"]);
+    expect(t[1]!.record.message).toEqual(expect.objectContaining({
+      content: [expect.objectContaining({ type: "text", text: "Completed on retry." })],
+    }));
   });
 
   it("honors rollback markers when rendering append-only rollout logs", () => {

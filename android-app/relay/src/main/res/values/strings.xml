@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">Tailnet Relay</string>
+    <string name="notification_channel_name">Tailnet relay</string>
+    <string name="notification_title">Tailnet relay active</string>
+</resources>

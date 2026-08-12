@@ -3,8 +3,9 @@ import crypto from "node:crypto";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { mkdir, open, readFile, realpath, readdir, stat, unlink, writeFile } from "node:fs/promises";
+import { createReadStream } from "node:fs";
 import Fastify, { LogController, type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import cookie from "@fastify/cookie";
 import websocket from "@fastify/websocket";
@@ -20,20 +21,23 @@ import {
   flushLineIndexPersistence,
   JsonlTailer,
   isRenderableClaudeLine,
+  MAX_JSONL_RECORD_BYTES,
   preserveIndexes,
   readRecordAt,
   readRange,
   readTail,
+  readTailSnapshot,
 } from "./services/jsonl.js";
 import { AppState, normalizePrefs } from "./services/state.js";
 import { PubSub } from "./services/pubsub.js";
 import { ClaudeDriver } from "./services/claude-driver.js";
-import { CodexDriver } from "./services/codex-driver.js";
-import { PreviewStore, readLocalSource, resolveLocalFile } from "./services/files.js";
+import { CODEX_REASONING_EFFORTS, CodexDriver } from "./services/codex-driver.js";
+import { inspectLocalPath, listLocalDirectory, openLocalPath, PreviewStore, readLocalSource, resolveLocalFile, resolveLocalPath } from "./services/files.js";
 import { autoTitle, autoTitleFromText, deleteSessions, forkSession, getUserMessages, markdownExport, rewindSession, searchSessions } from "./actions/sessions.js";
 import { expandHome, isWithin, safeFilename } from "./util/paths.js";
 import { resolveCodexExecutable } from "./util/executable.js";
-import { isMeaningfulEndTurnRecord, NotificationDeduper } from "./services/notifications.js";
+import { codexDurableTerminal, isMeaningfulEndTurnRecord, NotificationDeduper } from "./services/notifications.js";
+import { assertDirectPromptAllowed, normalizeDirectPromptError } from "./services/session-prompt.js";
 import {
   failRunningClaudeBackgroundTasks,
   mergeClaudeBackgroundTasks,
@@ -45,22 +49,44 @@ import { ClaudeProcessObserver, type ForeignClaudeObservation } from "./services
 import { ContentSearchIndex } from "./services/content-search-index.js";
 import { fullCodexContextUsage } from "./services/codex-context-usage.js";
 import { sendJson } from "./services/ws-send.js";
+import { themedVisualizationHtml } from "./services/visualization.js";
+import {
+  sanitizeTranscriptLines,
+  sanitizeTranscriptRaw,
+  transcriptImagePayload,
+} from "./services/transcript-images.js";
 import {
   formatTitleWithEmoji,
   resolveSessionTitle,
   splitTitleEmoji,
 } from "./services/session-title.js";
 import {
+  appendConversationTitleRequests,
   appendIncrementalTitleRequests,
   formatIncrementalTitleContext,
+  formatTitleRequestContext,
   recentSessionTitleContext,
+  sessionTitleRequests,
   titleRequestText,
 } from "./services/session-title-context.js";
 import { CodexSessionTitleGenerator } from "./services/session-title-generator.js";
 import type { SessionTitleGenerator } from "./services/session-title-generator.js";
-import type { AgentCapabilities, AgentSelectOption, PrefsBlob } from "@agent-webui/shared";
+import {
+  MAX_CLAUDE_PROMPT_ATTACHMENTS,
+  MAX_CODEX_PROMPT_ATTACHMENTS,
+  MAX_PROMPT_ATTACHMENT_BYTES,
+  type AgentCapabilities,
+  type AgentSelectOption,
+  type PrefsBlob,
+} from "@agent-webui/shared";
 
 const execFileAsync = promisify(execFile);
+// Automatic mobile gap repair should never pull a multi-megabyte tool record.
+// Full-fidelity range reads remain available when the user explicitly loads
+// older history; this compact mode is only for quietly reconnecting a recent
+// sparse suffix to the already-cached turn.
+const COMPACT_RANGE_MAX_BYTES = 512 * 1024;
+const COMPACT_RANGE_MAX_RECORD_BYTES = 128 * 1024;
 
 export interface BuildAppOptions {
   home?: string;
@@ -86,6 +112,15 @@ function rawPath(request: FastifyRequest): string {
   const question = raw.indexOf("?");
   const value = question >= 0 ? raw.slice(0, question) : raw;
   try { return decodeURIComponent(value); } catch { return "\0"; }
+}
+
+function fileContentDisposition(kind: "inline" | "attachment", filePath: string): string {
+  const name = basename(filePath);
+  const ascii = name.replace(/[^\x20-\x7e]|["\\]/g, "_");
+  const encoded = encodeURIComponent(name).replace(/[!'()*]/g, char =>
+    `%${char.charCodeAt(0).toString(16).toUpperCase()}`,
+  );
+  return `${kind}; filename="${ascii}"; filename*=UTF-8''${encoded}`;
 }
 
 export function webSocketOriginAllowed(origin: unknown, host: unknown): boolean {
@@ -272,10 +307,10 @@ function reasoningEffort(value: unknown): string | undefined {
   if (effort && !/^[0-9A-Za-z_-]+$/.test(effort)) throw new RpcError(400, "Invalid reasoning effort");
   return effort;
 }
-const CODEX_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
+const CODEX_REASONING_EFFORT_SET = new Set<string>(CODEX_REASONING_EFFORTS);
 function codexReasoningEffort(value: unknown): string | undefined {
   const effort = reasoningEffort(value);
-  if (effort && !CODEX_REASONING_EFFORTS.has(effort)) {
+  if (effort && !CODEX_REASONING_EFFORT_SET.has(effort)) {
     throw new RpcError(400, `Unsupported Codex reasoning effort: ${effort}`);
   }
   return effort;
@@ -285,8 +320,10 @@ function codexServiceTier(value: unknown): string | undefined {
   if (tier && tier !== "priority") throw new RpcError(400, `Unsupported Codex service tier: ${tier}`);
   return tier;
 }
-function storedCodexServiceTier(value: unknown): string | undefined {
-  if (value === "standard") return undefined;
+function storedCodexServiceTier(value: unknown): string | null | undefined {
+  // Persisted "standard" is an explicit Fast-off choice. Keep sending null
+  // so a restarted app-server cannot silently re-inherit global Fast config.
+  if (value === "standard") return null;
   return codexServiceTier(value);
 }
 
@@ -324,7 +361,9 @@ function claudeCapabilities(prefs: PrefsBlob): AgentCapabilities {
     sandboxModes: [],
     defaults: {
       model: prefs.defaultClaudeModel || null,
-      effort: prefs.defaultClaudeEffort || null,
+      // External default: the CLI's own env (CLAUDE_CODE_EFFORT_LEVEL from
+      // ~/.claude/settings.json) wins when the webui pref is unset.
+      effort: prefs.defaultClaudeEffort || process.env.CLAUDE_CODE_EFFORT_LEVEL || null,
       permissionMode: prefs.defaultClaudePermissionMode || null,
       sandboxMode: null,
     },
@@ -352,34 +391,6 @@ export function decodeAttachmentPayload(raw: unknown): { name?: string; type: st
   const bytes = Buffer.from(data, "base64");
   if (!bytes.length || bytes.length > 10 * 1024 * 1024) throw new RpcError(413, "Attachment exceeds 10 MiB");
   return { name: asString(item?.name), type: declared, data, bytes };
-}
-
-function transcriptImagePayload(
-  record: Record<string, unknown>,
-  agent: "claude" | "codex",
-  imageIndex: number,
-): { type: string; data: string } | null {
-  const content = agent === "claude"
-    ? asRecord(record.message)?.content
-    : asRecord(record.payload)?.content;
-  if (!Array.isArray(content)) return null;
-  const images = content.flatMap(raw => {
-    const block = asRecord(raw);
-    const type = asString(block?.type);
-    if (agent === "codex" && type === "input_image") {
-      const data = asString(block?.image_url) ?? asString(block?.imageUrl);
-      const match = data?.match(/^data:(image\/[a-z0-9.+-]+);base64,/i);
-      return data && match?.[1] ? [{ type: match[1].toLowerCase(), data }] : [];
-    }
-    if (type !== "image") return [];
-    const source = asRecord(block?.source);
-    const sourceType = asString(source?.type);
-    const mediaType = asString(source?.media_type) ?? asString(source?.mediaType);
-    const data = asString(source?.data);
-    if (sourceType !== "base64" || !mediaType?.startsWith("image/") || !data) return [];
-    return [{ type: mediaType, data }];
-  });
-  return images[imageIndex] ?? null;
 }
 
 export function decodeAvatarPayload(raw: unknown): Buffer {
@@ -438,7 +449,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   state.titleGenerator = options.titleGenerator
     ?? new CodexSessionTitleGenerator(options.codexBinary ?? "codex").generate;
   const contentSearchIndex = await ContentSearchIndex.open(
-    join(stateDir, "content-search-v5.sqlite"),
+    join(stateDir, "content-search-v6.sqlite"),
     event => {
       if (event.type === "error") app.log.warn({ contentSearchIndex: event }, "Content search index update failed");
       else if (event.type === "disabled") app.log.warn({ contentSearchIndex: event }, "Content search index disabled");
@@ -446,7 +457,14 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     },
   );
   if (contentSearchIndex) {
-    for (const name of ["content-search.sqlite", "content-search.sqlite-wal", "content-search.sqlite-shm"]) {
+    for (const name of [
+      "content-search.sqlite",
+      "content-search.sqlite-wal",
+      "content-search.sqlite-shm",
+      "content-search-v5.sqlite",
+      "content-search-v5.sqlite-wal",
+      "content-search-v5.sqlite-shm",
+    ]) {
       try {
         await unlink(join(stateDir, name));
       } catch (error) {
@@ -461,6 +479,8 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   const claudeProcesses = new ClaudeProcessObserver(options.claudeSessionsDir ?? join(home, ".claude", "sessions"));
   claude.setForeignAttachmentLookup(sessionId => claudeProcesses.foreignAttachment(sessionId));
   const codex = new CodexDriver(options.codexBinary ?? "codex", state);
+  claude.on("driver-error", event => app.log.warn({ agent: "claude", event }, "Agent driver reported a recoverable error"));
+  codex.on("driver-error", event => app.log.warn({ agent: "codex", event }, "Agent driver reported a recoverable error"));
   const previews = new PreviewStore(join(stateDir, "previews"));
   // Source/image reads are restricted to discovered or explicitly normalized
   // working directories. The home directory is only a navigation root.
@@ -481,6 +501,8 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   const autoTitlePending = new Map<string, { requests: string[]; turns: number }>();
   const autoTitleTurns = new Map<string, number>();
   const autoTitleCycleRequests = new Map<string, string[]>();
+  const autoTitleAnchorRequests = new Map<string, { requests: string[]; size: number }>();
+  const titleMutationWork = new Map<string, Promise<void>>();
   const recentAutoTitlePrompts = new Map<string, string[]>();
   const newSessionResults = new Map<string, { sessionId: string }>();
   const newSessionRequests = new Map<string, Promise<{ sessionId: string }>>();
@@ -558,50 +580,67 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     }
   }
 
+  async function serializeTitleMutation<T>(
+    sessionId: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const previous = titleMutationWork.get(sessionId) ?? Promise.resolve();
+    const result = previous.catch(() => undefined).then(operation);
+    const tail = result.then(() => undefined, () => undefined);
+    titleMutationWork.set(sessionId, tail);
+    try {
+      return await result;
+    } finally {
+      if (titleMutationWork.get(sessionId) === tail) titleMutationWork.delete(sessionId);
+    }
+  }
+
   async function publishAutoTitle(session: SessionRecord, title: string): Promise<{
     title: string | null;
     titleSource: "auto" | "manual" | null;
     emoji: string | null;
   }> {
-    const titles = await state.titles.get();
-    const entry = titles[session.id];
-    if (session.agent === "codex") {
-      const canonical = formatTitleWithEmoji(title, entry?.emoji);
-      // Update the cache before the RPC. App-server may synchronously emit
-      // thread/name/updated before thread/name/set resolves; the optimistic
-      // value makes that echo a no-op, leaving one deliberate rename push
-      // below instead of two flickering updates.
-      canonicalCodexTitles.set(session.id, canonical);
-      try {
-        await codex.setThreadName(session.id, canonical);
-      } catch (error) {
-        // Prefer the freshly generated local entry in this WebUI when the
-        // canonical write fails, instead of snapping back to a stale name.
-        canonicalCodexTitles.set(session.id, null);
-        app.log.warn(
-          { sessionId: session.id, error },
-          "Codex title was generated locally but its canonical thread name could not be updated",
-        );
+    return serializeTitleMutation(session.id, async () => {
+      const titles = await state.titles.get();
+      const entry = titles[session.id];
+      if (session.agent === "codex" && entry?.source !== "manual") {
+        const canonical = formatTitleWithEmoji(title, entry?.emoji);
+        // Update the cache before the RPC. App-server may synchronously emit
+        // thread/name/updated before thread/name/set resolves; the optimistic
+        // value makes that echo a no-op, leaving one deliberate rename push
+        // below instead of two flickering updates.
+        canonicalCodexTitles.set(session.id, canonical);
+        try {
+          await codex.setThreadName(session.id, canonical);
+        } catch (error) {
+          // Prefer the freshly generated local entry in this WebUI when the
+          // canonical write fails, instead of snapping back to a stale name.
+          canonicalCodexTitles.set(session.id, null);
+          app.log.warn(
+            { sessionId: session.id, error },
+            "Codex title was generated locally but its canonical thread name could not be updated",
+          );
+        }
       }
-    }
-    const resolved = resolveSessionTitle(
-      session.agent,
-      entry,
-      canonicalCodexTitles.get(session.id),
-    );
-    pubsub.push({
-      type: "session-renamed",
-      kind: "session-renamed",
-      id: session.id,
-      title: resolved.title,
-      titleSource: resolved.source,
-      emoji: resolved.emoji ?? null,
+      const resolved = resolveSessionTitle(
+        session.agent,
+        entry,
+        canonicalCodexTitles.get(session.id),
+      );
+      pubsub.push({
+        type: "session-renamed",
+        kind: "session-renamed",
+        id: session.id,
+        title: resolved.title,
+        titleSource: resolved.source,
+        emoji: resolved.emoji ?? null,
+      });
+      return {
+        title: resolved.title,
+        titleSource: resolved.source,
+        emoji: resolved.emoji ?? null,
+      };
     });
-    return {
-      title: resolved.title,
-      titleSource: resolved.source,
-      emoji: resolved.emoji ?? null,
-    };
   }
 
   function ensureCodexThreadNames(): void {
@@ -809,17 +848,36 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   app.get("/api/sessions", sessionView);
   app.get("/api/sessions/:id/tail", async request => {
     const { id } = request.params as { id: string }; assertSessionId(id); const session = await index.resolveLight(id); if (!session) throw new RpcError(404, "Session not found");
-    const lines = await readTail(session.path, Number((request.query as Record<string, unknown>).n ?? 200));
-    const filtered = session.agent === "claude" ? preserveIndexes(lines, isRenderableClaudeLine) : lines;
-    const totalLines = await countJsonlLines(session.path);
-    return { totalLines, fromIndex: filtered[0]?.index ?? totalLines, lines: filtered };
+    const query = request.query as Record<string, unknown>;
+    const priority = query.priority === "interactive" ? "interactive" : "background";
+    const snapshot = await readTailSnapshot(session.path, Number(query.n ?? 200), priority);
+    const filtered = session.agent === "claude" ? preserveIndexes(snapshot.lines, isRenderableClaudeLine) : snapshot.lines;
+    return {
+      totalLines: snapshot.lineCount,
+      fromIndex: filtered[0]?.index ?? snapshot.lineCount,
+      lines: sanitizeTranscriptLines(id, filtered),
+      supportsCompactRange: true,
+    };
   });
   app.get("/api/sessions/:id/range", async request => {
     const { id } = request.params as { id: string }; assertSessionId(id); const session = await index.resolveLight(id); if (!session) throw new RpcError(404, "Session not found");
     const query = request.query as Record<string, unknown>;
-    const lines = await readRange(session.path, Number(query.from ?? 0), query.to === undefined ? undefined : Number(query.to));
+    const compact = query.mode === "compact";
+    const lines = await readRange(
+      session.path,
+      Number(query.from ?? 0),
+      query.to === undefined ? undefined : Number(query.to),
+      compact ? {
+        maxBytes: COMPACT_RANGE_MAX_BYTES,
+        maxRecordBytes: COMPACT_RANGE_MAX_RECORD_BYTES,
+        priority: "background",
+      } : undefined,
+    );
     const filtered = session.agent === "claude" ? preserveIndexes(lines, isRenderableClaudeLine) : lines;
-    return { totalLines: await countJsonlLines(session.path), lines: filtered };
+    return {
+      totalLines: await countJsonlLines(session.path),
+      lines: sanitizeTranscriptLines(id, filtered),
+    };
   });
   app.get("/api/sessions/:id/context-usage", async request => {
     const { id } = request.params as { id: string };
@@ -845,10 +903,11 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   }
   async function attachments(value: unknown, agent: "claude" | "codex"): Promise<PreparedAttachments> {
     if (!Array.isArray(value)) return { files: [] };
-    if (value.length > 8) throw new RpcError(413, "Too many attachments");
+    const maxCount = agent === "codex" ? MAX_CODEX_PROMPT_ATTACHMENTS : MAX_CLAUDE_PROMPT_ATTACHMENTS;
+    if (value.length > maxCount) throw new RpcError(413, `Too many attachments (max ${maxCount})`);
     const decoded = value.map(decodeAttachmentPayload);
     const totalBytes = decoded.reduce((total, item) => total + item.bytes.length, 0);
-    if (totalBytes > 40 * 1024 * 1024) throw new RpcError(413, "Attachments exceed the 40 MiB request limit");
+    if (totalBytes > MAX_PROMPT_ATTACHMENT_BYTES) throw new RpcError(413, "Attachments exceed the 40 MiB request limit");
     if (agent === "claude") {
       return { files: decoded.map(item => ({ name: item.name, type: item.type, data: item.data })) };
     }
@@ -922,7 +981,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
         const permissionMode = settingValue(args.permissionMode, "Codex approval") ?? prefs.defaultCodexApprovalPreset;
         const hasServiceTierOverride = Object.prototype.hasOwnProperty.call(args, "serviceTier");
         const serviceTier = hasServiceTierOverride
-          ? codexServiceTier(args.serviceTier)
+          ? codexServiceTier(args.serviceTier) ?? null
           : codexServiceTier(prefs.defaultCodexServiceTier);
         const result = await codex.newSession(cwd, prompt, {
           model: settingValue(args.model, "Model") ?? settingValue(prefs.defaultCodexModel, "Model"),
@@ -980,6 +1039,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   }
   async function promptSession(id: string, args: Record<string, unknown>) {
     assertSessionId(id); const session = await index.resolveLight(id); if (!session) throw new RpcError(404, "Session not found");
+    assertDirectPromptAllowed(session);
     const prompt = asString(args.prompt) ?? ""; const prepared = await attachments(args.images, session.agent); const files = prepared.files; if (!prompt.trim() && !files.length) throw new RpcError(400, "Prompt is empty");
     const settings = (await state.settings.get())[id]; const prefs = await state.prefs.get();
     let accepted = false;
@@ -1012,7 +1072,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
       return result;
     } catch (error) {
       if (!accepted) await discardFailedAttachments(prepared.batchId);
-      throw error;
+      throw normalizeDirectPromptError(error);
     }
   }
   async function stopSession(id: string) {
@@ -1038,6 +1098,25 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   app.get("/api/local-file", async request => {
     const query = request.query as Record<string, unknown>; return readLocalSource(String(query.path ?? ""), [...extraRoots], query.line === undefined ? undefined : Number(query.line));
   });
+  app.get("/api/local-file-content", async (request, reply) => {
+    const query = request.query as Record<string, unknown>;
+    const source = await resolveLocalFile(String(query.path ?? ""), [...extraRoots]);
+    const download = query.download === "1";
+    if (!download && source.size > 256 * 1024 * 1024) throw new RpcError(413, "File exceeds 256 MiB");
+    if (!download && !/\.pdf$/i.test(source.path)) {
+      throw new RpcError(415, "Only PDF files can be embedded through this endpoint");
+    }
+    reply
+      .header("Cache-Control", "private, no-store")
+      .header("X-Content-Type-Options", "nosniff")
+      .header("Content-Length", String(source.size))
+      .header(
+        "Content-Disposition",
+        fileContentDisposition(download ? "attachment" : "inline", source.path),
+      )
+      .type(download ? "application/octet-stream" : "application/pdf");
+    return reply.send(createReadStream(source.path));
+  });
   app.get("/local-file", async (request, reply) => {
     const query = request.query as Record<string, unknown>; const source = await readLocalSource(String(query.path ?? ""), [...extraRoots], query.line === undefined ? undefined : Number(query.line));
     reply.header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'").type("text/html").send(`<!doctype html><meta charset="utf-8"><title>${escapeHtml(String(source.name))}</title><style>body{margin:0;font:14px/1.55 ui-monospace,monospace;background:#1f1f1f;color:#eee}pre{padding:16px;white-space:pre-wrap}</style><pre id="source"></pre><script>document.getElementById('source').textContent=${safeBootJson(source.content)}</script>`);
@@ -1055,7 +1134,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     const mime = /\.png$/i.test(path) ? "image/png" : /\.gif$/i.test(path) ? "image/gif" : /\.webp$/i.test(path) ? "image/webp" : "image/jpeg";
     return reply.type(mime).send(await readFile(path));
   });
-  app.get("/api/sessions/:sessionId/input-image/:lineIndex/:imageIndex", async (request, reply) => {
+  const transcriptImage = async (request: FastifyRequest, reply: FastifyReply) => {
     const params = request.params as {
       sessionId: string;
       lineIndex: string;
@@ -1070,24 +1149,70 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     const session = await index.resolveLight(params.sessionId);
     if (!session) throw new RpcError(404, "Session not found");
     // 10 MiB decoded input plus JSON/base64 overhead and a small envelope.
-    const line = await readRecordAt(session.path, lineIndex, 15 * 1024 * 1024);
+    const line = await readRecordAt(session.path, lineIndex, MAX_JSONL_RECORD_BYTES);
     if (!line || line.index !== lineIndex) throw new RpcError(404, "Transcript image record not found");
     let record: Record<string, unknown> | null = null;
     try { record = asRecord(JSON.parse(line.raw)); } catch { /* handled below */ }
-    const payload = record ? transcriptImagePayload(record, session.agent, imageIndex) : null;
+    const payload = record ? transcriptImagePayload(record, imageIndex) : null;
     if (!payload) throw new RpcError(404, "Transcript image not found");
     const decoded = decodeAttachmentPayload(payload);
     if (!decoded.type.startsWith("image/")) throw new RpcError(415, "Transcript attachment is not an image");
-    reply.header("Cache-Control", "private, max-age=31536000, immutable");
+    reply
+      .header("Cache-Control", "private, max-age=31536000, immutable")
+      .header("X-Content-Type-Options", "nosniff");
     return reply.type(decoded.type).send(decoded.bytes);
-  });
+  };
+  // Keep the original route for cached clients while using the broader name
+  // for generated/tool-result images as well as user inputs.
+  app.get("/api/sessions/:sessionId/input-image/:lineIndex/:imageIndex", transcriptImage);
+  app.get("/api/sessions/:sessionId/transcript-image/:lineIndex/:imageIndex", transcriptImage);
   app.get("/api/codex-image", async (request, reply) => {
     const query = request.query as Record<string, unknown>; const path = String(query.path ?? "");
     const source = await resolveLocalFile(path, [...extraRoots]);
-    if (!/\.(png|jpe?g|gif|webp)$/i.test(source.path)) throw new RpcError(415, "Unsupported image type");
+    if (!/\.(png|jpe?g|gif|webp|bmp|avif)$/i.test(source.path)) throw new RpcError(415, "Unsupported image type");
     if (source.size > 20 * 1024 * 1024) throw new RpcError(413, "Image is too large");
-    const mime = /\.png$/i.test(source.path) ? "image/png" : /\.gif$/i.test(source.path) ? "image/gif" : /\.webp$/i.test(source.path) ? "image/webp" : "image/jpeg";
+    const mime = /\.png$/i.test(source.path) ? "image/png"
+      : /\.gif$/i.test(source.path) ? "image/gif"
+      : /\.webp$/i.test(source.path) ? "image/webp"
+      : /\.bmp$/i.test(source.path) ? "image/bmp"
+      : /\.avif$/i.test(source.path) ? "image/avif"
+      : "image/jpeg";
     return reply.type(mime).send(await readFile(source.path));
+  });
+  app.get("/api/sessions/:sessionId/visualization/:filename", async (request, reply) => {
+    const params = request.params as { sessionId: string; filename: string };
+    assertSessionId(params.sessionId);
+    safeFilename(params.filename);
+    if (!/\.html?$/i.test(params.filename)) throw new RpcError(415, "Visualization must be an HTML file");
+    const session = await index.resolveLight(params.sessionId);
+    if (!session || session.agent !== "codex") throw new RpcError(404, "Codex session not found");
+    const sessionDirectory = dirname(session.path);
+    if (!isWithin(codexRoot, sessionDirectory)) throw new RpcError(403, "Session is outside the Codex root");
+    const datedDirectory = relative(codexRoot, sessionDirectory);
+    const visualizationRoot = resolve(
+      dirname(codexRoot),
+      "visualizations",
+      datedDirectory,
+      params.sessionId,
+    );
+    let actualRoot: string;
+    let actual: string;
+    try {
+      actualRoot = await realpath(visualizationRoot);
+      actual = await realpath(join(actualRoot, params.filename));
+    } catch {
+      throw new RpcError(404, "Visualization not found");
+    }
+    if (!isWithin(actualRoot, actual)) throw new RpcError(403, "Visualization escapes its session directory");
+    const info = await stat(actual);
+    if (!info.isFile()) throw new RpcError(404, "Visualization not found");
+    if (info.size > 5 * 1024 * 1024) throw new RpcError(413, "Visualization exceeds 5 MiB");
+    reply
+      .header("Content-Security-Policy", "sandbox allow-scripts; default-src 'none'; img-src data: blob:; style-src 'unsafe-inline'; script-src 'unsafe-inline'")
+      .header("X-Content-Type-Options", "nosniff")
+      .header("Cache-Control", "private, no-store")
+      .type("text/html; charset=utf-8");
+    return reply.send(themedVisualizationHtml(await readFile(actual, "utf8")));
   });
   app.post("/api/preview", async request => {
     const body = objectBody(request); const html = asString(body.html); if (html === undefined) throw new RpcError(400, "Missing HTML"); return previews.create(html);
@@ -1129,8 +1254,20 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
       tailN,
       filter: session.agent === "claude" ? isRenderableClaudeLine : undefined,
     }, event => {
-      if (event.type === "stream-line") send(socket, { ...event, sessionId });
-      else if (event.type === "stream-batch") send(socket, { ...event, sessionId, lines: event.lines.map(line => ({ index: line.index, data: line.raw })) });
+      if (event.type === "stream-line") {
+        send(socket, {
+          ...event,
+          sessionId,
+          data: sanitizeTranscriptRaw(event.data, sessionId, event.index),
+        });
+      } else if (event.type === "stream-batch") {
+        send(socket, {
+          ...event,
+          sessionId,
+          lines: sanitizeTranscriptLines(sessionId, event.lines)
+            .map(line => ({ index: line.index, data: line.raw })),
+        });
+      }
       else send(socket, { ...event, sessionId });
     });
     map.set(sessionId, tailer);
@@ -1212,6 +1349,13 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
         return { paths };
       }
       case "read-local-file": return readLocalSource(String(args.path ?? ""), [...extraRoots], args.line === undefined ? undefined : Number(args.line));
+      case "inspect-local-path": return inspectLocalPath(String(args.path ?? ""), [...extraRoots]);
+      case "list-local-directory": return listLocalDirectory(String(args.path ?? ""), [...extraRoots]);
+      case "reveal-local-path": {
+        const target = await resolveLocalPath(String(args.path ?? ""), [...extraRoots]);
+        await openLocalPath(target.path, target.kind);
+        return { path: target.path, kind: target.kind };
+      }
       case "new-session": return newSession(args);
       case "prompt": return promptSession(String(args.sessionId ?? ""), args);
       case "stop": return stopSession(String(args.sessionId ?? ""));
@@ -1255,6 +1399,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
             ...capabilities.defaults,
             model: prefs.defaultCodexModel || capabilities.defaults.model,
             effort: prefs.defaultCodexEffort || capabilities.defaults.effort,
+            serviceTier: prefs.defaultCodexServiceTier || capabilities.defaults.serviceTier,
             permissionMode: prefs.defaultCodexApprovalPreset || capabilities.defaults.permissionMode,
             sandboxMode: prefs.defaultCodexSandboxMode || capabilities.defaults.sandboxMode,
           },
@@ -1287,7 +1432,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
           all[id] = current;
         });
         pubsub.push({ type: "session-settings", kind: "session-settings", id, ...(await state.settings.get())[id] });
-        return { applies: "immediately" };
+        return { applies: "next-turn" };
       }
       case "set-permission-mode": {
         const id = String(args.sessionId ?? ""); assertSessionId(id); const rawMode = settingValue(args.mode, "Permission mode");
@@ -1347,33 +1492,35 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
         if (!session) throw new RpcError(404, "Session not found");
         const parsed = splitTitleEmoji(args.title);
         const title = parsed.title;
-        await state.titles.update(all => {
-          if (title) {
-            const topicSummary = all[id]?.topicSummary;
-            all[id] = {
-              title,
-              source: "manual",
-              ...(parsed.emoji ? { emoji: parsed.emoji } : {}),
-              ...(topicSummary ? { topicSummary } : {}),
-            };
-          }
-          else delete all[id];
+        return serializeTitleMutation(id, async () => {
+          await state.titles.update(all => {
+            if (title) {
+              const topicSummary = all[id]?.topicSummary;
+              all[id] = {
+                title,
+                source: "manual",
+                ...(parsed.emoji ? { emoji: parsed.emoji } : {}),
+                ...(topicSummary ? { topicSummary } : {}),
+              };
+            }
+            else delete all[id];
+          });
+          const local = (await state.titles.get())[id];
+          const resolvedTitle = resolveSessionTitle(session.agent, local, canonicalCodexTitles.get(id));
+          pubsub.push({
+            type: "session-renamed",
+            kind: "session-renamed",
+            id,
+            title: resolvedTitle.title,
+            titleSource: resolvedTitle.source,
+            emoji: resolvedTitle.emoji ?? null,
+          });
+          return {
+            title: resolvedTitle.title,
+            titleSource: resolvedTitle.source,
+            emoji: resolvedTitle.emoji ?? null,
+          };
         });
-        const local = (await state.titles.get())[id];
-        const resolvedTitle = resolveSessionTitle(session.agent, local, canonicalCodexTitles.get(id));
-        pubsub.push({
-          type: "session-renamed",
-          kind: "session-renamed",
-          id,
-          title: resolvedTitle.title,
-          titleSource: resolvedTitle.source,
-          emoji: resolvedTitle.emoji ?? null,
-        });
-        return {
-          title: resolvedTitle.title,
-          titleSource: resolvedTitle.source,
-          emoji: resolvedTitle.emoji ?? null,
-        };
       }
       case "get-title": {
         const id = String(args.sessionId ?? "");
@@ -1447,13 +1594,15 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
         const id = String(args.sessionId ?? ""); assertSessionId(id);
         const session = await index.resolveLight(id); if (!session) throw new RpcError(404, "Session not found");
         const lines = await readTail(session.path, Number(args.n ?? 200));
-        return session.agent === "claude" ? preserveIndexes(lines, isRenderableClaudeLine) : lines;
+        const filtered = session.agent === "claude" ? preserveIndexes(lines, isRenderableClaudeLine) : lines;
+        return sanitizeTranscriptLines(id, filtered);
       }
       case "read-range": {
         const id = String(args.sessionId ?? ""); assertSessionId(id);
         const session = await index.resolveLight(id); if (!session) throw new RpcError(404, "Session not found");
         const lines = await readRange(session.path, Number(args.from ?? 0), Number(args.to ?? Number.MAX_SAFE_INTEGER));
-        return session.agent === "claude" ? preserveIndexes(lines, isRenderableClaudeLine) : lines;
+        const filtered = session.agent === "claude" ? preserveIndexes(lines, isRenderableClaudeLine) : lines;
+        return sanitizeTranscriptLines(id, filtered);
       }
       case "get-prefs": return state.prefs.get();
       case "put-prefs": await state.prefs.put(normalizePrefs(args.prefs)); return undefined;
@@ -1472,6 +1621,9 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
         if (args.channel === "global") {
           pubsub.addGlobal(socket, typeof args.notifSinceSeq === "number" ? args.notifSinceSeq : undefined);
           for (const [id, status] of state.status) send(socket, { type: "session-status", kind: "session-status", id, ...status });
+          for (const [sessionId, retry] of state.capacityRetries) {
+            send(socket, { type: "capacity-retry", kind: "capacity-retry", sessionId, ...retry });
+          }
           for (const interaction of state.interactions.values()) send(socket, interactionAddedPush(interaction));
           for (const [sessionId, tasks] of state.tasks) send(socket, backgroundTasksPush(sessionId, tasks));
           for (const [id, settings] of Object.entries(await state.settings.get())) send(socket, { type: "session-settings", kind: "session-settings", id, ...settings });
@@ -1517,6 +1669,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   });
   codex.on("status", event => {
     const previousStatus = state.status.get(event.id)?.status;
+    if (event.status !== "running") state.capacityRetries.delete(event.id);
     // `startTurnNow` and the app-server both emit "running". Only the first
     // transition into a turn is a boundary; the duplicate must not settle
     // tasks that already started in the current turn.
@@ -1534,6 +1687,29 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
       }
     }
     status(event);
+  });
+  codex.on("capacity-retry", (event: {
+    sessionId: string;
+    turnId: string;
+    attempt: number;
+    maxAttempts: number;
+    delayMs: number;
+  }) => {
+    const retryAt = new Date(Date.now() + event.delayMs).toISOString();
+    const retry = {
+      turnId: event.turnId,
+      attempt: event.attempt,
+      maxAttempts: event.maxAttempts,
+      delayMs: event.delayMs,
+      retryAt,
+    };
+    state.capacityRetries.set(event.sessionId, retry);
+    pubsub.push({
+      type: "capacity-retry",
+      kind: "capacity-retry",
+      sessionId: event.sessionId,
+      ...retry,
+    });
   });
   codex.on("turn-error", (event: { sessionId: string; turnId: string | null; message: string; details: string | null }) => {
     pubsub.push({ type: "session-error", kind: "session-error", ...event, agent: "codex" });
@@ -1627,7 +1803,11 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
         if (!trigger) return;
         autoTitlePending.delete(sessionId);
         const [prefs, titles] = await Promise.all([state.prefs.get(), state.titles.get()]);
-        if (!prefs.autoTitleEnabled || titles[sessionId]?.source === "manual") continue;
+        if (!prefs.autoTitleEnabled || titles[sessionId]?.source === "manual") {
+          autoTitleTurns.delete(sessionId);
+          autoTitleCycleRequests.delete(sessionId);
+          continue;
+        }
         const cycleRequests = appendIncrementalTitleRequests(
           autoTitleCycleRequests.get(sessionId) ?? [],
           trigger.requests,
@@ -1639,18 +1819,44 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
         if (titles[sessionId] && turns < frequency) continue;
         pubsub.push({ type: "session-retitling", kind: "session-retitling", id: sessionId, inflight: true });
         try {
-          // Normal refreshes feed only requests completed since the previous
-          // rolling summary. If a restart missed their prompt records, the
-          // bounded reverse tail reader supplies recent context instead.
+          // Load one bounded conversation-wide anchor on the first refresh in
+          // this process. Later refreshes reuse it and add the completed cycle,
+          // so the titler always sees the overall task without rescanning a
+          // potentially large transcript every few turns.
           const currentSession = index.get(sessionId);
-          const context = cycleRequests.length
-            ? formatIncrementalTitleContext(cycleRequests)
-            : currentSession
-            ? await recentSessionTitleContext(
-              currentSession.path,
-              currentSession.agent,
-            )
+          let anchor = autoTitleAnchorRequests.get(sessionId);
+          if (currentSession && (!anchor || currentSession.size < anchor.size)) {
+            try {
+              anchor = {
+                requests: await sessionTitleRequests(currentSession.path, currentSession.agent),
+                size: currentSession.size,
+              };
+              autoTitleAnchorRequests.set(sessionId, anchor);
+            } catch (error) {
+              if (anchor && currentSession.size < anchor.size) {
+                anchor = undefined;
+                autoTitleAnchorRequests.delete(sessionId);
+              }
+              app.log.warn({ sessionId, error }, "conversation-wide title context scan failed");
+            }
+          }
+          if (anchor && cycleRequests.length) {
+            anchor = {
+              requests: appendConversationTitleRequests(anchor.requests, cycleRequests),
+              size: currentSession?.size ?? anchor.size,
+            };
+            autoTitleAnchorRequests.set(sessionId, anchor);
+          }
+          const overallContext = anchor?.requests.length
+            ? formatTitleRequestContext(anchor.requests, 3_800)
             : "";
+          const cycleContext = cycleRequests.length
+            ? formatIncrementalTitleContext(cycleRequests, 1_500)
+            : "";
+          const context = [overallContext, cycleContext].filter(Boolean).join("\n\n")
+            || (currentSession
+              ? await recentSessionTitleContext(currentSession.path, currentSession.agent)
+              : "");
           const title = context
             ? await autoTitleFromText(index, state, sessionId, context)
             : await autoTitle(index, state, sessionId);
@@ -1737,6 +1943,17 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
           const record = asRecord(JSON.parse(line)); if (!record) continue; const payload = asRecord(record.payload);
           const promptText = titleRequestText(record, session.agent);
           if (promptText) rememberAutoTitlePrompt(session.id, promptText);
+          if (session.agent === "codex") {
+            const terminal = codexDurableTerminal(record);
+            if (terminal) {
+              codex.reconcileDurableTerminal(
+                session.id,
+                terminal.turnId,
+                terminal.kind,
+                terminal.timestamp,
+              );
+            }
+          }
           if (session.agent === "claude") {
             const priorTasks = state.tasks.get(session.id) ?? [];
             const tasks = mergeClaudeBackgroundTasks(priorTasks, record);
@@ -1757,7 +1974,15 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
             }
           }
           const uuid = asString(record.uuid) ?? asString(payload?.id) ?? `${session.id}:${record.timestamp}`; if (!meaningfulEndTurn || notificationUuids.seen(uuid)) continue;
-          pubsub.notify({ id: session.id, cwd: session.cwd, title: session.title ?? null, body: session.preview ?? "Turn completed", uuid, timestamp: asString(record.timestamp) ?? new Date().toISOString() });
+          pubsub.notify({
+            id: session.id,
+            cwd: session.cwd,
+            title: session.title ?? null,
+            body: session.preview ?? "Turn completed",
+            uuid,
+            timestamp: asString(record.timestamp) ?? new Date().toISOString(),
+            subagent: session.subagent,
+          });
         } catch { /* isolate malformed or incomplete records */ }
       }
       if (completedTurns) {
@@ -1786,6 +2011,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
       size: session.size,
       agent: session.agent,
       preview: session.preview,
+      previewRole: session.previewRole,
       lastTurnAt: session.lastTurnAt,
       parentSessionId: session.parentSessionId,
       subagent: session.subagent,
@@ -1839,6 +2065,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     autoTitlePending.delete(session.id);
     autoTitleTurns.delete(session.id);
     autoTitleCycleRequests.delete(session.id);
+    autoTitleAnchorRequests.delete(session.id);
     recentAutoTitlePrompts.delete(session.id);
     canonicalCodexTitles.delete(session.id);
     foreignClaudeSessions.delete(session.id);

@@ -24,6 +24,7 @@ export type NotificationPush = PushBase<"notification"> & {
   timestamp: string;
   seq: number;
   peer?: boolean;
+  subagent?: boolean;
 };
 
 export type SessionAddedPush = PushBase<"session-added"> & {
@@ -81,6 +82,15 @@ export type SessionErrorPush = PushBase<"session-error"> & {
   details: string | null;
 };
 
+export type CapacityRetryPush = PushBase<"capacity-retry"> & {
+  sessionId: string;
+  turnId: string;
+  attempt: number;
+  maxAttempts: number;
+  delayMs: number;
+  retryAt: string;
+};
+
 export type InteractionAddedPush = PushBase<"interaction-added"> & {
   interaction: Interaction;
 };
@@ -108,6 +118,7 @@ export type GlobalPushEvent =
   | SessionRetitlingPush
   | SessionSettingsPush
   | SessionErrorPush
+  | CapacityRetryPush
   | InteractionAddedPush
   | InteractionRemovedPush
   | BackgroundTasksPush;
@@ -154,6 +165,7 @@ const GLOBAL_PUSH_TYPES: ReadonlySet<string> = new Set([
   "session-retitling",
   "session-settings",
   "session-error",
+  "capacity-retry",
   "interaction-added",
   "interaction-removed",
   "background-tasks",

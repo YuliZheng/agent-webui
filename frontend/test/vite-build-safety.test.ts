@@ -8,4 +8,18 @@ describe("production build safety", () => {
 
     expect(config).toContain("emptyOutDir: false");
   });
+
+  it("keeps frontend type checks from emitting alongside source files", async () => {
+    const config = JSON.parse(
+      await readFile(resolve(process.cwd(), "tsconfig.json"), "utf8"),
+    ) as { compilerOptions?: { noEmit?: unknown } };
+
+    expect(config.compilerOptions?.noEmit).toBe(true);
+  });
+
+  it("collects only TypeScript tests even if stray JavaScript output exists", async () => {
+    const config = await readFile(resolve(process.cwd(), "vitest.config.ts"), "utf8");
+
+    expect(config).toContain('include: ["test/**/*.test.ts"]');
+  });
 });

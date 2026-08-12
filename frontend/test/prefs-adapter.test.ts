@@ -16,12 +16,15 @@ describe("preferences compatibility adapter", () => {
       pinnedGroupIds: ["g-work"],
       pinnedSessionIds: ["s2"],
       thinkingTrigger: "think hard",
+      autoCompactWindow: 180_000,
+      codexAutoCompactWindow: 350_000,
       autoTitleEnabled: true,
       autoTitleFrequency: 7,
       autoTitleLanguage: "简体中文",
       scratchSessionEnabled: false,
       scratchSessionPath: "C:\\scratch",
       defaultClaudeModel: "claude-opus-4-8",
+      defaultClaudeEffort: "max",
       defaultClaudePermissionMode: "bypassPermissions",
       defaultCodexModel: "gpt-5.6-sol",
       defaultCodexServiceTier: "priority",
@@ -42,12 +45,15 @@ describe("preferences compatibility adapter", () => {
         { kind: "session", id: "s2" },
       ],
       thinkingTrigger: "think hard",
+      autoCompactWindow: 180_000,
+      codexAutoCompactWindow: 350_000,
       autoRetitleEnabled: true,
       autoRetitleEvery: 7,
       titleLanguage: "简体中文",
       scratchEnabled: false,
       scratchDir: "C:\\scratch",
       defaultModel: "claude-opus-4-8",
+      defaultClaudeEffort: "max",
       defaultPermissionMode: "bypassPermissions",
       defaultCodexModel: "gpt-5.6-sol",
       defaultCodexServiceTier: "priority",
@@ -72,6 +78,8 @@ describe("preferences compatibility adapter", () => {
       }],
       pinnedGroupIds: [],
       pinnedSessionIds: [],
+      autoCompactWindow: 180_000,
+      codexAutoCompactWindow: 350_000,
       defaultCodexSandboxMode: "read-only",
     });
 
@@ -104,5 +112,7 @@ describe("preferences compatibility adapter", () => {
     expect(outgoing.defaultCodexApprovalPreset).toBe("never");
     expect(outgoing.defaultCodexSandboxMode).toBe("danger-full-access");
     expect(outgoing.showSubagentSessions).toBe(true);
+    expect(outgoing).not.toHaveProperty("autoCompactWindow");
+    expect(outgoing).not.toHaveProperty("codexAutoCompactWindow");
   });
 });

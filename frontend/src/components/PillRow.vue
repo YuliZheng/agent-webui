@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, onMounted, nextTick, watch } from "vue";
-import { MODEL_CHOICES, CODEX_MODEL_CHOICES, CODEX_DEFAULT_MODEL, CODEX_APPROVAL_PRESETS, CODEX_DEFAULT_APPROVAL, PERMISSION_MODES } from "@claude-webui/shared/prefs";
+import type { AgentCapabilities } from "@claude-webui/shared/api";
+import { MODEL_CHOICES, CODEX_MODEL_CHOICES, CODEX_DEFAULT_MODEL, CODEX_APPROVAL_PRESETS, CODEX_DEFAULT_APPROVAL, PERMISSION_MODES, CLAUDE_REASONING_EFFORTS } from "@claude-webui/shared/prefs";
 import { useSessionSettingsStore } from "../stores/session-settings.js";
 import { useSessionsStore } from "../stores/sessions.js";
 import { usePrefsStore } from "../stores/prefs.js";
@@ -10,9 +11,11 @@ import {
   setSessionPermissionMode,
   setSessionEffort,
   setSessionServiceTier,
+  getAgentCapabilities,
   stopSession,
 } from "../api/sessions.js";
 import { APP_BACK_PRIORITY, registerAppBackHandler } from "../util/app-back.js";
+import { resolveCodexEffortChoices } from "../util/codex-efforts.js";
 import { setPwaLayerActive } from "../util/pwa-history.js";
 
 const props = defineProps<{ sessionId: string }>();
@@ -29,16 +32,17 @@ const isCodex = computed(() => sessions.byId[props.sessionId]?.agent === "codex"
 const modelChoices = computed<readonly string[]>(() => isCodex.value ? CODEX_MODEL_CHOICES : MODEL_CHOICES);
 const codexEff = computed(() => settings.effectiveCodex(props.sessionId));
 
-// Effort pill — only for Codex (Claude uses the Extended Thinking trigger instead).
-const CODEX_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
-const effortChoices = computed(() => CODEX_EFFORTS);
+// Effort pill. Codex resolves through the codex capability chain; Claude
+// through the backend push (set-effort) with the webui pref, then the
+// external CLAUDE_CODE_EFFORT_LEVEL (surfaced via claude capabilities), as
+// fallbacks.
 const currentEffort = computed(() => {
   // Resolve effective effort: session override → global pref default → null
   const raw = isDraft.value
-    ? (draft.value?.effort ?? (prefs.defaultCodexEffort || null))
+    ? (draft.value?.effort ?? (isCodex.value ? (prefs.defaultCodexEffort || null) : (prefs.defaultClaudeEffort || null)))
     : isCodex.value
       ? (codexEff.value.effort || null)
-      : null;
+      : (eff.value.effort || prefs.defaultClaudeEffort || codexCapabilities.value?.defaults.effort || null);
   return raw;
 });
 // While a service-tier request is in flight, keep the user's newest choice as
@@ -46,18 +50,44 @@ const currentEffort = computed(() => {
 // changes are coalesced and the backend ultimately receives the last choice.
 const pendingFastTier = ref<"" | "priority" | null>(null);
 const fastBusy = ref(false);
-const fastMode = computed(() => {
-  if (!isCodex.value) return false;
+const codexCapabilities = ref<AgentCapabilities | null>(null);
+const capabilitiesLoading = ref(false);
+const fastTier = computed(() => {
+  if (!isCodex.value) return "unknown";
   if (!isDraft.value && pendingFastTier.value !== null) {
-    return pendingFastTier.value === "priority";
+    return pendingFastTier.value === "priority" ? "priority" : "standard";
   }
-  const tier = isDraft.value
-    ? (draft.value?.serviceTier ?? prefs.defaultCodexServiceTier)
-    : codexEff.value.serviceTier;
-  return tier === "priority";
+  if (!isDraft.value) {
+    // Existing sessions must use session evidence. Falling back to the global
+    // capability default here would mislabel an external Standard session as
+    // Fast whenever its rollout omits service_tier.
+    return codexEff.value.serviceTier;
+  }
+  if (draft.value?.serviceTier !== undefined) {
+    return draft.value.serviceTier === "priority" ? "priority" : "standard";
+  }
+  if (prefs.loaded) {
+    return prefs.defaultCodexServiceTier === "priority" ? "priority" : "standard";
+  }
+  const defaultTier = codexCapabilities.value?.defaults.serviceTier;
+  return defaultTier === "priority" || defaultTier === "fast"
+    ? "priority"
+    : defaultTier === "standard" || defaultTier === "default"
+      ? "standard"
+      : "unknown";
 });
+const fastMode = computed(() => fastTier.value === "priority");
+const fastKnown = computed(() =>
+  fastTier.value === "priority"
+  || fastTier.value === "standard"
+  || (isDraft.value && fastTier.value === ""),
+);
+const fastStateLabel = computed(() => fastKnown.value ? (fastMode.value ? "on" : "off") : "unknown");
 const effortLabel = computed(() => {
-  return currentEffort.value || "(default)";
+  // Claude always shows the effective value (never "(default)") — the
+  // fallback chain ends at the external settings.json default.
+  if (currentEffort.value) return currentEffort.value;
+  return isCodex.value ? "(default)" : "?";
 });
 // stashed on the pending draft (localStorage) and ride along with the
 // first newSession call instead of going through the set-model RPC.
@@ -77,6 +107,19 @@ const currentModel = computed(() => {
     ? codexEff.value.model
     : eff.value.model;
 });
+const currentModelCapability = computed(() =>
+  codexCapabilities.value?.models.find(model => model.value === currentModel.value),
+);
+const effortChoices = computed(() =>
+  isCodex.value
+    ? resolveCodexEffortChoices(currentModelCapability.value?.supportedEfforts)
+    : CLAUDE_REASONING_EFFORTS,
+);
+const fastSupportKnown = computed(() => currentModelCapability.value?.serviceTiers !== undefined);
+const fastSupported = computed(() =>
+  currentModelCapability.value?.serviceTiers?.some(tier => tier.value === "priority") ?? true,
+);
+const fastUnavailable = computed(() => fastSupportKnown.value && !fastSupported.value && !fastMode.value);
 // Strip the dead-weight `claude-` prefix from the visible pill label. The
 // full id still shows in the popover and the tooltip, so nothing is hidden.
 const modelLabel = computed(() => {
@@ -135,6 +178,7 @@ function positionPop(anchor: HTMLElement | null) {
 function toggle(which: "model" | "effort" | "perm") {
   if (open.value === which) { close(); return; }
   open.value = which;
+  if (which === "model" || which === "effort") void loadCapabilities();
   void nextTick(() => positionPop(
     which === "model" ? modelBtn.value :
     which === "effort" ? effortBtn.value :
@@ -157,6 +201,21 @@ function onKey(e: KeyboardEvent) {
   if (e.key === "Escape" && open.value) { e.preventDefault(); close(); }
 }
 function onResize() { if (open.value) close(); }
+async function loadCapabilities() {
+  if (capabilitiesLoading.value || codexCapabilities.value) return;
+  capabilitiesLoading.value = true;
+  try {
+    codexCapabilities.value = await getAgentCapabilities(
+      isCodex.value ? "codex" : "claude",
+      sessions.byId[props.sessionId]?.cwd,
+    );
+  } catch {
+    // Older or temporarily disconnected backends remain usable. Unknown
+    // capability state keeps the control available and lets app-server decide.
+  } finally {
+    capabilitiesLoading.value = false;
+  }
+}
 onMounted(() => {
   unregisterAppBack = registerAppBackHandler(() => {
     if (!open.value) return false;
@@ -212,8 +271,17 @@ async function syncFastTier() {
       const requested = pendingFastTier.value;
       await setSessionServiceTier(props.sessionId, requested);
       if (pendingFastTier.value === requested) {
-        settings.apply({ id: props.sessionId, serviceTier: requested || null });
+        // Empty is the wire command for "turn Fast off", but `null` means
+        // "no authoritative override" in the settings resolver. Persist the
+        // confirmed off state explicitly so an older rollout `priority` record
+        // cannot make the pill spring back on before the next turn lands.
+        const confirmedTier = requested === "priority" ? "priority" : "standard";
+        settings.apply({ id: props.sessionId, serviceTier: confirmedTier });
         pendingFastTier.value = null;
+        notifications.pushInfo(
+          `Fast turned ${requested === "priority" ? "on" : "off"} — applies from the next turn.`,
+          { title: "Fast" },
+        );
       }
     }
   } catch (err) {
@@ -226,9 +294,17 @@ async function syncFastTier() {
 }
 
 function toggleFast() {
+  if (fastUnavailable.value) {
+    notifications.pushError(`Fast is not supported by ${currentModel.value || "the current model"}.`, { title: "Fast unavailable" });
+    return;
+  }
   const next: "" | "priority" = fastMode.value ? "" : "priority";
   if (isDraft.value) {
     sessions.setPendingSettings(props.sessionId, { serviceTier: next });
+    notifications.pushInfo(
+      `Fast will be ${next === "priority" ? "on" : "off"} when this session starts.`,
+      { title: "Fast" },
+    );
     return;
   }
   pendingFastTier.value = next;
@@ -278,17 +354,17 @@ async function interrupt() {
         <span class="chev">▾</span>
       </button>
 
-      <!-- Effort pill — Codex only -->
+      <!-- Effort pill — Codex has Fast tier marks, Claude plain effort -->
       <button
-        v-if="isCodex"
         ref="effortBtn"
         type="button"
         class="pill-btn shrink-0"
         :class="{ 'pill-active': open === 'effort', 'pill-fast-on': fastMode }"
-        :title="`effort = ${currentEffort || '(default)'} · Fast ${fastMode ? 'on' : 'off'} — click to switch`"
+        :title="isCodex ? `effort = ${currentEffort || '(default)'} · Fast ${fastStateLabel} — click to switch` : `effort = ${currentEffort || '(default)'} — click to switch`"
         @click="toggle('effort')"
       >
         <span v-if="fastMode" class="fast-inline-mark" aria-hidden="true">⚡</span>
+        <span v-else-if="!fastKnown" class="fast-inline-mark" aria-hidden="true">?</span>
         <span class="font-mono">{{ effortLabel }}</span>
         <span class="chev">▾</span>
       </button>
@@ -347,7 +423,7 @@ async function interrupt() {
     </div>
     </Teleport>
 
-    <!-- Effort popover — Codex only -->
+    <!-- Effort popover -->
     <Teleport to="body">
     <div
       v-if="open === 'effort'"
@@ -355,15 +431,18 @@ async function interrupt() {
       :style="popStyle"
     >
       <button
+        v-if="isCodex"
         type="button"
         class="pill-pop-item pill-pop-fast"
         :class="{ 'pill-pop-fast-active': fastMode, 'pill-pop-fast-syncing': fastBusy }"
-        :title="fastMode ? 'Disable Fast service tier' : 'Enable Fast service tier'"
-        :aria-pressed="fastMode"
+        :title="fastUnavailable ? `Fast is not supported by ${currentModel || 'the current model'}` : fastMode ? 'Disable Fast service tier for the next turn' : fastKnown ? 'Enable Fast service tier for the next turn' : 'Fast tier unknown — click to enable for the next turn'"
+        :aria-pressed="fastKnown ? fastMode : 'mixed'"
         :aria-busy="fastBusy"
+        :aria-disabled="fastUnavailable"
+        :disabled="fastUnavailable"
         @click="toggleFast"
       >
-        <span class="lbl font-mono">⚡ Fast</span>
+        <span class="lbl font-mono">⚡ Fast{{ fastUnavailable ? " (unavailable)" : fastKnown ? "" : " (?)" }}</span>
         <span class="fast-toggle" aria-hidden="true">
           <span class="fast-toggle-knob"></span>
         </span>

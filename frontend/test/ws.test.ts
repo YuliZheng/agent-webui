@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { afterEach, describe, it, expect, beforeEach, vi } from "vitest";
 
 // Minimal WebSocket mock that lets us drive open / message events explicitly.
 class MockWebSocket {
@@ -47,6 +47,16 @@ beforeEach(() => {
   globalThis.location = { protocol: "http:", host: "127.0.0.1:8787" };
   vi.resetModules();
   MockWebSocket.last = null;
+});
+
+afterEach(async () => {
+  // resetModules() only removes the module from the import cache; it does not
+  // stop the watchdog interval or reconnect timers owned by the old instance.
+  // Disconnect before the next test resets modules so no stale client can wake
+  // up later and replace MockWebSocket.last behind another test's back.
+  const ws = await import("../src/api/ws.js");
+  ws.disconnect();
+  vi.useRealTimers();
 });
 
 describe("ws client", () => {
@@ -279,6 +289,63 @@ describe("ws client", () => {
       data: { sessionId: "created-once" },
     });
     await expect(request).resolves.toEqual({ sessionId: "created-once" });
+  });
+
+  it("replays only explicitly idempotent sent requests after a natural close", async () => {
+    const ws = await import("../src/api/ws.js");
+    ws.connect();
+    const first = MockWebSocket.last!;
+    first.open();
+
+    const safe = ws.request<{ accepted: boolean }>(
+      "prompt",
+      { sessionId: "s1", prompt: "hello", clientUuid: "stable-prompt-1" },
+      { retryOnReconnect: true },
+    );
+    const unsafe = ws.request("set-title", { sessionId: "s1", title: "new title" });
+
+    first.close();
+    await expect(unsafe).rejects.toThrow(/set-title: connection closed; request outcome is unknown/i);
+
+    // Skip the reconnect backoff just as a foreground/online event would.
+    ws.wake();
+    const second = MockWebSocket.last!;
+    second.open();
+    const replayed = second.sent.map((raw) => JSON.parse(raw));
+    const prompt = replayed.find((message) => message.type === "prompt");
+    expect(prompt).toBeDefined();
+    expect(replayed.some((message) => message.type === "set-title")).toBe(false);
+
+    second.receive({ type: "result", reqId: prompt.reqId, ok: true, data: { accepted: true } });
+    await expect(safe).resolves.toEqual({ accepted: true });
+  });
+
+  it("does not send an idempotent retry after its request deadline expires", async () => {
+    vi.useFakeTimers();
+    try {
+      const ws = await import("../src/api/ws.js");
+      ws.connect();
+      const first = MockWebSocket.last!;
+      first.open();
+
+      const request = ws.request(
+        "prompt",
+        { sessionId: "s1", prompt: "hello", clientUuid: "expired-prompt" },
+        { retryOnReconnect: true, timeoutMs: 50 },
+      );
+      const rejection = expect(request).rejects.toThrow(/timed out after 50ms/i);
+      first.close();
+      ws.wake();
+      const second = MockWebSocket.last!;
+
+      await vi.advanceTimersByTimeAsync(50);
+      await rejection;
+      second.open();
+      expect(second.sent.map((raw) => JSON.parse(raw)).some((message) => message.type === "prompt")).toBe(false);
+      ws.disconnect();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("keeps an unsent queued request across a forced connecting-socket replacement", async () => {

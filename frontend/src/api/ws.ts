@@ -216,7 +216,7 @@ function replaceSocket(reason: string) {
   // leaving them to hang until their (sometimes 200 s) timeout. Requests still
   // waiting in sendQueue remain pending and are safely flushed to the
   // replacement socket.
-  settleSentPendingForReplacement(
+  settlePendingForReconnect(
     `connection replaced (${reason}); request outcome is unknown`,
     reason === "reconnect-supersede",
   );
@@ -302,7 +302,14 @@ function rejectAllPending(reason: string) {
   pending.clear();
 }
 
-function settleSentPendingForReplacement(reason: string, allowIdempotentRetry: boolean) {
+/**
+ * Settle requests whose current transport can no longer return a response.
+ * Unsent requests already remain in sendQueue. Sent requests are replayed only
+ * when the caller explicitly supplied a stable backend idempotency key;
+ * everything else has an indeterminate outcome and must fail rather than risk
+ * performing the mutation twice.
+ */
+function settlePendingForReconnect(reason: string, allowIdempotentRetry: boolean) {
   for (const [reqId, p] of pending) {
     if (!p.sent) continue;
     if (allowIdempotentRetry && p.reconnectRetryFrame) {
@@ -386,7 +393,7 @@ function doConnect() {
     connected.value = false; syncDisconnectedAwhile();
     clearTimers();
     ws = null;
-    rejectAllPending("connection closed");
+    settlePendingForReconnect("connection closed; request outcome is unknown", true);
     scheduleReconnect();
   };
 

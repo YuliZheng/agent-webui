@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  latestSidebarPendingPrompt,
   matchedCodexPendingPromptIds,
   normalizePendingUserText,
   pendingPromptProbeRange,
@@ -89,5 +90,47 @@ describe("Codex optimistic prompt reconciliation", () => {
         steered: true,
       }],
     )).toEqual([]);
+  });
+});
+
+describe("sidebar pending prompt reconciliation", () => {
+  const accepted = {
+    id: "pending-1",
+    text: "older optimistic user message",
+    startedAt: 1_000,
+    startedAtLineCount: 10,
+    phase: "accepted" as const,
+  };
+
+  it("lets a durable preview replace an accepted prompt in an idle unopened session", () => {
+    expect(latestSidebarPendingPrompt(
+      [{ ...accepted, startedAtSessionSize: 100 }],
+      { backendPreview: "new assistant reply", now: 20_000, sessionSize: 200 },
+    )).toBeUndefined();
+  });
+
+  it("keeps an accepted prompt until the backend file advances", () => {
+    expect(latestSidebarPendingPrompt(
+      [{ ...accepted, startedAtSessionSize: 100 }],
+      { backendPreview: "old reply", now: 20_000, sessionSize: 100 },
+    )?.id).toBe(accepted.id);
+  });
+
+  it("keeps in-flight prompts but releases accepted prompts after the backend advances", () => {
+    expect(latestSidebarPendingPrompt(
+      [{ ...accepted, phase: "dispatched", startedAtSessionSize: 100 }],
+      { backendPreview: "old reply", now: 20_000, sessionSize: 200 },
+    )?.id).toBe(accepted.id);
+    expect(latestSidebarPendingPrompt(
+      [{ ...accepted, startedAtSessionSize: 100 }],
+      { backendPreview: "streaming reply", now: 20_000, sessionSize: 200 },
+    )).toBeUndefined();
+  });
+
+  it("expires legacy accepted entries after a short idle grace period", () => {
+    expect(latestSidebarPendingPrompt(
+      [accepted],
+      { backendPreview: "new assistant reply", now: 20_000, sessionSize: 200 },
+    )).toBeUndefined();
   });
 });

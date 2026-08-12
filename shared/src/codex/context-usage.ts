@@ -5,6 +5,7 @@ export type CodexContextContributorSource =
   | "skills"
   | "instructions"
   | "base"
+  | "compaction"
   | "images"
   | "shell"
   | "browser"
@@ -36,6 +37,7 @@ const CONTRIBUTOR_LABELS: Record<CodexContextContributorSource, string> = {
   skills: "skills",
   instructions: "system / context",
   base: "Codex base context",
+  compaction: "compaction summary",
   images: "images",
   shell: "shell",
   browser: "browser",
@@ -318,10 +320,12 @@ export class CodexContextUsageAccumulator {
   private latest: CodexContextUsageSummary = { tokens: 0, limit: null, compactionCount: 0 };
   private latestWindow: number | null = null;
   private compactionCount = 0;
+  private detailedCompactionAtMs: number | null = null;
   // Codex includes a stable hidden floor (base prompt + tool schemas) in every
   // authoritative token_count, but does not persist those bytes as rollout
-  // rows. Calibrate that floor from the smallest positive pre-compaction
-  // residual instead of leaving it permanently "unattributed".
+  // rows. Calibrate that floor from the first complete pre-compaction usage
+  // sample. Later byte/token estimation noise must not erode a stable hidden
+  // floor into a misleading near-zero value.
   private baseContextTokens: number | null = null;
 
   constructor(private readonly configuredAutoCompactLimit: number | null = null) {}
@@ -330,8 +334,26 @@ export class CodexContextUsageAccumulator {
     const record = parsedRecord(raw);
     if (!record) return;
     if (this.isCompaction(record)) {
+      const timestamp = typeof record.timestamp === "string"
+        ? Date.parse(record.timestamp)
+        : Number.NaN;
+      const detailed = record.type === "compacted";
+      if (
+        !detailed
+        && this.detailedCompactionAtMs !== null
+        && Number.isFinite(timestamp)
+        && timestamp >= this.detailedCompactionAtMs
+        && timestamp - this.detailedCompactionAtMs <= 5_000
+      ) {
+        this.detailedCompactionAtMs = null;
+        return;
+      }
+      this.detailedCompactionAtMs = detailed && Number.isFinite(timestamp)
+        ? timestamp
+        : null;
       this.compactionCount++;
       this.resetSegment();
+      this.addCompactionContext(record);
       this.latest = {
         tokens: 0,
         limit: compactLimit(this.latestWindow, this.configuredAutoCompactLimit),
@@ -395,21 +417,72 @@ export class CodexContextUsageAccumulator {
     this.tools.clear();
   }
 
+  private addCompactionContext(record: JsonRecord): void {
+    const payload = recordValue(record.payload);
+    if (!payload) return;
+    const replacementHistory = Array.isArray(payload.replacement_history)
+      ? payload.replacement_history
+      : Array.isArray(payload.replacementHistory)
+        ? payload.replacementHistory
+        : [];
+    let hasEncryptedSummary = false;
+    for (const value of replacementHistory) {
+      const item = recordValue(value);
+      if (!item) continue;
+      const replacement = item.type === "response_item"
+        ? recordValue(item.payload)
+        : item;
+      if (!replacement) continue;
+      if (replacement.type === "compaction") {
+        const encoded = typeof replacement.encrypted_content === "string"
+          ? replacement.encrypted_content
+          : typeof replacement.encryptedContent === "string"
+            ? replacement.encryptedContent
+            : "";
+        if (encoded) {
+          hasEncryptedSummary = true;
+          addTokens(this.totals, "compaction", estimatedReasoningTokens(encoded.length));
+        }
+        continue;
+      }
+      this.addPayload(replacement);
+    }
+
+    // Newer Codex versions persist a readable summary beside the replacement
+    // history instead of an encrypted `type: "compaction"` item. Count exactly
+    // one representation when both forms are ever present.
+    const summary = typeof payload.message === "string"
+      ? payload.message
+      : typeof payload.summary === "string"
+        ? payload.summary
+        : "";
+    if (!hasEncryptedSummary && summary) {
+      addTokens(
+        this.totals,
+        "compaction",
+        Math.ceil(new TextEncoder().encode(summary).length / 4) + MESSAGE_ENVELOPE_TOKEN_ESTIMATE,
+      );
+    }
+  }
+
   private addPayload(payload: JsonRecord): void {
     const type = typeof payload.type === "string" ? payload.type : "";
     if (!type) return;
-    if (type === "message") {
+    if (type === "message" || type === "agent_message") {
       addMessage(this.totals, payload);
       return;
     }
 
     let source: CodexContextContributorSource = "other";
     let tokens = Math.ceil(utf8Length(payload) / 4);
-    if (type === "reasoning") {
-      source = "reasoning";
-      if (typeof payload.encrypted_content === "string") {
-        tokens = estimatedReasoningTokens(payload.encrypted_content.length);
-      }
+    if (type === "reasoning" || type === "compaction") {
+      source = type === "compaction" ? "compaction" : "reasoning";
+      const encoded = typeof payload.encrypted_content === "string"
+        ? payload.encrypted_content
+        : typeof payload.encryptedContent === "string"
+          ? payload.encryptedContent
+          : "";
+      if (encoded) tokens = estimatedReasoningTokens(encoded.length);
     } else if (type === "image_generation_call") {
       source = "images";
       tokens = Math.min(tokens, IMAGE_CONTEXT_TOKEN_ESTIMATE);
@@ -431,15 +504,18 @@ export class CodexContextUsageAccumulator {
 
   private captureUsage(record: JsonRecord): void {
     let reported = Number.NaN;
+    let failureTotal = Number.NaN;
     let window = Number.NaN;
     if (record.type === "event_msg") {
       const payload = recordValue(record.payload);
       if (payload?.type !== "token_count") return;
       const info = recordValue(payload.info);
       const usage = recordValue(info?.last_token_usage);
+      const totalUsage = recordValue(info?.total_token_usage);
       reported = Number(usage?.total_tokens ?? (
         Number(usage?.input_tokens ?? 0) + Number(usage?.output_tokens ?? 0)
       ));
+      failureTotal = Number(totalUsage?.total_tokens);
       window = Number(info?.model_context_window ?? 0);
     } else if (record.method === "thread/tokenUsage/updated") {
       const params = recordValue(record.params);
@@ -453,15 +529,25 @@ export class CodexContextUsageAccumulator {
       return;
     }
 
-    const tokens = Number.isFinite(reported) ? Math.max(0, reported) : 0;
+    let tokens = Number.isFinite(reported) ? Math.max(0, reported) : 0;
+    // A request rejected at the hard context boundary is recorded by Codex
+    // with an empty `last_token_usage` and a non-cumulative sentinel in
+    // `total_token_usage.total_tokens`. Preserve the authoritative full-window
+    // value instead of making a failed, full thread appear empty.
+    if (
+      tokens === 0
+      && Number.isFinite(window)
+      && window > 0
+      && failureTotal === window
+    ) {
+      tokens = window;
+    }
     if (Number.isFinite(window) && window > 0) this.latestWindow = window;
     const attributionTotals = new Map(this.totals);
     const visibleTotal = [...attributionTotals.values()].reduce((sum, value) => sum + value, 0);
     const residual = Math.max(0, tokens - visibleTotal);
-    if (this.compactionCount === 0 && residual > 0) {
-      this.baseContextTokens = this.baseContextTokens === null
-        ? residual
-        : Math.min(this.baseContextTokens, residual);
+    if (this.compactionCount === 0 && residual > 0 && this.baseContextTokens === null) {
+      this.baseContextTokens = residual;
     }
     const baseTokens = Math.min(this.baseContextTokens ?? 0, residual);
     if (baseTokens > 0) attributionTotals.set("base", baseTokens);

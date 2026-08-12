@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import type { SessionListItem } from "@claude-webui/shared/api";
-import { isOrdinarySidebarSessionVisible } from "../src/util/session-visibility.js";
+import {
+  isOrdinarySidebarSessionVisible,
+  shouldNotifyForSession,
+} from "../src/util/session-visibility.js";
 
 const basePrefs = {
   hidden: [] as string[],
@@ -45,5 +48,40 @@ describe("ordinary sidebar session visibility", () => {
       hidden: ["hidden"],
     }, "hidden")).toBe(false);
     expect(isOrdinarySidebarSessionVisible(session({ peer: true }), basePrefs)).toBe(false);
+  });
+});
+
+describe("session completion notification visibility", () => {
+  it("suppresses hidden subagent completion bubbles by default", () => {
+    expect(shouldNotifyForSession({
+      id: "worker",
+      subagent: true,
+    }, basePrefs)).toBe(false);
+  });
+
+  it("allows subagent completion bubbles only when workers are shown", () => {
+    expect(shouldNotifyForSession({
+      id: "worker",
+      subagent: true,
+    }, {
+      ...basePrefs,
+      showSubagentSessions: true,
+    })).toBe(true);
+  });
+
+  it("keeps ordinary and forked session completion bubbles", () => {
+    expect(shouldNotifyForSession({ id: "ordinary" }, basePrefs)).toBe(true);
+    expect(shouldNotifyForSession({ id: "fork" }, basePrefs)).toBe(true);
+  });
+
+  it("continues to suppress manually hidden and disabled peer sessions", () => {
+    expect(shouldNotifyForSession({ id: "hidden" }, {
+      ...basePrefs,
+      hidden: ["hidden"],
+    })).toBe(false);
+    expect(shouldNotifyForSession({
+      id: "peer",
+      peer: true,
+    }, basePrefs)).toBe(false);
   });
 });

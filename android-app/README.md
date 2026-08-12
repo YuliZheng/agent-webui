@@ -31,3 +31,25 @@ $gradle = "$env:USERPROFILE\.gradle\wrapper\dists\gradle-7.4-all\aadb4xli5jkdsnu
 `assembleRelease` is signed only when `keystore.properties` exists. Keep the
 keystore and its passwords private and backed up; losing it makes future APK
 updates incompatible with an already installed copy.
+
+## Cross-profile Agent relay
+
+The `relay` module builds one package that chooses its role from the Android
+profile where it runs:
+
+- the managed work profile runs the only foreground service and exposes a
+  loopback-only SOCKS5 listener on `127.0.0.1:38483`;
+- that same service exposes fixed-origin Web bridges for the Windows Agent at
+  `127.0.0.1:38484` and `agent-macbook` at `127.0.0.1:38485`; the Mac launcher
+  reaches the latter through the equivalent `localhost:38485` host alias;
+- the personal owner profile is only a launcher for those two localhost URLs,
+  so it occupies no VPN slot and can coexist with personal-profile FlClash;
+- the MacBook launcher explicitly targets Chrome and combines the distinct
+  `localhost` origin with `/agent-macbook-38485/` because Android WebAPK intent
+  filters omit loopback ports; using `127.0.0.1` for both instances would make
+  Chrome treat the 38485 PWA as the already-installed 38484 app;
+- only the two configured Agent WebUI HTTPS hosts are accepted by the SOCKS,
+  CONNECT, and reverse-proxy paths.
+
+Keep the work-profile Tailnet Relay and work-profile Tailscale running. The
+service restarts after boot and has no public listener.

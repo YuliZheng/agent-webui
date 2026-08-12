@@ -26,6 +26,19 @@ function fakeClaudeChild(onKill?: (child: any) => void) {
 }
 
 describe("Claude ownership and interactions", () => {
+  it("reports malformed stdout without emitting Node's fatal error event", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-webui-claude-malformed-"));
+    const driver = new ClaudeDriver("claude", join(root, "sessions"), new AppState(root)) as any;
+    const warning = vi.fn();
+    driver.on("driver-error", warning);
+
+    expect(() => driver.stdout({ sessionId: "session", buffer: "" }, "not-json\n")).not.toThrow();
+    expect(warning).toHaveBeenCalledWith({
+      sessionId: "session",
+      message: "Malformed Claude stream record",
+    });
+  });
+
   it("terminates and cleans up a new process that never initializes", async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-webui-claude-init-timeout-"));
     const child = fakeClaudeChild(proc => {
@@ -99,8 +112,8 @@ describe("Claude ownership and interactions", () => {
     expect(driver.owned.has("resumed")).toBe(false);
   });
 
-  it("uses the supported Claude stream flags and never passes effort", () => {
-    const args = claudeSpawnArgs("session", "opus", "acceptEdits");
+  it("uses the supported Claude stream flags and passes effort when given", () => {
+    const args = claudeSpawnArgs("session", "opus", "acceptEdits", "max");
     expect(args).toEqual([
       "--print",
       "--input-format", "stream-json",
@@ -110,8 +123,10 @@ describe("Claude ownership and interactions", () => {
       "--resume", "session",
       "--model", "opus",
       "--permission-mode", "acceptEdits",
+      "--effort", "max",
     ]);
-    expect(args).not.toContain("--effort");
+    const noEffort = claudeSpawnArgs("session", "opus", "acceptEdits", undefined);
+    expect(noEffort).not.toContain("--effort");
   });
 
   it("classifies normal numeric signal exits neutrally", () => {
@@ -162,7 +177,7 @@ describe("Claude ownership and interactions", () => {
     const root = await mkdtemp(join(tmpdir(), "agent-webui-buffer-"));
     const driver = new ClaudeDriver("claude", join(root, "sessions"), new AppState(root)) as any;
     const errors: unknown[] = [];
-    driver.on("error", (error: unknown) => errors.push(error));
+    driver.on("driver-error", (error: unknown) => errors.push(error));
     const kill = vi.fn();
     const proc = { sessionId: "session", buffer: "", child: { kill } };
     driver.stdout(proc, "x".repeat(4 * 1024 * 1024 + 1));

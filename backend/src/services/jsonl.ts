@@ -71,10 +71,16 @@ export const LINE_INDEX_READ_CHUNK_BYTES = 1024 * 1024;
 export const LINE_INDEX_COLD_YIELD_MS = 8;
 export const LINE_INDEX_ANCHOR_STRIDE = 256;
 export const LINE_INDEX_TAIL_BOUNDARIES = 513;
-export const MAX_JSONL_RECORD_BYTES = 4 * 1024 * 1024;
+// Codex stores every image in one user-message rollout record as base64. A
+// normal nine-photo compressed send is ~3.2 MiB decoded but ~4.3 MiB in JSON,
+// so the old 4 MiB ceiling replaced an otherwise valid user-image record with
+// an omission placeholder and made its chat bubble disappear. Keep this well
+// below the 64 MiB WebSocket frame ceiling while allowing a typical fully
+// compressed multi-image prompt to render.
+export const MAX_JSONL_RECORD_BYTES = 16 * 1024 * 1024;
 export const MAX_READ_RANGE_LINES = 2_000;
-export const MAX_READ_RESPONSE_BYTES = 8 * 1024 * 1024;
-export const MAX_STREAM_BATCH_BYTES = 2 * 1024 * 1024;
+export const MAX_READ_RESPONSE_BYTES = 24 * 1024 * 1024;
+export const MAX_STREAM_BATCH_BYTES = 16 * 1024 * 1024;
 export const MAX_STREAM_BATCH_LINES = 200;
 const LINE_INDEX_SIGNATURE_BYTES = 64;
 const TAIL_APPEND_CHUNK_BYTES = 1024 * 1024;
@@ -91,7 +97,16 @@ let activeColdIndexBuilds = 0;
 let peakColdIndexBuilds = 0;
 const interactiveColdIndexWaiters: Array<() => void> = [];
 const backgroundColdIndexWaiters: Array<() => void> = [];
-type LineIndexPriority = "background" | "interactive";
+export type LineIndexPriority = "background" | "interactive";
+
+export interface ReadRangeOptions {
+  /** Maximum retained raw payload across the returned suffix. */
+  maxBytes?: number;
+  /** Replace any larger individual record with the standard omission marker. */
+  maxRecordBytes?: number;
+  /** Interactive reads jump ahead of queued speculative cold-index work. */
+  priority?: LineIndexPriority;
+}
 
 export function jsonlIndexIoCounters(): { fullBytes: number; appendedBytes: number } {
   return { fullBytes: fullIndexBytesRead, appendedBytes: appendedIndexBytesRead };
@@ -541,11 +556,14 @@ async function getLineIndex(
   }
 }
 
-function oversizedRecordRaw(bytes: number): string {
+function oversizedRecordRaw(bytes: number, limitBytes = MAX_JSONL_RECORD_BYTES): string {
+  const limitLabel = limitBytes >= 1024 * 1024
+    ? `${limitBytes / (1024 * 1024)} MiB display`
+    : `${Math.ceil(limitBytes / 1024)} KiB quick-sync`;
   return JSON.stringify({
     type: "agent-webui-record-omitted",
     bytes,
-    message: `This JSONL record exceeds the ${MAX_JSONL_RECORD_BYTES / (1024 * 1024)} MiB display limit.`,
+    message: `This JSONL record exceeds the ${limitLabel} limit.`,
   });
 }
 
@@ -574,7 +592,7 @@ async function readDirectTailLines(
       const payloadBytes = Math.max(0, endByte - startByte - 1);
       let raw: string;
       if (payloadBytes > maxRecordBytes) {
-        raw = oversizedRecordRaw(payloadBytes);
+        raw = oversizedRecordRaw(payloadBytes, maxRecordBytes);
       } else {
         const value = Buffer.allocUnsafe(payloadBytes);
         let offset = 0;
@@ -648,7 +666,7 @@ async function readIndexedLines(
 
   function finishLine(): string {
     let raw: string;
-    if (discardedBytes) raw = oversizedRecordRaw(discardedBytes);
+    if (discardedBytes) raw = oversizedRecordRaw(discardedBytes, maxRecordBytes);
     else {
       raw = partBytes ? Buffer.concat(parts, partBytes).toString("utf8") : "";
       if (raw.endsWith("\r")) raw = raw.slice(0, -1);
@@ -746,8 +764,12 @@ async function snapshotFromIndex(path: string, index: LineIndex, options: ScanOp
   };
 }
 
-async function indexedSnapshot(path: string, options: ScanOptions): Promise<FileSnapshot> {
-  return snapshotFromIndex(path, await getLineIndex(path), options);
+async function indexedSnapshot(
+  path: string,
+  options: ScanOptions,
+  priority: LineIndexPriority = "background",
+): Promise<FileSnapshot> {
+  return snapshotFromIndex(path, await getLineIndex(path, priority), options);
 }
 
 async function scanJsonl(path: string, options: ScanOptions = {}): Promise<FileSnapshot> {
@@ -887,11 +909,27 @@ export async function* streamJsonlLines(
   }
 }
 
-export async function readRange(path: string, from: number, to?: number): Promise<IndexedRawLine[]> {
+export async function readRange(
+  path: string,
+  from: number,
+  to?: number,
+  options: ReadRangeOptions = {},
+): Promise<IndexedRawLine[]> {
   const start = Math.max(0, Math.floor(from));
   const requestedEnd = to === undefined ? Number.MAX_SAFE_INTEGER : Math.max(start, Math.floor(to));
   const end = Math.min(requestedEnd, start + MAX_READ_RANGE_LINES);
-  return (await indexedSnapshot(path, { from: start, to: end, maxBytes: MAX_READ_RESPONSE_BYTES })).lines;
+  const maxBytes = options.maxBytes === undefined
+    ? MAX_READ_RESPONSE_BYTES
+    : Math.max(1, Math.floor(options.maxBytes));
+  const maxRecordBytes = options.maxRecordBytes === undefined
+    ? MAX_JSONL_RECORD_BYTES
+    : Math.max(1, Math.floor(options.maxRecordBytes));
+  return (await indexedSnapshot(path, {
+    from: start,
+    to: end,
+    maxBytes,
+    maxRecordBytes,
+  }, options.priority)).lines;
 }
 
 /**
@@ -917,11 +955,29 @@ export async function readRecordAt(
   })).lines[0];
 }
 
-export async function readTail(path: string, n = 200): Promise<IndexedRawLine[]> {
-  return (await indexedSnapshot(path, {
+export interface TailSnapshot {
+  lines: IndexedRawLine[];
+  lineCount: number;
+}
+
+export async function readTailSnapshot(
+  path: string,
+  n = 200,
+  priority: LineIndexPriority = "background",
+): Promise<TailSnapshot> {
+  const snapshot = await indexedSnapshot(path, {
     tailN: Math.max(0, Math.min(MAX_READ_RANGE_LINES, Math.floor(n))),
     maxBytes: MAX_READ_RESPONSE_BYTES,
-  })).lines;
+  }, priority);
+  return { lines: snapshot.lines, lineCount: snapshot.lineCount };
+}
+
+export async function readTail(
+  path: string,
+  n = 200,
+  priority: LineIndexPriority = "background",
+): Promise<IndexedRawLine[]> {
+  return (await readTailSnapshot(path, n, priority)).lines;
 }
 
 export function preserveIndexes(lines: IndexedRawLine[], predicate: (raw: string) => boolean): IndexedRawLine[] {
@@ -1001,10 +1057,14 @@ export class JsonlTailer {
     );
     this.lastMtimeMs = (await stat(this.path)).mtimeMs;
     await this.updateCheckpoints();
-    this.emit({ type: "stream-truncate", keepCount: this.nextIndex });
     const initialFrom = this.options.tailN === undefined
-      ? Math.min(snapshot.lineCount, Math.max(0, Math.floor(this.options.from)))
+      ? 0
       : Math.max(0, snapshot.lineCount - Math.min(MAX_READ_RANGE_LINES, Math.max(0, Math.floor(this.options.tailN))));
+    // A new tailer has no proof that the reconnecting client's cached prefix
+    // still matches disk. Reset before replay; tailN keeps normal UI reconnects
+    // bounded, while a cursor-only subscriber must rebuild from zero.
+    this.options.from = initialFrom;
+    this.emit({ type: "stream-reset" });
     await this.emitInitialRange(index, initialFrom, snapshot.lineCount);
     if (this.stopped) return;
     this.watcher = chokidar.watch(this.path, { ignoreInitial: true, followSymlinks: false });
@@ -1177,7 +1237,6 @@ export class JsonlTailer {
   private async rescan(): Promise<void> {
     const index = await getLineIndex(this.path, "interactive");
     const snapshot = await snapshotFromIndex(this.path, index, { from: 0, to: 0 });
-    const oldCount = this.nextIndex;
     this.positionBytes = snapshot.size;
     this.lastSize = snapshot.size;
     this.lastMtimeMs = (await stat(this.path)).mtimeMs;
@@ -1188,12 +1247,23 @@ export class JsonlTailer {
       snapshot.trailingDiscarded ? snapshot.size - snapshot.completeBytes : 0,
     );
     await this.updateCheckpoints();
-    this.emit(this.nextIndex <= oldCount
-      ? { type: "stream-truncate", keepCount: this.nextIndex }
-      : { type: "stream-reset" });
-    const initialFrom = this.options.tailN === undefined
-      ? Math.min(snapshot.lineCount, Math.max(0, Math.floor(this.options.from)))
-      : Math.max(0, snapshot.lineCount - Math.min(MAX_READ_RANGE_LINES, Math.max(0, Math.floor(this.options.tailN))));
+    // rescan() runs only after previously observed bytes may have changed.
+    // A smaller line count does not prove a pure suffix truncation: the file
+    // may also have rewritten its retained prefix. Since clients deliberately
+    // do not clobber populated cache slots during replay, always reset before
+    // sending the authoritative snapshot.
+    // A rewrite/rewind invalidates an unknown portion of the cached prefix.
+    // Unlike a fresh subscription, replay the complete rewritten file so the
+    // frontend can atomically replace its old branch with authoritative
+    // history. Applying tailN here left only the last 200 physical records
+    // visible after rewind and made the user manually "Load earlier" to repair
+    // a conversation that had already been fully loaded.
+    const initialFrom = 0;
+    // Reset clears every cached slot, so the old resume cursor is no longer a
+    // valid lower bound. Re-anchor both this replay and future live filtering
+    // at the start of the rewritten source.
+    this.options.from = 0;
+    this.emit({ type: "stream-reset" });
     await this.emitInitialRange(index, initialFrom, snapshot.lineCount);
   }
 

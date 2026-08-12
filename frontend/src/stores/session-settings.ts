@@ -25,6 +25,81 @@ interface BackendSettings {
   serviceTier: string | null;
 }
 
+interface DerivedCodexSettings {
+  model: string | null;
+  permissionMode: string | null;
+  effort: string | null;
+  serviceTier: "priority" | "standard" | null;
+}
+
+function record(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object"
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function stringValue(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function serviceTierValue(value: unknown): "priority" | "standard" | null {
+  const tier = stringValue(value);
+  if (tier === "priority" || tier === "fast") return "priority";
+  if (tier === "default" || tier === "standard") return "standard";
+  return null;
+}
+
+function sandboxMode(value: unknown): string | null {
+  if (typeof value === "string") return stringValue(value);
+  const obj = record(value);
+  return stringValue(obj?.type) ?? stringValue(obj?.mode);
+}
+
+function approvalPreset(approval: unknown, sandbox: unknown): string | null {
+  const policy = stringValue(approval);
+  const mode = sandboxMode(sandbox);
+  if (policy === "never" && mode === "danger-full-access") return "full-access";
+  if ((policy === "on-failure" || policy === "untrusted") && mode === "workspace-write") return "auto";
+  if (policy === "on-request" && mode === "read-only") return "read-only";
+  if (policy === "on-request" && mode === "workspace-write") return "ask";
+  if (policy === "full-access" || policy === "auto" || policy === "ask" || policy === "read-only") return policy;
+  return null;
+}
+
+function deriveCodexSettings(lines: string[]): DerivedCodexSettings {
+  const derived: DerivedCodexSettings = {
+    model: null,
+    permissionMode: null,
+    effort: null,
+    serviceTier: null,
+  };
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (derived.model && derived.permissionMode && derived.effort && derived.serviceTier) break;
+    let parsed: Record<string, unknown> | null = null;
+    try { parsed = record(JSON.parse(lines[i]!)); } catch { continue; }
+    if (!parsed) continue;
+    const payload = record(parsed.payload);
+    if (parsed.type === "turn_context" && payload) {
+      derived.model ??= stringValue(payload.model);
+      derived.effort ??= stringValue(payload.effort) ?? stringValue(payload.reasoning_effort);
+      derived.permissionMode ??= approvalPreset(payload.approval_policy, payload.sandbox_policy);
+      continue;
+    }
+    if (parsed.type === "event_msg" && payload?.type === "thread_settings_applied") {
+      const applied = record(payload.thread_settings);
+      if (!applied) continue;
+      derived.model ??= stringValue(applied.model);
+      derived.effort ??= stringValue(applied.reasoning_effort) ?? stringValue(applied.effort);
+      derived.permissionMode ??= approvalPreset(
+        applied.approval_policy,
+        applied.sandbox_policy ?? applied.sandbox_mode,
+      );
+      derived.serviceTier ??= serviceTierValue(applied.service_tier ?? applied.serviceTier);
+    }
+  }
+  return derived;
+}
+
 export const useSessionSettingsStore = defineStore("session-settings", {
   state: () => ({
     bySession: {} as Record<string, BackendSettings>,
@@ -102,11 +177,16 @@ export const useSessionSettingsStore = defineStore("session-settings", {
     effectiveCodex(sessionId: string): { model: string; permissionMode: string; effort: string; serviceTier: string } {
       const backend = this.bySession[sessionId];
       const prefs = usePrefsStore();
+      const cache = useSessionCacheStore();
+      const derived = deriveCodexSettings(cache.bySession[sessionId]?.lines ?? []);
       return {
-        model: backend?.model ?? (prefs.defaultCodexModel || CODEX_DEFAULT_MODEL),
-        permissionMode: backend?.permissionMode ?? (prefs.defaultCodexApproval || CODEX_DEFAULT_APPROVAL),
-        effort: backend?.effort ?? (prefs.defaultCodexEffort || ""),
-        serviceTier: backend?.serviceTier ?? "",
+        model: backend?.model || derived.model || prefs.defaultCodexModel || CODEX_DEFAULT_MODEL,
+        permissionMode: backend?.permissionMode || derived.permissionMode || prefs.defaultCodexApproval || CODEX_DEFAULT_APPROVAL,
+        effort: backend?.effort || derived.effort || prefs.defaultCodexEffort || "",
+        // Codex 0.144.x omits service_tier from turn_context. Do not turn that
+        // absence into a false "Fast off"; only an applied/persisted tier is
+        // authoritative.
+        serviceTier: serviceTierValue(backend?.serviceTier) ?? derived.serviceTier ?? "unknown",
       };
     },
   },

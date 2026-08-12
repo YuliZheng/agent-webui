@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { isForwardedSlashCommand, newSession, sendPrompt, type OutgoingImage } from "../api/sessions.js";
+import { WsError } from "../api/ws.js";
 import { useSessionsStore } from "../stores/sessions.js";
 import { useDraftsStore } from "../stores/drafts.js";
 import { useImageDraftsStore, type PendingImage } from "../stores/image-drafts.js";
@@ -17,8 +18,11 @@ import SlashCommandMenu from "./SlashCommandMenu.vue";
 import { useSessionSettingsStore } from "../stores/session-settings.js";
 import { promotePendingDraft } from "../stores/live.js";
 import { parseLocalCommand, runLocalCommand, latestContextUsage, HIDDEN_CLI_COMMANDS } from "../util/local-commands.js";
+import { idempotencyFingerprint } from "../util/idempotency.js";
 import { APP_BACK_PRIORITY, registerAppBackHandler } from "../util/app-back.js";
 import { setPwaLayerActive } from "../util/pwa-history.js";
+import { promptAttachmentError } from "../util/attachment-limits.js";
+import { preparePromptAttachment } from "../util/image-compression.js";
 
 const props = defineProps<{ sessionId: string; running: boolean }>();
 const emit = defineEmits<{ "mobile-composer-focus": [] }>();
@@ -47,14 +51,6 @@ function applyThinkingTrigger(text: string): string {
   return trig ? `${trimmed} ${trig}` : text;
 }
 
-function idempotencyFingerprint(value: string): string {
-  let hash = 0x811c9dc5;
-  for (let index = 0; index < value.length; index++) {
-    hash ^= value.charCodeAt(index);
-    hash = Math.imul(hash, 0x01000193);
-  }
-  return `${value.length}:${(hash >>> 0).toString(36)}`;
-}
 const notifications = useNotificationsStore();
 const ui = useUiStore();
 const lightbox = useLightboxStore();
@@ -65,49 +61,131 @@ const sessionSkills = useSessionSkillsStore();
 
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 const ACCEPTED_ATTACHMENT_MIME = /^(?:image\/(?:png|jpe?g|gif|webp|bmp)|application\/pdf)$/i;
+const VIDEO_ATTACHMENT_MIME = /^video\//i;
+const VIDEO_ATTACHMENT_EXTENSION = /\.(?:mp4|mov|m4v|webm|avi|mkv|3gp)$/i;
 const PDF_MIME = "application/pdf";
 
 const pendingImages = computed(() => imageDrafts.list(props.sessionId));
 const hasPendingImages = computed(() => pendingImages.value.length > 0);
+const currentAgent = computed(() => sessions.byId[props.sessionId]?.agent ?? "claude");
+const isCodexRunning = computed(() => props.running && currentAgent.value === "codex");
+const promptPlaceholder = computed(() => {
+  if (!props.running) return "Type a message…";
+  return isCodexRunning.value
+    ? "Running… (Send into current turn)"
+    : "Running… (Send to queue)";
+});
+const sendActionTitle = computed(() => {
+  if (!props.running) return "Send";
+  return isCodexRunning.value ? "Send into current turn" : "Send to queue";
+});
+const sendOriginalAttachments = ref(false);
 
-function blobToBase64(blob: Blob): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onerror = () => reject(reader.error ?? new Error("FileReader error"));
-    reader.onload = () => {
-      const result = reader.result as string;
-      const comma = result.indexOf(",");
-      resolve(comma >= 0 ? result.slice(comma + 1) : result);
-    };
-    reader.readAsDataURL(blob);
-  });
+function formatAttachmentBytes(bytes: number): string {
+  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
+
+const attachmentSizeSummary = computed(() => {
+  const attachments = pendingImages.value;
+  if (!attachments.length) return "";
+  const original = attachments.reduce((sum, item) => sum + (item.originalBytes ?? item.bytes), 0);
+  const outgoing = attachments.reduce((sum, item) => sum + item.bytes, 0);
+  const compressed = attachments.some(item => item.compressed);
+  return compressed
+    ? `${formatAttachmentBytes(original)} → ${formatAttachmentBytes(outgoing)}`
+    : formatAttachmentBytes(outgoing);
+});
+
+function attachmentTitle(img: PendingImage): string {
+  const current = formatAttachmentBytes(img.bytes);
+  const original = img.originalBytes ?? img.bytes;
+  const size = img.compressed ? `${formatAttachmentBytes(original)} → ${current}` : current;
+  return `${img.name ?? img.mime} · ${size}`;
+}
+
+const FILE_READ_TIMEOUT_MS = 45_000;
 
 function blobToDataUrl(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
-    reader.onerror = () => reject(reader.error ?? new Error("FileReader error"));
-    reader.onload = () => resolve(reader.result as string);
+    let settled = false;
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      callback();
+    };
+    const timeout = window.setTimeout(() => {
+      if (reader.readyState === FileReader.LOADING) reader.abort();
+      finish(() => reject(new Error("Reading this attachment timed out. Try exporting it as a JPEG or sending a screenshot.")));
+    }, FILE_READ_TIMEOUT_MS);
+    reader.onerror = () => finish(() => reject(reader.error ?? new Error("FileReader error")));
+    reader.onabort = () => finish(() => reject(new Error("Attachment reading was interrupted.")));
+    reader.onload = () => finish(() => resolve(reader.result as string));
     reader.readAsDataURL(blob);
   });
 }
 
+function isVideoAttachment(blob: Blob, name?: string): boolean {
+  return VIDEO_ATTACHMENT_MIME.test(blob.type) || VIDEO_ATTACHMENT_EXTENSION.test(name ?? "");
+}
+
 async function ingestAttachmentBlob(blob: Blob, name?: string) {
+  // Stop before compression, FileReader, or size checks: videos are exposed in
+  // the picker only so an attempted selection receives a useful explanation.
+  if (isVideoAttachment(blob, name)) {
+    notifications.pushError(
+      "暂不支持发送视频，请改发关键截图。",
+      { title: "视频未添加" },
+    );
+    return;
+  }
+  let prepared;
+  try {
+    prepared = await preparePromptAttachment(blob, name, sendOriginalAttachments.value);
+  } catch (err) {
+    notifications.pushError(err instanceof Error ? err.message : String(err), { title: "Photo compression failed" });
+    return;
+  }
+  blob = prepared.blob;
+  name = prepared.name;
   if (!ACCEPTED_ATTACHMENT_MIME.test(blob.type)) {
-    notifications.pushError(`Unsupported file type: ${blob.type || "unknown"}`);
+    const looksLikeHeic = /(?:heic|heif)/i.test(`${blob.type} ${name ?? ""}`);
+    notifications.pushError(
+      looksLikeHeic
+        ? "HEIC/HEIF or Live Photo is not supported. Export it as JPEG or send a screenshot."
+        : `Unsupported file type: ${blob.type || "unknown"}`,
+      { title: "Attachment not added" },
+    );
     return;
   }
   if (blob.size > MAX_ATTACHMENT_BYTES) {
     notifications.pushError(`File too large (max ${MAX_ATTACHMENT_BYTES / 1024 / 1024}MB)`);
     return;
   }
+  const attachmentError = promptAttachmentError(
+    [...pendingImages.value, { bytes: blob.size }],
+    currentAgent.value,
+  );
+  if (attachmentError) {
+    notifications.pushError(attachmentError, { title: "附件未添加" });
+    return;
+  }
   try {
-    const [base64, dataUrl] = await Promise.all([blobToBase64(blob), blobToDataUrl(blob)]);
+    // Read once. The previous implementation ran two FileReaders per photo,
+    // which doubled peak memory and could freeze mobile Safari on multi-select.
+    const dataUrl = await blobToDataUrl(blob);
+    const comma = dataUrl.indexOf(",");
+    if (comma < 0) throw new Error("The selected attachment could not be decoded.");
+    const base64 = dataUrl.slice(comma + 1);
     imageDrafts.add(props.sessionId, {
       mime: blob.type,
       base64,
       dataUrl,
       bytes: blob.size,
+      originalBytes: prepared.originalBytes,
+      compressed: prepared.compressed,
       ...(name ? { name } : {}),
     });
   } catch (err) {
@@ -126,7 +204,9 @@ async function onPaste(e: ClipboardEvent) {
   for (const item of items) {
     if (item.kind === "file") {
       const f = item.getAsFile();
-      if (f && ACCEPTED_ATTACHMENT_MIME.test(f.type)) blobs.push({ blob: f, name: f.name });
+      if (f && (ACCEPTED_ATTACHMENT_MIME.test(f.type) || isVideoAttachment(f, f.name))) {
+        blobs.push({ blob: f, name: f.name });
+      }
     }
   }
   if (blobs.length === 0) return;
@@ -157,6 +237,10 @@ function toggleAttachmentTray() {
   if (attachmentTrayOpen.value) {
     textareaRef.value?.blur();
     stopWechatComposerResize();
+    // The tray takes height away from the message scroller just like the
+    // software keyboard does. Ask the list to keep the latest message visible
+    // while Vue mounts the tray and the mobile viewport finishes reflowing.
+    emit("mobile-composer-focus");
   }
 }
 
@@ -177,12 +261,11 @@ function openFileBrowser() {
 
 async function onFileInput(e: Event) {
   const input = e.target as HTMLInputElement;
-  const files = input.files;
-  if (files) {
-    for (const f of files) await ingestAttachmentBlob(f, f.name);
-  }
-  // Reset so picking the same file twice still fires `change`.
+  const files = Array.from(input.files ?? []);
+  // Release the native picker immediately. A slow or invalid item must not
+  // leave the input wedged or prevent selecting the same files again.
   input.value = "";
+  for (const f of files) await ingestAttachmentBlob(f, f.name);
 }
 
 function removeImage(imgId: string) {
@@ -292,6 +375,9 @@ const showSendButton = computed(() =>
   hasComposerContent.value || (isWechatComposer.value && isDesktopViewport.value),
 );
 const sendLabel = computed(() => (isWechatComposer.value && isDesktopViewport.value ? "发送(S)" : "Send"));
+const attachmentButtonLabel = computed(() => hasPendingImages.value
+  ? `继续添加附件，当前 ${pendingImages.value.length} 个`
+  : "添加附件");
 
 function updateDesktopViewport(e?: MediaQueryList | MediaQueryListEvent) {
   isDesktopViewport.value = !!e?.matches;
@@ -359,13 +445,46 @@ function friendlySendError(err: unknown): string {
   if (err && typeof err === "object" && (err as { name?: string }).name === "AbortError") {
     return "Send timed out — refresh the page if SSO needs re-auth, then try again. Your text is kept.";
   }
+  if (err instanceof WsError && err.code === 0) {
+    if (/timed out/i.test(err.message)) {
+      return "Send confirmation timed out. The message may already have arrived; check the conversation before retrying. Your text is kept.";
+    }
+    return "The connection changed before send confirmation arrived. Your text is kept; check the conversation before retrying.";
+  }
   return err instanceof Error ? err.message : String(err);
 }
 
+function sendErrorTitle(err: unknown): string {
+  return err instanceof WsError && err.code === 0 ? "Send not confirmed" : "Send failed";
+}
+
 async function send() {
-  if (!canSend.value) return;
-  attachmentTrayOpen.value = false;
   const sid = props.sessionId;
+  // This lock is taken synchronously, before nextTick or provider metadata
+  // lookup. Button disabling alone cannot prevent a second Enter/click in the
+  // same render turn.
+  if (!canSend.value || drafts.isInflight(sid)) return;
+  drafts.beginInflight(sid);
+  try {
+    await sendOnce(sid);
+  } catch (err) {
+    notifications.pushError(friendlySendError(err), { title: sendErrorTitle(err) });
+  } finally {
+    drafts.endInflight(sessions.resolvePromoted(sid));
+    // Re-enabling the textarea after the in-flight window does NOT restore
+    // focus on its own — disabling a focused element blurs it, so the caret
+    // is lost and the user can't fire off a second message without clicking
+    // back in. Restore focus on desktop. Skip touch (would pop the on-screen
+    // keyboard), and bail if the user switched sessions mid-send.
+    if (isDesktopLike && sid === props.sessionId) {
+      await nextTick();
+      textareaRef.value?.focus();
+    }
+  }
+}
+
+async function sendOnce(sid: string) {
+  attachmentTrayOpen.value = false;
   // Webui-local control commands (/model, /context) branch off here: handled
   // in the browser, never sent to the agent. Only on a real session —
   // pending drafts have no id to control.
@@ -398,6 +517,9 @@ async function send() {
       return;
     }
   }
+  const agent = sessions.byId[sid]?.agent ?? "claude";
+  const attachmentError = promptAttachmentError(pendingImages.value, agent);
+  if (attachmentError) throw new Error(attachmentError);
   const snapText = text.value;
   const snapImages = imagePayload();
   const snapImageIds = pendingImages.value.map((image) => image.id);
@@ -411,16 +533,21 @@ async function send() {
   const showOptimistic = snapText.trim().length > 0 || snapImages.length > 0;
   let pendId: string | null = null;
   if (showOptimistic) {
+    // Sending from a conversation means everything currently on screen has
+    // been read. Advance that baseline synchronously so an adjacent watcher
+    // event cannot turn our own outbound prompt into a one-frame unread badge.
+    // Draft ids are not backend session ids; promotion marks the real row read.
+    if (!sessions.isPending(sid)) sessions.markRead(sid);
     const sessionState = sessionCache.bySession[sid];
     // `nextLineIndex` is the physical source high-water mark. `lines` is a
     // sparse render cache and can lag it when the backend filters non-rendered
     // records, so lines.length is not a safe send boundary.
     const startLineIndex = sessionState?.nextLineIndex ?? sessionState?.lines.length ?? 0;
-    const agent = sessions.byId[sid]?.agent ?? "claude";
     pendId = promptPending.add(sid, {
       text: snapText,
       imageCount: pendingImages.value.length,
       startedAtLineCount: startLineIndex,
+      startedAtSessionSize: sessions.byId[sid]?.size ?? 0,
       agent,
       // codex mid-turn = backend routes through turn/steer (injected into the
       // live turn immediately, not queued). Label the bubble honestly.
@@ -433,7 +560,6 @@ async function send() {
   }
   const slashCommands = await providerSlashCommandsFor(snapText, sid);
   const providerSlash = isForwardedSlashCommand(snapText, slashCommands);
-  drafts.beginInflight(sid);
   let dispatched = false;
   let clearedTextOnDispatch = false;
   let removedImagesOnDispatch: PendingImage[] = [];
@@ -510,18 +636,7 @@ async function send() {
     }
     // Drop the optimistic bubble so it doesn't linger pretending success.
     if (pendId) promptPending.remove(settledSid, pendId);
-    notifications.pushError(friendlySendError(err), { title: "Send failed" });
-  } finally {
-    drafts.endInflight(sessions.resolvePromoted(sid));
-    // Re-enabling the textarea after the in-flight window does NOT restore
-    // focus on its own — disabling a focused element blurs it, so the caret
-    // is lost and the user can't fire off a second message without clicking
-    // back in. Restore focus on desktop. Skip touch (would pop the on-screen
-    // keyboard), and bail if the user switched sessions mid-send.
-    if (isDesktopLike && sid === props.sessionId) {
-      await nextTick();
-      textareaRef.value?.focus();
-    }
+    notifications.pushError(friendlySendError(err), { title: sendErrorTitle(err) });
   }
 }
 
@@ -666,7 +781,7 @@ onBeforeUnmount(() => {
     <input
       ref="fileInputRef"
       type="file"
-      accept="image/*,application/pdf"
+      accept="image/*,application/pdf,video/*"
       multiple
       class="hidden"
       @change="onFileInput"
@@ -674,7 +789,7 @@ onBeforeUnmount(() => {
     <input
       ref="galleryInputRef"
       type="file"
-      accept="image/*"
+      accept="image/*,video/*"
       multiple
       class="hidden"
       @change="onFileInput"
@@ -687,13 +802,12 @@ onBeforeUnmount(() => {
       class="hidden"
       @change="onFileInput"
     />
-    <!-- HyperOS 3 intercepts image-MIME document intents with its limited
-         privacy picker. Keep this action generic so Android can offer SAF;
-         ingestAttachmentBlob still rejects everything except images/PDFs. -->
+    <!-- Keep files separate from camera capture. Videos remain selectable only
+         so onFileInput can explain that they are not supported. -->
     <input
       ref="browseInputRef"
       type="file"
-      accept="*/*"
+      accept="application/pdf,video/*"
       multiple
       class="hidden"
       @change="onFileInput"
@@ -709,7 +823,7 @@ onBeforeUnmount(() => {
           v-for="img in pendingImages"
           :key="img.id"
           class="relative group border border-[var(--cw-border)]  rounded overflow-hidden"
-          :title="`${img.name ?? img.mime} · ${(img.bytes / 1024).toFixed(0)} KB`"
+          :title="attachmentTitle(img)"
         >
           <button
             v-if="!isPdfDraft(img.mime)"
@@ -730,6 +844,15 @@ onBeforeUnmount(() => {
             title="Remove"
           >×</button>
         </div>
+        <span class="cw-attachment-size-summary self-center text-xs opacity-60 whitespace-nowrap">{{ attachmentSizeSummary }}</span>
+        <button
+          type="button"
+          class="cw-original-mode-toggle self-center text-xs px-2 py-1 rounded border border-[var(--cw-border)]"
+          :class="{ 'bg-[var(--cw-accent)] text-[var(--cw-accent-text)]': sendOriginalAttachments }"
+          :aria-pressed="sendOriginalAttachments"
+          title="Affects photos selected after changing this option"
+          @click="sendOriginalAttachments = !sendOriginalAttachments"
+        >原图</button>
       </div>
       <SlashCommandMenu
         v-if="slash.open.value"
@@ -751,7 +874,7 @@ onBeforeUnmount(() => {
           inputmode="text"
           :disabled="isInflightHere"
           class="cw-cc-textarea"
-          :placeholder="running ? 'Running… (Send to queue)' : 'Type a message…'"
+          :placeholder="promptPlaceholder"
           @paste="(e) => { slash.notePaste(); onPaste(e); }"
           @keydown="onTextareaKey"
           @keyup="syncSlash"
@@ -778,10 +901,10 @@ onBeforeUnmount(() => {
           <button
             type="button"
             class="cw-cc-send"
-            :disabled="!canSend"
+            :disabled="!canSend || isInflightHere"
             @click="() => void send()"
-            :title="running ? 'Send to queue' : 'Send'"
-            aria-label="Send"
+            :title="sendActionTitle"
+            :aria-label="sendActionTitle"
           >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" class="w-[18px] h-[18px]">
               <line x1="12" y1="19" x2="12" y2="5" />
@@ -803,7 +926,7 @@ onBeforeUnmount(() => {
         v-for="img in pendingImages"
         :key="img.id"
         class="relative group border border-[var(--cw-border)]  rounded overflow-hidden"
-        :title="`${img.name ?? img.mime} · ${(img.bytes / 1024).toFixed(0)} KB`"
+        :title="attachmentTitle(img)"
       >
         <button
           v-if="!isPdfDraft(img.mime)"
@@ -824,6 +947,7 @@ onBeforeUnmount(() => {
           title="Remove"
         >×</button>
       </div>
+      <span class="cw-attachment-size-summary self-center text-xs opacity-60 whitespace-nowrap">{{ attachmentSizeSummary }}</span>
     </div>
     <SlashCommandMenu
       v-if="slash.open.value"
@@ -833,7 +957,27 @@ onBeforeUnmount(() => {
       @hover="(i) => slash.setActive(i)"
     />
     <div class="cw-composer-row flex items-end gap-2">
-      <!-- Middle: textarea pinned to the h-9 baseline (36 px). Single-line by
+      <!-- Attachment access keeps a permanent thumb-reachable slot. It never
+           competes with Send, so text, a captured photo, or existing drafts do
+           not prevent the user from adding another item. -->
+      <button
+        type="button"
+        class="cw-attach-button shrink-0 w-9 h-9 rounded-full border border-[var(--cw-border)]  bg-transparent opacity-80 hover:opacity-100 hover:bg-[var(--cw-panel-2)]  active:opacity-75  transition disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center text-[var(--cw-text)] "
+        :class="{ 'cw-attach-button-open': attachmentTrayOpen }"
+        :disabled="isInflightHere"
+        :aria-expanded="attachmentTrayOpen"
+        aria-controls="cw-attachment-tray"
+        @click="(e) => { toggleAttachmentTray(); (e.currentTarget as HTMLElement).blur(); }"
+        :title="attachmentButtonLabel"
+        :aria-label="attachmentButtonLabel"
+      >
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-5 h-5">
+          <line x1="12" y1="5" x2="12" y2="19" />
+          <line x1="5" y1="12" x2="19" y2="12" />
+        </svg>
+      </button>
+
+      <!-- Middle: textarea pinned to the control baseline. Single-line by
            default; grows from there as you type, capped at max-h-48 (~8 lines). -->
       <textarea
         ref="textareaRef"
@@ -846,8 +990,8 @@ onBeforeUnmount(() => {
         spellcheck="true"
         inputmode="text"
         :disabled="isInflightHere"
-        class="cw-composer-textarea flex-1 resize-none overflow-y-auto rounded-lg bg-[var(--cw-panel-2)]  border-0 px-3 py-2 text-sm leading-5 max-h-48 focus:outline-none focus:ring-2 focus:ring-[var(--cw-focus-ring)]"
-        :placeholder="running ? 'Running… (Send to queue)' : 'Type a message…'"
+        class="cw-composer-textarea min-w-0 flex-1 resize-none overflow-y-auto rounded-lg bg-[var(--cw-panel-2)]  border-0 px-3 py-2 text-sm leading-5 max-h-48 focus:outline-none focus:ring-2 focus:ring-[var(--cw-focus-ring)]"
+        :placeholder="promptPlaceholder"
         @paste="(e) => { slash.notePaste(); onPaste(e); }"
         @keydown="onTextareaKey"
         @keyup="syncSlash"
@@ -856,33 +1000,15 @@ onBeforeUnmount(() => {
         @input="syncSlash"
       />
 
-      <!-- Right slot, SAME on desktop and mobile (WeChat-style): + attach
-           by default, Send (filled blue) appears when there's text /
-           image content to send. -->
+      <!-- Send owns its own right-side slot and appears only with sendable
+           content; the attachment control remains available beside it. -->
       <button
         v-if="showSendButton"
         type="button"
         @click="() => void send()"
-        :disabled="!canSend"
+        :disabled="!canSend || isInflightHere"
         class="cw-send-button shrink-0 h-9 px-4 rounded-lg bg-[var(--cw-accent)] text-[var(--cw-accent-text)] text-sm font-semibold hover:opacity-100 active:scale-95 transition disabled:opacity-50 disabled:cursor-not-allowed"
       >{{ sendLabel }}</button>
-      <button
-        v-else
-        type="button"
-        class="cw-attach-button shrink-0 w-9 h-9 rounded-full border border-[var(--cw-border)]  bg-transparent opacity-80 hover:opacity-100 hover:bg-[var(--cw-panel-2)]  active:opacity-75  transition disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center text-[var(--cw-text)] "
-        :class="{ 'cw-attach-button-open': attachmentTrayOpen }"
-        :disabled="isInflightHere"
-        :aria-expanded="attachmentTrayOpen"
-        aria-controls="cw-attachment-tray"
-        @click="(e) => { toggleAttachmentTray(); (e.currentTarget as HTMLElement).blur(); }"
-        title="Attach file"
-        aria-label="Attach file"
-      >
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-5 h-5">
-          <line x1="12" y1="5" x2="12" y2="19" />
-          <line x1="5" y1="12" x2="19" y2="12" />
-        </svg>
-      </button>
     </div>
     <div
       v-if="!isDesktopViewport && attachmentTrayOpen"
@@ -890,16 +1016,22 @@ onBeforeUnmount(() => {
       class="cw-attachment-tray"
       aria-label="附件"
     >
-      <button type="button" class="cw-attachment-action" @click="openGalleryPicker">
-        <span class="cw-attachment-action-icon" aria-hidden="true">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-            <rect x="3.5" y="4" width="17" height="16" rx="2" />
-            <circle cx="9" cy="9" r="1.5" />
-            <path d="m5.5 17 4.2-4.2 3.1 3 2.2-2.2 3.5 3.4" />
-          </svg>
-        </span>
-        <span>相册</span>
-      </button>
+      <div class="cw-attachment-action-group" role="group" aria-label="相册选项">
+        <button type="button" class="cw-attachment-action" @click="openGalleryPicker">
+          <span class="cw-attachment-action-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3.5" y="4" width="17" height="16" rx="2" />
+              <circle cx="9" cy="9" r="1.5" />
+              <path d="m5.5 17 4.2-4.2 3.1 3 2.2-2.2 3.5 3.4" />
+            </svg>
+          </span>
+          <span>相册</span>
+        </button>
+        <label class="cw-gallery-original-option" title="不压缩之后从相册选择的照片">
+          <input v-model="sendOriginalAttachments" type="checkbox" />
+          <span>原图</span>
+        </label>
+      </div>
       <button type="button" class="cw-attachment-action" @click="openCameraPicker">
         <span class="cw-attachment-action-icon" aria-hidden="true">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">

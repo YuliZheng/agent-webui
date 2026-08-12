@@ -15,10 +15,20 @@ import { usePendingInteractionsStore } from "../stores/pending-interactions.js";
 import { basenameFromPath, codexImageUrl, localFileFromHref } from "../util/local-file-links.js";
 import { copyText } from "../util/clipboard.js";
 import { extractAttachedImages } from "../util/extract-images.js";
+import { standaloneExternalNavigationHref } from "../util/pwa-history.js";
+import { currentTurnProgress } from "../util/turn-progress.js";
+import { localDirectoryBehavior } from "../util/local-file-device.js";
+import {
+  captureViewportAnchor,
+  resolveBottomLock,
+  restoreViewportAnchor,
+  type ViewportAnchorSnapshot,
+} from "../util/scroll-anchor.js";
 import {
   matchedCodexPendingPromptIds,
   pendingPromptProbeRange,
 } from "../util/pending-prompt-reconciliation.js";
+import { interleavePendingPrompts } from "../util/pending-prompt-order.js";
 import { useNotificationsStore } from "../stores/notifications.js";
 import { groupTimeline, type TimelineNode, type ToolPair } from "../parser/group.js";
 import { toolSummary } from "../parser/tool-summaries.js";
@@ -26,7 +36,7 @@ import { codexRolloutToClaudeLines } from "../parser/codex-adapt.js";
 import { isTaskNotificationContent, parseTaskNotification, type TaskNotificationInfo } from "../parser/task-notification.js";
 import { isQueueOperation } from "@claude-webui/shared/discriminate";
 import { readSessionRange, sendPrompt, stopSession } from "../api/sessions.js";
-import { wake as wsWake } from "../api/ws.js";
+import { inspectLocalPath, revealLocalPath } from "../api/local-files.js";
 
 import UserPromptBlock from "./blocks/UserPromptBlock.vue";
 import UserToolResultBlock from "./blocks/UserToolResultBlock.vue";
@@ -48,7 +58,9 @@ interface Usage { input_tokens?: number; output_tokens?: number; cache_read_inpu
 type DecoratedEntry = { node: TimelineNode; usage: Usage | null };
 type RenderRow =
   | { kind: "entry"; entry: DecoratedEntry }
+  | { kind: "pending"; prompt: PendingPrompt }
   | { kind: "toolRun"; key: string; items: ToolRunItem[] };
+type ToolRunRow = Extract<RenderRow, { kind: "toolRun" }>;
 
 const props = defineProps<{ sessionId: string }>();
 const cache = useSessionCacheStore();
@@ -63,13 +75,105 @@ const lightbox = useLightboxStore();
 const ui = useUiStore();
 const live = useLiveStore();
 const pendingInteractions = usePendingInteractionsStore();
-// True while the on-tap HTTP tail fetch for this session is in flight — drives
-// a small "syncing latest…" pill so the ~1s mobile/proxy round-trip reads
-// as "loading" rather than a frozen/stale screen.
-const syncingLatest = computed(() => !!live.tailFetching[props.sessionId]);
+// Keep fast background checks invisible. Only surface a sync after it has
+// taken long enough to be useful feedback; a failure remains as an explicit
+// retry instead of an endless "syncing" spinner.
+const syncingLatest = ref(false);
+const latestSyncError = computed(() => live.tailErrors[props.sessionId] ?? "");
+let syncingLatestTimer: ReturnType<typeof setTimeout> | null = null;
+watch([
+  () => props.sessionId,
+  () => !!live.tailFetching[props.sessionId],
+], ([, fetching]) => {
+  if (syncingLatestTimer) {
+    clearTimeout(syncingLatestTimer);
+    syncingLatestTimer = null;
+  }
+  syncingLatest.value = false;
+  if (fetching) {
+    syncingLatestTimer = setTimeout(() => {
+      syncingLatestTimer = null;
+      if (live.tailFetching[props.sessionId]) syncingLatest.value = true;
+    }, 450);
+  }
+}, { immediate: true });
+
+async function retryLatestSync() {
+  if (live.tailFetching[props.sessionId]) return;
+  try {
+    await live.refreshSession(props.sessionId, true);
+  } catch {
+    // refreshSession owns the persistent, retryable error state.
+  }
+}
 const scroller = ref<HTMLDivElement | null>(null);
-const pendingPromptEl = ref<HTMLDivElement | null>(null);
+const historyEl = ref<HTMLDivElement | null>(null);
 const lockedToBottom = ref(true);
+let bottomPinGeneration = 0;
+let bottomPinActive = false;
+let userScrollIntentUntil = 0;
+let historyResizeObserver: ResizeObserver | null = null;
+let rememberedViewportAnchor: ViewportAnchorSnapshot | null = null;
+let lightboxViewportAnchor: ViewportAnchorSnapshot | null = null;
+
+function snapshotViewportAnchor(): ViewportAnchorSnapshot | null {
+  const el = scroller.value;
+  const history = historyEl.value;
+  return el && history ? captureViewportAnchor(el, history) : null;
+}
+
+function rememberViewportAnchor(): ViewportAnchorSnapshot | null {
+  const snapshot = snapshotViewportAnchor();
+  if (snapshot) rememberedViewportAnchor = snapshot;
+  return snapshot;
+}
+
+function restoreRememberedViewportAnchor(snapshot = rememberedViewportAnchor): boolean {
+  const el = scroller.value;
+  const history = historyEl.value;
+  if (!el || !history || !snapshot) return false;
+  restoreViewportAnchor(el, history, snapshot);
+  rememberedViewportAnchor = captureViewportAnchor(el, history);
+  return true;
+}
+
+function onHistoryResize() {
+  const el = scroller.value;
+  if (!el) return;
+  if (lockedToBottom.value || bottomPinActive) {
+    // A lazy thumbnail or async code highlight can finish long after the
+    // mount-time pin loop stopped. Keep an actually-bottomed conversation at
+    // the bottom when that late layout work changes transcript height.
+    el.scrollTop = el.scrollHeight;
+    rememberViewportAnchor();
+    return;
+  }
+  // Away from the bottom, preserve the visible message rather than a numeric
+  // scrollTop. This covers delayed image decode, Shiki and window prepends.
+  restoreRememberedViewportAnchor();
+}
+
+watch(historyEl, (next) => {
+  historyResizeObserver?.disconnect();
+  historyResizeObserver = null;
+  if (next && typeof ResizeObserver === "function") {
+    historyResizeObserver = new ResizeObserver(onHistoryResize);
+    historyResizeObserver.observe(next);
+  }
+  rememberViewportAnchor();
+});
+
+watch(() => lightbox.url, async (url, previous) => {
+  if (url && !previous) {
+    lightboxViewportAnchor = rememberViewportAnchor();
+    return;
+  }
+  if (url || !previous || !lightboxViewportAnchor) return;
+  const snapshot = lightboxViewportAnchor;
+  lightboxViewportAnchor = null;
+  await nextTick();
+  requestAnimationFrame(() => restoreRememberedViewportAnchor(snapshot));
+});
 
 const running = computed(() => sessions.statusBySession[props.sessionId] === "running");
 // CLI is mid-/compact. The jsonl is silent for the whole compact window
@@ -82,7 +186,12 @@ const lines = computed(() => cache.bySession[props.sessionId]?.lines ?? []);
 // so the existing timeline/blocks render them. claude sessions pass through.
 const isCodex = computed(() => sessions.byId[props.sessionId]?.agent === "codex");
 const agent = computed(() => sessions.byId[props.sessionId]?.agent ?? "claude");
-const renderLines = computed(() => isCodex.value ? codexRolloutToClaudeLines(lines.value) : lines.value);
+const capacityRetry = computed(() => sessions.capacityRetryBySession[props.sessionId] ?? null);
+const renderLines = computed(() => isCodex.value
+  ? codexRolloutToClaudeLines(lines.value, {
+      suppressLatestEmptyCompletion: capacityRetry.value !== null,
+    })
+  : lines.value);
 const timeline = computed<TimelineNode[]>(() => groupTimeline(renderLines.value));
 const pendingPrompts = computed(() => promptPending.pending(props.sessionId));
 const pendingProbeAttempted = new Set<string>();
@@ -254,19 +363,60 @@ watch(stickyOverlayEl, (n) => {
   if (n) stickyOverlayRO.observe(n);
 });
 
-function onContentClick(e: MouseEvent) {
-  const target = e.target as Element | null;
-  const anchor = target?.closest?.("a[href]") as HTMLAnchorElement | null;
-  if (!anchor || !scroller.value?.contains(anchor)) return;
-  const local = localFileFromHref(anchor.getAttribute("href") ?? anchor.href, window.location.href);
-  if (!local) return;
-  e.preventDefault();
-  e.stopPropagation();
+async function openLocalLink(local: NonNullable<ReturnType<typeof localFileFromHref>>) {
   if (local.isImage) {
     lightbox.open(codexImageUrl(local.path), basenameFromPath(local.path));
     return;
   }
+  try {
+    const info = await inspectLocalPath(local.path);
+    if (info.kind === "directory" && localDirectoryBehavior() === "open-on-host") {
+      try {
+        await revealLocalPath(info.path);
+        notificationsStore.pushInfo("Opened on the host computer", { title: info.name });
+        return;
+      } catch (error) {
+        notificationsStore.pushError(
+          error instanceof Error ? error.message : String(error),
+          { title: "Could not open on the host; browsing here instead" },
+        );
+      }
+    }
+  } catch { /* the viewer renders the authoritative path error */ }
   localFileViewer.show(props.sessionId, local.path, local.line);
+}
+
+function onContentClick(e: MouseEvent) {
+  const target = e.target as Element | null;
+  const anchor = target?.closest?.("a[href]") as HTMLAnchorElement | null;
+  if (!anchor || !scroller.value?.contains(anchor)) return;
+  const href = anchor.getAttribute("href") ?? anchor.href;
+  const local = localFileFromHref(href, window.location.href);
+  if (local) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (local.openInSystem) {
+      void revealLocalPath(local.path)
+        .then(() => notificationsStore.pushInfo("Opened in the system file manager"))
+        .catch(err => notificationsStore.pushError(
+          err instanceof Error ? err.message : String(err),
+          { title: "Could not open local path" },
+        ));
+      return;
+    }
+    void openLocalLink(local);
+    return;
+  }
+
+  // Android/Chrome standalone PWAs do not reliably surface target=_blank
+  // navigations. Use an in-context navigation for out-of-scope web URLs; the
+  // browser then hands the external page off while preserving the installed
+  // app. Ordinary browser tabs keep the Markdown renderer's new-tab behavior.
+  const external = standaloneExternalNavigationHref(href, window.location.href);
+  if (!external) return;
+  e.preventDefault();
+  e.stopPropagation();
+  window.location.assign(external);
 }
 
 // ─── Stall detection ───
@@ -323,6 +473,7 @@ const pullDistance = ref(0);
 const PULL_THRESHOLD = 60;
 const PULL_MAX = 90;
 const PULL_REFRESH_HOLD = 50;
+const PULL_START_SLOP = 8;
 let pullStartY = 0;
 let pullActive = false;
 
@@ -350,14 +501,14 @@ function onPullTouchMove(e: TouchEvent) {
   }
   const y = e.touches[0]?.clientY ?? pullStartY;
   const dy = y - pullStartY;
-  if (dy <= 0) {
+  if (dy <= PULL_START_SLOP) {
     pullDistance.value = 0;
     pullState.value = "idle";
     return;
   }
   // Resistance curve: half the actual delta, capped at PULL_MAX. Feels
   // like rubber-band tension instead of 1:1 finger-following.
-  pullDistance.value = Math.min(dy * 0.5, PULL_MAX);
+  pullDistance.value = Math.min((dy - PULL_START_SLOP) * 0.5, PULL_MAX);
   pullState.value = "pulling";
   e.preventDefault();
 }
@@ -378,16 +529,20 @@ async function runPullRefresh() {
   pullState.value = "refreshing";
   pullDistance.value = PULL_REFRESH_HOLD;
   try {
-    wsWake({ forceReconnect: true });
-    await Promise.all([
-      sessions.fetchAll().catch(() => undefined),
-      // Force-reconnect replays the existing session subscription on open.
-      // Avoid resetAndReengage here: doing unsubscribe/subscribe while the new
-      // socket is CONNECTING can race the WS layer's own onopen re-subscribe.
-      // Floor: keep the spinner visible long enough to feel intentional
-      // even when the refresh itself completes in under 100 ms.
-      new Promise((r) => setTimeout(r, 350)),
+    const [, sessionsOk] = await Promise.all([
+      // HTTP is independent of a stale/zombie mobile WebSocket, so completion
+      // here means this conversation really did check the backend tail.
+      live.refreshSession(props.sessionId, true),
+      sessions.fetchAll(),
+      new Promise((resolve) => setTimeout(resolve, 280)),
     ]);
+    if (!sessionsOk) throw new Error("会话列表刷新失败");
+    notificationsStore.pushInfo("已更新到最新消息");
+  } catch (err) {
+    notificationsStore.pushError(
+      err instanceof Error ? err.message : String(err),
+      { title: "刷新失败，请重试" },
+    );
   } finally {
     pullDistance.value = 0;
     pullState.value = "idle";
@@ -453,6 +608,24 @@ const runningToolLabel = computed<string>(() => {
     .list(props.sessionId)
     .some((it) => it.toolUseId === open.pair.use.id);
   return waiting ? `⏸ Waiting for approval · ${label}` : `⚙ ${label}`;
+});
+// Once a tool finishes, retain a truthful sense of momentum instead of
+// falling back to the opaque "Codex is thinking…" label. Progress is derived
+// only from transcript-visible commentary and completed tool calls.
+const codexTurnProgress = computed(() => currentTurnProgress(timeline.value));
+const capacityRetryLabel = computed(() => {
+  const retry = capacityRetry.value;
+  if (!retry) return "";
+  const seconds = Math.max(0, Math.ceil((Date.parse(retry.retryAt) - now.value) / 1_000));
+  const wait = seconds > 0 ? ` · continuing in ${seconds}s` : "";
+  return `Model busy · automatically retrying ${retry.attempt}/${retry.maxAttempts}${wait}…`;
+});
+const workingLabel = computed(() => {
+  if (!isCodex.value) return "Claude is thinking…";
+  return capacityRetryLabel.value
+    || codexTurnProgress.value.label
+    || live.turnProgress[props.sessionId]
+    || "Codex is starting work…";
 });
 const stallThresholdMs = computed(() => (toolInProgress.value ? TOOL_STALL_MS : STALL_MS));
 const isStalled = computed(() =>
@@ -685,6 +858,13 @@ const renderedSlice = computed(() => {
 // nobody scrolls through a long stack of individual Read/Bash rows, and the
 // per-row spacing wastes vertical space. (Was 4.)
 const TOOL_RUN_MIN = 2;
+
+function sourceLineIndexForEntry(entry: DecoratedEntry): number | null {
+  if (entry.node.kind !== "event") return null;
+  const index = (entry.node.record as Record<string, unknown>).__agentWebuiSourceIndex;
+  return typeof index === "number" && Number.isSafeInteger(index) && index >= 0 ? index : null;
+}
+
 const renderedRows = computed<RenderRow[]>(() => {
   const rows: RenderRow[] = [];
   // Drop truly-empty assistant records first (no text / tool_use / non-empty
@@ -694,21 +874,30 @@ const renderedRows = computed<RenderRow[]>(() => {
   // interleaved thinking→tool→thinking sequences no longer merge into a single
   // tool run — each thinking record is one small glyph between tool rows.
   const entries = renderedSlice.value.items.filter((e) => !isEmptyAssistantEntry(e));
-  for (let i = 0; i < entries.length;) {
-    const firstItems = collapsibleToolItems(entries[i]!);
+  const ordered = interleavePendingPrompts(entries, pendingPrompts.value, sourceLineIndexForEntry);
+  for (let i = 0; i < ordered.length;) {
+    const current = ordered[i]!;
+    if (current.kind === "pending") {
+      rows.push(current);
+      i++;
+      continue;
+    }
+    const firstItems = collapsibleToolItems(current.entry);
     if (!firstItems) {
-      rows.push({ kind: "entry", entry: entries[i]! });
+      rows.push(current);
       i++;
       continue;
     }
 
-    const runEntries: DecoratedEntry[] = [entries[i]!];
+    const runEntries: DecoratedEntry[] = [current.entry];
     const runItems: ToolRunItem[] = [...firstItems];
     i++;
-    while (i < entries.length) {
-      const nextItems = collapsibleToolItems(entries[i]!);
+    while (i < ordered.length) {
+      const next = ordered[i]!;
+      if (next.kind === "pending") break;
+      const nextItems = collapsibleToolItems(next.entry);
       if (!nextItems) break;
-      runEntries.push(entries[i]!);
+      runEntries.push(next.entry);
       runItems.push(...nextItems);
       i++;
     }
@@ -721,6 +910,33 @@ const renderedRows = computed<RenderRow[]>(() => {
   }
   return rows;
 });
+
+// Tool runs can grow at either edge as history is prepended or a live turn
+// appends another call. Keep expansion state by the calls inside the run, not
+// in the keyed child component: a regroup/remount must not collapse an image
+// the user is currently viewing and remove hundreds of pixels from the list.
+const expandedToolCallIds = ref<Set<string>>(new Set());
+const expandedToolDetailIds = ref<Set<string>>(new Set());
+
+function isToolRunExpanded(row: ToolRunRow): boolean {
+  return row.items.some((item) => expandedToolCallIds.value.has(item.uuid));
+}
+
+function setToolRunExpanded(row: ToolRunRow, expanded: boolean) {
+  const next = new Set(expandedToolCallIds.value);
+  for (const item of row.items) {
+    if (expanded) next.add(item.uuid);
+    else next.delete(item.uuid);
+  }
+  expandedToolCallIds.value = next;
+}
+
+function setToolDetailExpanded(value: { uuid: string; expanded: boolean }) {
+  const next = new Set(expandedToolDetailIds.value);
+  if (value.expanded) next.add(value.uuid);
+  else next.delete(value.uuid);
+  expandedToolDetailIds.value = next;
+}
 // Two distinct sources of "older content":
 //   1. unloadedAbove — lines that exist on disk but the cache hasn't fetched
 //      (sparse padding from the tail-N initial load). These need a backend
@@ -729,7 +945,7 @@ const renderedRows = computed<RenderRow[]>(() => {
 //      out of the rendered window by renderLimit. Just expand renderLimit.
 // Either condition keeps the "↑ Load earlier" affordance live.
 const cacheEntry = computed(() => cache.bySession[props.sessionId]);
-const unloadedAbove = computed(() => cacheEntry.value?.firstLoadedIndex ?? 0);
+const unloadedAbove = computed(() => cacheEntry.value?.loadedFromIndex ?? 0);
 const hiddenAbove = computed(() => renderedSlice.value.start);
 // Internal trigger for loadEarlier() — fires on EITHER unloaded-on-disk lines
 // OR window-trimmed cached lines. The auto-load-on-scroll path uses this so
@@ -748,25 +964,43 @@ const showLoadEarlierButton = computed(() => canLoadEarlier.value);
 // scroll-near-top auto-load can already hold the gate — without feedback a tap
 // looks like it did nothing ("点了要很久ui没显示" / "经常不work").
 const loadEarlierInflight = ref(false);
+const loadEarlierError = ref("");
 
 // Grow the render window by `by` rows, then restore the viewport: prepending
-// items above must not shift the content under the user's finger. Returns once
-// Vue has painted the new rows. Standard chat-app scroll-anchoring trick.
+// items above must not shift the content under the user's finger. Anchor to a
+// visible keyed row instead of using one scrollHeight delta: images and Shiki
+// continue changing height after nextTick, and the ResizeObserver above keeps
+// correcting those late changes against the same visible-message contract.
 async function growRenderWindow(by: number): Promise<void> {
   const el = scroller.value;
+  const anchor = rememberViewportAnchor();
   const beforeHeight = el?.scrollHeight ?? 0;
   const beforeTop = el?.scrollTop ?? 0;
   renderLimit.value = Math.min(decorated.value.length, renderLimit.value + by);
   await nextTick();
+  if (anchor && restoreRememberedViewportAnchor(anchor)) {
+    return;
+  }
   if (el) {
+    // Pre-mount/unsupported-observer fallback. The row-anchor path above is the
+    // normal one once the transcript exists.
     const delta = el.scrollHeight - beforeHeight;
     if (delta > 0) el.scrollTop = beforeTop + delta;
   }
 }
 
-async function loadEarlier(mode: "chunk" | "all" = "chunk"): Promise<boolean> {
+async function loadEarlier(mode: "chunk" | "all" = "chunk", retry = false): Promise<boolean> {
   if (loadEarlierInflight.value) return false;
   if (!canLoadEarlier.value) return false;
+  if (loadEarlierError.value && !retry) return false;
+  loadEarlierError.value = "";
+  cancelBottomPin();
+  // Loading history is an explicit move away from the live tail. A collapsed
+  // tail can be shorter than the viewport, making scrollTop=0 count as both
+  // "top" and "bottom"; without clearing this flag the resize observer pins
+  // the newly prepended history back to the bottom and defeats row anchoring.
+  lockedToBottom.value = false;
+  rememberViewportAnchor();
   loadEarlierInflight.value = true;
   try {
     // Step 1: backfill unloaded older lines from disk. "chunk" pulls one
@@ -775,16 +1009,19 @@ async function loadEarlier(mode: "chunk" | "all" = "chunk"): Promise<boolean> {
     // re-read a 65MB codex fork rollout N times. The fetch was never the
     // bottleneck (0.7s for 75MB); rendering it all at once was.
     const entry = cacheEntry.value;
-    if (entry && entry.firstLoadedIndex > 0) {
-      const to = entry.firstLoadedIndex;
+    if (entry && entry.loadedFromIndex !== null && entry.loadedFromIndex > 0) {
+      const to = entry.loadedFromIndex;
       const from = mode === "all" ? 0 : Math.max(0, to - RENDER_BATCH);
       try {
         const r = await readSessionRange(props.sessionId, from, to);
         cache.appendBatch(props.sessionId, r.lines.map((ln) => ({ index: ln.index, raw: ln.raw })));
+        // Advance physical coverage even when every returned line was backend-
+        // filtered bookkeeping and no visible row was appended.
+        cache.markLoadedFrom(props.sessionId, from);
       } catch (err) {
-        // Backend hiccup — fall through to expanding the render window with
-        // whatever we already have, so the user still sees SOMETHING happen.
         console.error("loadEarlier read-range failed", err);
+        loadEarlierError.value = "较早记录加载失败，点此重试";
+        return false;
       }
     }
     // Step 2: reveal the freshly-loaded (or cached-but-windowed-out) entries.
@@ -828,7 +1065,17 @@ function comp(kind: string | null) {
 }
 
 function keyForRow(row: RenderRow): string {
-  return row.kind === "toolRun" ? row.key : keyFor(row.entry);
+  if (row.kind === "toolRun") return row.key;
+  if (row.kind === "pending") return `pending:${row.prompt.id}`;
+  return keyFor(row.entry);
+}
+
+function scrollKeyForRow(row: RenderRow): string {
+  if (row.kind === "entry") return keyFor(row.entry);
+  if (row.kind === "pending") return `pending:${row.prompt.id}`;
+  // A run at the head of the render window can absorb older calls when the
+  // window grows. Its tail call remains stable across that prepend.
+  return `tool-run-tail:${row.items.at(-1)?.uuid ?? row.key}`;
 }
 
 // Threshold for "I'm at the bottom" — affects both whether the auto-
@@ -842,13 +1089,26 @@ const NEAR_BOTTOM_PX = 24;
 function onScroll() {
   const el = scroller.value;
   if (!el) return;
-  lockedToBottom.value = el.scrollTop + el.clientHeight >= el.scrollHeight - NEAR_BOTTOM_PX;
+  const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - NEAR_BOTTOM_PX;
+  // Programmatic bottom-follow scrolls can fire while an idle render-window
+  // expansion or late image decode has already increased scrollHeight. Do not
+  // mistake that transient geometry for a user leaving the live tail.
+  lockedToBottom.value = resolveBottomLock(lockedToBottom.value, {
+    atBottom,
+    pinActive: bottomPinActive,
+    userScrollIntent: performance.now() <= userScrollIntentUntil,
+  });
+  rememberViewportAnchor();
   recomputePromptNav();
   recomputeStickyPrompt();
   // Auto-load older history when the user scrolls near the top — same
   // pattern as WeChat / iMessage. Throttled inside loadEarlier so even a
   // momentum-scroll burst only fires one batch per render.
-  if (el.scrollTop < AUTO_LOAD_THRESHOLD_PX) loadEarlier();
+  if (
+    !lockedToBottom.value
+    && el.scrollHeight > el.clientHeight + NEAR_BOTTOM_PX
+    && el.scrollTop < AUTO_LOAD_THRESHOLD_PX
+  ) loadEarlier();
 }
 
 // ---------------------------------------------------------------------------
@@ -974,6 +1234,8 @@ function recomputeStickyPrompt() {
 function jumpToPrompt(direction: "up" | "down") {
   const el = scroller.value;
   if (!el) return;
+  cancelBottomPin();
+  lockedToBottom.value = false;
   recomputePromptNav();
   const tops = promptOffsets.value;
   let target: number | null = null;
@@ -1004,7 +1266,7 @@ function jumpToPrompt(direction: "up" | "down") {
     // user's mental model: ↑ walks back through their prompts, ↓ walks
     // forward and finally to "the latest reply".
     if (target === null) {
-      el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+      scrollToBottom();
       return;
     }
   }
@@ -1079,7 +1341,11 @@ function forceScrollSoon() {
   // pending → real message swap, first assistant text chunk,
   // Shiki highlight). Without this the bubble routinely lands below the
   // fold because scrollHeight grows AFTER our scroll.
-  pinToBottomUntilStable(1500);
+  //
+  // Do not allow the loop to declare stability during the quiet frames before
+  // Android starts its keyboard animation. On some Chromium/HyperOS builds
+  // the layout viewport changes a few hundred milliseconds after focus.
+  pinToBottomUntilStable(1800, 700);
 }
 
 defineExpose({ revealLatest: forceScrollSoon });
@@ -1161,29 +1427,59 @@ function scrollToUuidUntilStable(uuid: string, maxMs = 8000) {
 // IDB cache restore, WS catch-up, render-window expansion (30 → 200),
 // Shiki async highlight, image load — all change scrollHeight after
 // mount and a single scrollTo would land at the wrong target.
-function pinToBottomUntilStable(maxMs = 6000) {
+function pinToBottomUntilStable(maxMs = 6000, minMs = 0) {
   const el0 = scroller.value;
   if (!el0) return;
+  const generation = ++bottomPinGeneration;
+  bottomPinActive = true;
+  lockedToBottom.value = true;
   let lastScrollHeight = -1;
   let lastClientHeight = -1;
   let stableFrames = 0;
   const start = performance.now();
   const tick = () => {
+    if (generation !== bottomPinGeneration) return;
     const el = scroller.value;
-    if (!el) return;
+    if (!el) {
+      bottomPinActive = false;
+      return;
+    }
     el.scrollTop = el.scrollHeight;
+    lockedToBottom.value = true;
     if (el.scrollHeight === lastScrollHeight && el.clientHeight === lastClientHeight) {
       stableFrames++;
-      if (stableFrames >= 12) { lockedToBottom.value = true; return; }
+      if (stableFrames >= 12 && performance.now() - start >= minMs) {
+        bottomPinActive = false;
+        lockedToBottom.value = true;
+        rememberViewportAnchor();
+        return;
+      }
     } else {
       lastScrollHeight = el.scrollHeight;
       lastClientHeight = el.clientHeight;
       stableFrames = 0;
     }
     if (performance.now() - start < maxMs) requestAnimationFrame(tick);
-    else lockedToBottom.value = true;
+    else {
+      bottomPinActive = false;
+      lockedToBottom.value = true;
+      rememberViewportAnchor();
+    }
   };
   requestAnimationFrame(tick);
+}
+
+function cancelBottomPin() {
+  bottomPinGeneration++;
+  bottomPinActive = false;
+}
+
+function noteUserScrollIntent() {
+  cancelBottomPin();
+  // touchmove/wheel arrives before the browser's scroll event. Keep the intent
+  // alive through mobile momentum scrolling so those trusted user movements,
+  // unlike programmatic tail growth, are allowed to unlock bottom-follow.
+  userScrollIntentUntil = performance.now() + 5000;
 }
 
 // ─── Search-term highlight ────────────────────────────────────────────
@@ -1266,9 +1562,13 @@ watch([messageDisplayStyle, () => renderedRows.value.length], async () => {
 });
 
 onBeforeUnmount(() => {
+  cancelBottomPin();
+  if (syncingLatestTimer) clearTimeout(syncingLatestTimer);
   if (highlightTimer) clearTimeout(highlightTimer);
   stickyOverlayRO?.disconnect();
   stickyOverlayRO = null;
+  historyResizeObserver?.disconnect();
+  historyResizeObserver = null;
   // Clear so the next session's mount starts with no stale ranges
   // pointing at this session's (now detached) DOM.
   const highlights = (CSS as unknown as { highlights?: Map<string, unknown> }).highlights;
@@ -1287,11 +1587,6 @@ onMounted(() => {
   } else {
     lockedToBottom.value = true;
     void nextTick().then(() => pinToBottomUntilStable());
-  }
-  if (pendingPrompts.value.length) {
-    void nextTick().then(() => {
-      pendingPromptEl.value?.scrollIntoView({ block: "end", behavior: "auto" });
-    });
   }
   // First highlight pass after the initial mount renders. Subsequent passes
   // are driven by the watchers above as content settles.
@@ -1312,14 +1607,9 @@ onMounted(() => {
   }
 });
 
-watch(() => pendingPrompts.value.length, async (n, old) => {
+watch(() => pendingPrompts.value.length, (n, old) => {
   if (n <= (old ?? 0)) return;
   forceScrollSoon();
-  await nextTick();
-  pendingPromptEl.value?.scrollIntoView({ block: "end", behavior: "auto" });
-  requestAnimationFrame(() => {
-    pendingPromptEl.value?.scrollIntoView({ block: "end", behavior: "auto" });
-  });
 });
 
 const inflight = computed(() => drafts.inflight(props.sessionId));
@@ -1478,17 +1768,24 @@ onBeforeUnmount(() => document.removeEventListener("click", closeBubbleMenu));
     :class="messageDisplayClass"
     :data-message-display="messageDisplayStyle"
   >
-    <!-- Syncing-latest pill: shown while the on-tap HTTP tail fetch is in
-         flight. Floats over the bottom of the list so the cached content stays
-         visible underneath; disappears the instant fresh lines land. -->
+    <!-- Slow syncs get feedback; failures turn into a reachable retry. Cached
+         content remains visible underneath in both states. -->
     <Transition name="cw-sync-pill">
-      <div
-        v-if="syncingLatest"
-        class="cw-sync-pill pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 z-10 flex items-center gap-1.5 px-3 py-1 rounded-full text-[12px] bg-black/65 text-white shadow"
+      <button
+        v-if="syncingLatest || latestSyncError"
+        type="button"
+        class="cw-sync-pill absolute bottom-3 left-1/2 -translate-x-1/2 z-10 flex items-center gap-1.5 px-3 py-1 rounded-full text-[12px] bg-black/75 text-white shadow disabled:pointer-events-none"
+        :disabled="!latestSyncError || !!live.tailFetching[props.sessionId]"
+        :aria-label="latestSyncError ? '同步失败，重试' : '正在同步最新消息'"
+        aria-live="polite"
+        @click="retryLatestSync"
       >
-        <span class="inline-block w-3 h-3 border-2 border-current border-t-transparent rounded-full animate-spin" />
-        <span>同步最新…</span>
-      </div>
+        <span
+          v-if="!latestSyncError"
+          class="inline-block w-3 h-3 border-2 border-current border-t-transparent rounded-full animate-spin"
+        />
+        <span>{{ latestSyncError ? "同步失败 · 点此重试" : "同步最新…" }}</span>
+      </button>
     </Transition>
     <div
       v-if="stickyPromptOverlayEntry"
@@ -1511,9 +1808,15 @@ onBeforeUnmount(() => document.removeEventListener("click", closeBubbleMenu));
       ref="scroller"
       class="cw-message-scroller flex-1 overflow-y-auto overflow-x-hidden overscroll-contain min-h-0"
       @scroll="onScroll"
+      @wheel.passive="noteUserScrollIntent"
+      @touchmove.passive="noteUserScrollIntent"
       @click.capture="onContentClick"
       @contextmenu="onBubbleContextMenu"
     >
+      <!-- Keep a short tail aligned to the bottom. When older rows are
+           prepended, this flexible space collapses first, so the existing
+           messages do not move before the transcript becomes scrollable. -->
+      <div class="cw-message-top-spacer" aria-hidden="true" />
       <!-- Pull-to-refresh indicator. Sits above all content and grows in
            height as the user drags down, pushing the rest of the chat
            content with it. transition-none while actively pulling so the
@@ -1533,100 +1836,102 @@ onBeforeUnmount(() => document.removeEventListener("click", closeBubbleMenu));
           <span>{{ pullIndicatorLabel }}</span>
         </div>
       </div>
-      <button
-        v-if="showLoadEarlierButton"
-        class="block mx-auto my-2 text-xs px-3 py-1.5 rounded border border-[var(--cw-border)]  opacity-70 hover:opacity-100 disabled:opacity-50 disabled:cursor-default"
-        :disabled="loadEarlierInflight"
-        @click="loadEarlier('chunk')"
-      >{{ loadEarlierInflight ? "Loading…" : "↑ Load earlier" }}</button>
-      <template v-for="row in renderedRows" :key="keyForRow(row)">
-        <template v-if="row.kind === 'entry'">
-        <div
-          v-if="row.entry.node.kind === 'event' && row.entry.node.block === 'UserPromptBlock'"
-          class="cw-user-prompt-anchor h-px"
-          data-user-prompt="true"
-          :data-uuid="recordUuid(row.entry)"
-          aria-hidden="true"
-        />
-        <div
-          v-if="row.entry.node.kind === 'event' && comp(row.entry.node.block)"
-          class="cw-message-entry"
-          :class="{ 'cw-sticky-prompt-current': isStickyPromptEntry(row.entry) }"
-          :style="stickyPromptStyle(row.entry)"
-          :data-block="row.entry.node.block || ''"
-          :data-role="roleFor(row.entry)"
-          :data-uuid="uuidAttr(row.entry)"
-          :data-bubble-uuid="recordUuid(row.entry) || undefined"
-        >
-          <span
-            v-if="row.entry.node.block === 'UserPromptBlock' || row.entry.node.block === 'AssistantBlock'"
-            class="cw-message-avatar"
-            :class="[
-              row.entry.node.block === 'UserPromptBlock' ? 'cw-message-avatar-user' : 'cw-message-avatar-assistant',
-              isWechatAvatarEntry(row.entry) ? '' : 'cw-message-avatar-empty',
-            ]"
+      <div ref="historyEl" class="cw-message-history">
+        <button
+          v-if="showLoadEarlierButton"
+          class="block mx-auto my-2 text-xs px-3 py-1.5 rounded border border-[var(--cw-border)] opacity-70 hover:opacity-100 disabled:opacity-50 disabled:cursor-default"
+          :disabled="loadEarlierInflight"
+          aria-live="polite"
+          @click="loadEarlier('chunk', true)"
+        >{{ loadEarlierInflight ? "正在加载更早记录…" : (loadEarlierError || "加载更早记录") }}</button>
+        <template v-for="row in renderedRows" :key="keyForRow(row)">
+          <template v-if="row.kind === 'entry'">
+            <div
+              v-if="row.entry.node.kind === 'event' && row.entry.node.block === 'UserPromptBlock'"
+              class="cw-user-prompt-anchor h-px"
+              data-user-prompt="true"
+              :data-uuid="recordUuid(row.entry)"
+              aria-hidden="true"
+            />
+            <div
+              v-if="row.entry.node.kind === 'event' && comp(row.entry.node.block)"
+              class="cw-message-entry"
+              :class="{ 'cw-sticky-prompt-current': isStickyPromptEntry(row.entry) }"
+              :style="stickyPromptStyle(row.entry)"
+              :data-block="row.entry.node.block || ''"
+              :data-role="roleFor(row.entry)"
+              :data-uuid="uuidAttr(row.entry)"
+              :data-bubble-uuid="recordUuid(row.entry) || undefined"
+              :data-scroll-key="scrollKeyForRow(row)"
+            >
+              <span
+                v-if="row.entry.node.block === 'UserPromptBlock' || row.entry.node.block === 'AssistantBlock'"
+                class="cw-message-avatar"
+                :class="[
+                  row.entry.node.block === 'UserPromptBlock' ? 'cw-message-avatar-user' : 'cw-message-avatar-assistant',
+                  isWechatAvatarEntry(row.entry) ? '' : 'cw-message-avatar-empty',
+                ]"
+              >
+                <!-- Glyph only on the "lead" entry of a turn; other entries keep an
+                     empty (transparent) spacer so EVERY bubble in the column stays
+                     indented by the avatar slot and the two columns mirror-align.
+                     Without the spacer, tool/non-text assistant blocks lose the
+                     indent and span full width, breaking the mirror. -->
+                <template v-if="isWechatAvatarEntry(row.entry)">
+                  <template v-if="row.entry.node.block === 'UserPromptBlock'">
+                    <UserAvatar />
+                  </template>
+                  <AgentBadge v-else :agent="agent" :size="28" />
+                </template>
+              </span>
+              <component
+                :is="comp(row.entry.node.block)"
+                v-bind="propsFor(row.entry)"
+                :data-uuid="uuidAttr(row.entry)"
+              />
+            </div>
+          </template>
+          <!-- A Codex mid-turn steer has no durable rollout echo. It is
+               interleaved above at its send-time source boundary, so later
+               thinking and tool records flow beneath it chronologically. -->
+          <div
+            v-else-if="row.kind === 'pending'"
+            class="cw-message-entry cw-message-entry-pending"
+            data-block="UserPromptBlock"
+            data-role="user"
+            :data-scroll-key="scrollKeyForRow(row)"
+            :title="row.prompt.steered ? 'Sent into the active turn' : 'Sending'"
+            aria-live="polite"
           >
-            <!-- Glyph only on the "lead" entry of a turn; other entries keep an
-                 empty (transparent) spacer so EVERY bubble in the column stays
-                 indented by the avatar slot and the two columns mirror-align.
-                 Without the spacer, tool/non-text assistant blocks lose the
-                 indent and span full width, breaking the mirror. -->
-            <template v-if="isWechatAvatarEntry(row.entry)">
-              <template v-if="row.entry.node.block === 'UserPromptBlock'">
-                <UserAvatar />
-              </template>
-              <AgentBadge v-else :agent="agent" :size="28" />
-            </template>
-          </span>
-          <component
-          :is="comp(row.entry.node.block)"
-          v-bind="propsFor(row.entry)"
-          :data-uuid="uuidAttr(row.entry)"
-          />
-        </div>
+            <span class="cw-message-avatar cw-message-avatar-user">
+              <UserAvatar />
+            </span>
+            <UserPromptBlock
+              :node="pendingPromptNode(row.prompt)"
+              :pending-status="row.prompt.phase === 'sending' ? 'sending' : row.prompt.steered ? 'steered' : undefined"
+              :pending-image-count="row.prompt.imageCount"
+            />
+          </div>
+          <div
+            v-else
+            class="cw-message-entry"
+            data-block="ToolRunBlock"
+            data-role="assistant"
+            :data-scroll-key="scrollKeyForRow(row)"
+          >
+            <!-- Same transparent avatar spacer as tool-only assistant entries, so
+                 a collapsed run indents exactly like a single tool row (WeChat
+                 shows the avatar column; other displays hide it via CSS). -->
+            <span class="cw-message-avatar cw-message-avatar-assistant cw-message-avatar-empty" aria-hidden="true" />
+            <ToolRunBlock
+              :items="row.items"
+              :expanded="isToolRunExpanded(row)"
+              :expanded-item-ids="expandedToolDetailIds"
+              @update:expanded="setToolRunExpanded(row, $event)"
+              @update:item-expanded="setToolDetailExpanded"
+            />
+          </div>
         </template>
-        <div
-          v-else
-          class="cw-message-entry"
-          data-block="ToolRunBlock"
-          data-role="assistant"
-        >
-          <!-- Same transparent avatar spacer as tool-only assistant entries, so
-               a collapsed run indents exactly like a single tool row (WeChat
-               shows the avatar column; other displays hide it via CSS). -->
-          <span class="cw-message-avatar cw-message-avatar-assistant cw-message-avatar-empty" aria-hidden="true" />
-          <ToolRunBlock :items="row.items" />
-        </div>
-      </template>
-      <!-- First-frame user feedback. This is the same UserPromptBlock used by
-           durable transcript records, not a visually unrelated queue chip.
-           It intentionally has no source anchor/uuid/actions: the real
-           JSONL/rollout record takes over once source-index reconciliation
-           observes it. Keep it before the thinking row so send order reads
-           as user prompt → agent response immediately. -->
-      <div
-        v-if="pendingPrompts.length"
-        ref="pendingPromptEl"
-        class="cw-pending-prompts"
-        aria-live="polite"
-      >
-        <div
-          v-for="pp in pendingPrompts"
-          :key="pp.id"
-          class="cw-message-entry cw-message-entry-pending"
-          data-block="UserPromptBlock"
-          data-role="user"
-          :title="pp.steered ? 'Steered into the active turn' : 'Sending'"
-        >
-          <span class="cw-message-avatar cw-message-avatar-user">
-            <UserAvatar />
-          </span>
-          <UserPromptBlock
-            :node="pendingPromptNode(pp)"
-            :pending-status="pp.phase === 'sending' ? 'sending' : pp.steered ? 'steered' : undefined"
-            :pending-image-count="pp.imageCount"
-          />
-        </div>
       </div>
       <!-- Compacting writes NOTHING to the jsonl for minutes, which would
            trip the 3-min stall banner — suppress it while compacting and show
@@ -1644,12 +1949,15 @@ onBeforeUnmount(() => document.removeEventListener("click", closeBubbleMenu));
           @click="stopAndRetry"
         >{{ retrying ? "Retrying…" : "Stop & retry" }}</button>
       </div>
-      <div v-else-if="running || compacting || optimisticallyStarting" class="flex items-center gap-2 px-4 py-3 text-sm opacity-70">
+      <div v-else-if="running || compacting || optimisticallyStarting" class="flex min-w-0 items-center gap-2 px-4 py-3 text-sm opacity-70">
         <span class="thinking-dot bg-current" />
         <span class="thinking-dot bg-current" style="animation-delay: 0.15s" />
         <span class="thinking-dot bg-current" style="animation-delay: 0.3s" />
-        <span class="ml-1">{{ compacting ? "🗜 Compacting context…" : toolInProgress ? (runningToolLabel || "⚙ Running a command…") : `${isCodex ? "Codex" : "Claude"} is thinking…` }}</span>
-        <span v-if="spinnerElapsed" class="ml-1 opacity-70 tabular-nums">{{ spinnerElapsed }}</span>
+        <span
+          class="ml-1 min-w-0 truncate"
+          :title="compacting ? 'Compacting context' : capacityRetry ? capacityRetryLabel : toolInProgress ? runningToolLabel : workingLabel"
+        >{{ compacting ? "🗜 Compacting context…" : capacityRetry ? capacityRetryLabel : toolInProgress ? (runningToolLabel || "⚙ Running a command…") : workingLabel }}</span>
+        <span v-if="spinnerElapsed" class="ml-1 shrink-0 opacity-70 tabular-nums">{{ spinnerElapsed }}</span>
       </div>
       <!-- Server-confirmed queue chips: jsonl `queue-operation enqueue`
            records (lands ~140 ms after Send, cleared as a batch on remove /

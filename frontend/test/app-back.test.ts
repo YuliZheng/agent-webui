@@ -10,6 +10,7 @@ import {
   handlePwaPopState,
   initializeAppHistory,
   setPwaLayerActive,
+  standaloneExternalNavigationHref,
   updateHistoryForSelection,
 } from "../src/util/pwa-history.js";
 
@@ -32,6 +33,29 @@ function useStandaloneDisplayMode() {
     dispatchEvent: vi.fn(),
   })));
 }
+
+describe("PWA external links", () => {
+  const base = "https://lggram.tail6c8b6c.ts.net/?session=test";
+
+  it("uses an in-context navigation for external web links in standalone mode", () => {
+    expect(standaloneExternalNavigationHref("https://x.com/openai/status/1", base, true))
+      .toBe("https://x.com/openai/status/1");
+  });
+
+  it("leaves browser tabs, same-origin links, and non-web schemes alone", () => {
+    expect(standaloneExternalNavigationHref("https://x.com/openai", base, false)).toBeNull();
+    expect(standaloneExternalNavigationHref("/api/me", base, true)).toBeNull();
+    expect(standaloneExternalNavigationHref("javascript:alert(1)", base, true)).toBeNull();
+  });
+
+  it("wires the fallback and touch slop into the message list", () => {
+    const messageList = readFileSync(join(process.cwd(), "src/components/MessageList.vue"), "utf8");
+    expect(messageList).toContain("standaloneExternalNavigationHref(href, window.location.href)");
+    expect(messageList).toContain("window.location.assign(external)");
+    expect(messageList).toContain("const PULL_START_SLOP = 8");
+    expect(messageList).toContain("if (dy <= PULL_START_SLOP)");
+  });
+});
 
 describe("PWA app back hierarchy", () => {
   it("offers back to the topmost active layer before the fallback", () => {

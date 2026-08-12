@@ -6,6 +6,8 @@ export interface PendingImage {
   base64: string;
   dataUrl: string;
   bytes: number;
+  originalBytes?: number;
+  compressed?: boolean;
   name?: string;
 }
 

@@ -14,12 +14,15 @@ import LocalInfoBubble from "./LocalInfoBubble.vue";
 import AgentBadge from "./AgentBadge.vue";
 import BackgroundTasksPill from "./BackgroundTasksPill.vue";
 import TodoChecklistPill from "./TodoChecklistPill.vue";
+import MobileGoalPopover from "./MobileGoalPopover.vue";
 import SessionStatusPage from "./SessionStatusPage.vue";
 import { usePreviewModalStore } from "../stores/preview-modal.js";
 import { useLocalFileViewerStore } from "../stores/local-file-viewer.js";
 import { displayCwd } from "../util/cwd-display.js";
 import { copyText } from "../util/clipboard.js";
 import { getSessionGoal, killSession } from "../api/sessions.js";
+import { nowMs } from "../util/now-tick.js";
+import { isReadOnlySubagentSession } from "../util/session-access.js";
 
 const ui = useUiStore();
 const prefs = usePrefsStore();
@@ -41,6 +44,15 @@ const webuiAlive = computed(() => !!(
   && sessions.webuiAliveBySession[sessionId.value]
 ));
 const isWorking = computed(() => status.value === "running");
+const capacityRetry = computed(() => (
+  sessionId.value ? sessions.capacityRetryBySession[sessionId.value] ?? null : null
+));
+const capacityRetryWaitSeconds = computed(() => {
+  if (!capacityRetry.value) return 0;
+  return Math.max(0, Math.ceil(
+    (Date.parse(capacityRetry.value.retryAt) - nowMs.value) / 1_000,
+  ));
+});
 // CLI mid-/compact — wire-only signal, the jsonl is silent for the whole
 // window. Swaps the green pill's label so the user knows why nothing streams.
 const isCompacting = computed(() => !!(sessionId.value && sessions.compactingBySession[sessionId.value]));
@@ -53,9 +65,19 @@ const displayTitle = computed(() => [
 const agent = computed(() => item.value?.agent ?? "claude");
 const shortId = computed(() => sessionId.value ? sessionId.value.slice(0, 8) : "");
 const isDraft = computed(() => !!sessionId.value && sessions.isPending(sessionId.value));
+const isReadOnlySubagent = computed(() => isReadOnlySubagentSession(item.value));
+const subagentParentId = computed(() => (
+  isReadOnlySubagent.value ? item.value?.parentSessionId ?? null : null
+));
 const mobileHeaderTitle = computed(() => {
   if (isDraft.value) return `New session in ${cwdDisplay.value}`;
   if (isCompacting.value) return "正在整理上下文…";
+  if (capacityRetry.value) {
+    const wait = capacityRetryWaitSeconds.value > 0
+      ? `，${capacityRetryWaitSeconds.value} 秒后继续`
+      : "";
+    return `模型繁忙，正在重试 ${capacityRetry.value.attempt}/${capacityRetry.value.maxAttempts}${wait}…`;
+  }
   if (isWorking.value) return `${agent.value === "codex" ? "Codex" : "Claude"} 正在思考…`;
   return displayTitle.value || `${shortId.value}…`;
 });
@@ -214,6 +236,10 @@ async function copyCwd() {
   }
 }
 
+function openSubagentParent() {
+  if (subagentParentId.value) ui.select(subagentParentId.value);
+}
+
 </script>
 
 <template>
@@ -252,20 +278,33 @@ async function copyCwd() {
               <template v-else><span class="font-mono">{{ shortId }}…</span></template>
             </span>
           </div>
-          <div class="flex items-center justify-center gap-2 truncate text-[11px] leading-tight opacity-60 md:justify-start cw-main-header-meta font-sans font-normal tracking-normal">
-            <AgentBadge :agent="agent" :size="15" label class="shrink-0" />
-            <button
-              class="truncate min-w-0 text-left hover:opacity-100 hover:underline"
-              :title="`Click to copy working directory: ${item.cwd}`"
-              @click="copyCwd"
-            >{{ cwdDisplay }}</button>
-            <button
-              v-if="!isDraft"
-              class="shrink-0 hover:opacity-100 hover:underline"
-              :title="`Click to copy full session id: ${sessionId}`"
-              @click="copySessionId"
-            >· {{ shortId }}…</button>
-            <span v-else class="shrink-0 italic opacity-70">· draft (type to create)</span>
+          <div class="flex min-w-0 items-center justify-center gap-2 text-[11px] leading-tight md:justify-start cw-main-header-meta font-sans font-normal tracking-normal">
+            <div class="flex min-w-0 items-center gap-2 overflow-hidden opacity-60">
+              <AgentBadge :agent="agent" :size="15" label class="shrink-0" />
+              <button
+                class="truncate min-w-0 text-left hover:opacity-100 hover:underline"
+                :title="`Click to copy working directory: ${item.cwd}`"
+                @click="copyCwd"
+              >{{ cwdDisplay }}</button>
+              <button
+                v-if="!isDraft"
+                class="shrink-0 hover:opacity-100 hover:underline"
+                :title="`Click to copy full session id: ${sessionId}`"
+                @click="copySessionId"
+              >· {{ shortId }}…</button>
+              <span v-else class="shrink-0 italic opacity-70">· draft (type to create)</span>
+            </div>
+            <span
+              v-if="isReadOnlySubagent"
+              class="shrink-0 rounded px-1.5 py-0.5 font-medium text-[var(--cw-info)] bg-[color-mix(in_srgb,var(--cw-info)_14%,transparent)]"
+              title="Codex sub-agent threads are read-only"
+            ><span class="md:hidden">只读</span><span class="hidden md:inline">子 Agent · 只读</span></span>
+            <MobileGoalPopover
+              v-if="goal && !isDraft"
+              :key="sessionId"
+              :session-id="sessionId"
+              :goal="goal"
+            />
           </div>
           <div
             v-if="goal && !isDraft"
@@ -298,8 +337,17 @@ async function copyCwd() {
             class="text-xs px-1.5 py-0.5 rounded bg-[color-mix(in_srgb,var(--cw-danger)_16%,transparent)] text-[var(--cw-danger)] [@media(hover:hover)]:hover:bg-[color-mix(in_srgb,var(--cw-danger)_24%,transparent)] active:opacity-75 transition"
             title="Tap to reconnect now"
             @click="retryReconnect"
-          >{{ retryingReconnect ? "Reconnecting…" : "Disconnected · tap to retry" }}</button>
-          <span
+           >{{ retryingReconnect ? "Reconnecting…" : "Disconnected · tap to retry" }}</button>
+           <span
+             v-else-if="capacityRetry"
+             class="flex items-center gap-1.5 text-xs px-2 py-0.5 rounded bg-[color-mix(in_srgb,var(--cw-warning)_16%,transparent)] text-[var(--cw-warning)]"
+             :title="`Selected model is busy. Automatic retry ${capacityRetry.attempt} of ${capacityRetry.maxAttempts}.`"
+           >
+             <span class="inline-block animate-spin">⟳</span>
+             Model busy · retry {{ capacityRetry.attempt }}/{{ capacityRetry.maxAttempts }}
+             <template v-if="capacityRetryWaitSeconds > 0"> · {{ capacityRetryWaitSeconds }}s</template>
+           </span>
+           <span
             v-else-if="isWorking || isCompacting"
             class="flex items-center gap-1.5 text-xs px-2 py-0.5 rounded bg-[color-mix(in_srgb,var(--cw-success)_16%,transparent)] text-[var(--cw-success)]"
           >
@@ -428,7 +476,36 @@ async function copyCwd() {
       <!-- Client-side system bubble for webui-local slash commands (/help,
            /mcp, /status, …). Never written to the jsonl. -->
       <LocalInfoBubble :session-id="sessionId" />
+      <div
+        v-if="isReadOnlySubagent"
+        class="cw-subagent-readonly shrink-0 border-t border-[var(--cw-border)] bg-[var(--cw-panel-bg)] px-3 py-2.5 md:px-4"
+        role="note"
+        aria-label="子 Agent 只读提示"
+      >
+        <div class="mx-auto flex max-w-3xl items-center gap-3">
+          <span
+            class="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-[color-mix(in_srgb,var(--cw-info)_14%,transparent)] text-[var(--cw-info)]"
+            aria-hidden="true"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="h-[18px] w-[18px]">
+              <rect x="5" y="10" width="14" height="10" rx="2" />
+              <path d="M8 10V7a4 4 0 0 1 8 0v3" />
+            </svg>
+          </span>
+          <div class="min-w-0 flex-1">
+            <div class="text-sm font-medium leading-tight">子 Agent · 只读</div>
+            <div class="mt-0.5 text-xs leading-snug opacity-65">这是父会话派出的工作线程，只能查看记录，不能直接发送消息。</div>
+          </div>
+          <button
+            v-if="subagentParentId"
+            type="button"
+            class="min-h-11 shrink-0 rounded-lg bg-[var(--cw-accent)] px-3 text-sm font-medium text-[var(--cw-accent-text)] transition active:opacity-75 [@media(hover:hover)]:hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--cw-focus-ring)]"
+            @click="openSubagentParent"
+          >打开父会话</button>
+        </div>
+      </div>
       <PromptInput
+        v-else
         :session-id="sessionId"
         :running="status === 'running'"
         @mobile-composer-focus="revealLatestForMobileKeyboard"

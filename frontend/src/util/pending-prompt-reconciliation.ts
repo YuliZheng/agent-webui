@@ -8,8 +8,50 @@ export interface PendingPromptCandidate {
   id: string;
   text: string;
   startedAtLineCount: number;
+  startedAt?: number;
+  startedAtSessionSize?: number;
   phase?: "sending" | "dispatched" | "accepted";
   steered?: boolean;
+}
+
+export interface SidebarPendingState {
+  backendPreview: string | null;
+  now: number;
+  sessionSize: number;
+}
+
+const LEGACY_ACCEPTED_GRACE_MS = 15_000;
+
+/**
+ * Returns the newest optimistic prompt that should still override the
+ * sidebar's durable backend preview.
+ *
+ * MessageList normally reconciles these entries, but unopened sessions never
+ * mount it. An accepted prompt could therefore remain in localStorage forever
+ * and cover a newer assistant reply. New entries carry their send-time file
+ * size; legacy entries get a short grace period before an idle session's
+ * durable preview wins.
+ */
+export function latestSidebarPendingPrompt(
+  entries: readonly PendingPromptCandidate[],
+  state: SidebarPendingState,
+): PendingPromptCandidate | undefined {
+  for (let index = entries.length - 1; index >= 0; index--) {
+    const entry = entries[index];
+    if (!entry?.text) continue;
+    if (entry.phase !== "accepted" || !state.backendPreview) return entry;
+
+    if (typeof entry.startedAtSessionSize === "number") {
+      if (state.sessionSize <= entry.startedAtSessionSize) return entry;
+      continue;
+    }
+
+    const startedAt = typeof entry.startedAt === "number" && Number.isFinite(entry.startedAt)
+      ? entry.startedAt
+      : 0;
+    if (startedAt > 0 && state.now - startedAt < LEGACY_ACCEPTED_GRACE_MS) return entry;
+  }
+  return undefined;
 }
 
 export interface PendingPromptProbeRange {

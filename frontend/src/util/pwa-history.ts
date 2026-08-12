@@ -22,6 +22,22 @@ export function isStandalonePwa(): boolean {
   return standaloneMediaMatches() || navigatorWithStandalone.standalone === true;
 }
 
+export function standaloneExternalNavigationHref(
+  href: string,
+  baseHref: string,
+  standalone = isStandalonePwa(),
+): string | null {
+  if (!standalone) return null;
+  try {
+    const url = new URL(href, baseHref);
+    const base = new URL(baseHref);
+    if (url.origin === base.origin) return null;
+    return url.protocol === "http:" || url.protocol === "https:" ? url.href : null;
+  } catch {
+    return null;
+  }
+}
+
 function urlForSession(id: string | null): string {
   const url = new URL(window.location.href);
   if (id) url.searchParams.set("session", id);

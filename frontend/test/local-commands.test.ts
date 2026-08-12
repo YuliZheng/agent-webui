@@ -173,7 +173,7 @@ describe("local slash commands", () => {
     expect(apiMocks.getCodexRateLimits).toHaveBeenCalledWith("s1");
   });
 
-  it("deduplicates identical primary and weekly account windows", async () => {
+  it("keeps the five-hour row visible when Codex temporarily omits that window", async () => {
     const sessions = useSessionsStore();
     sessions.byId.s1 = {
       id: "s1",
@@ -200,8 +200,31 @@ describe("local slash commands", () => {
     });
 
     expect(summary.rows.filter((row) => row.label.endsWith("usage"))).toEqual([
+      { label: "5-hour usage", value: "not reported" },
       expect.objectContaining({ label: "Weekly usage" }),
     ]);
+  });
+
+  it("labels a primary window without duration as five-hour usage", async () => {
+    apiMocks.getCodexRateLimits.mockResolvedValue({
+      planType: "pro",
+      primary: { usedPercent: 25, windowDurationMins: null, resetsAt: 1_800_000_000 },
+      secondary: { usedPercent: 10, windowDurationMins: 10_080, resetsAt: 1_800_500_000 },
+    });
+
+    const summary = await buildSessionStatusSummary({
+      sessionId: "s1",
+      isCodex: true,
+      model: "gpt-5.6-sol",
+      ctxTokens: 100_000,
+      ctxLimit: 200_000,
+      lines: [],
+    });
+
+    expect(summary.rows).toEqual(expect.arrayContaining([
+      expect.objectContaining({ label: "5-hour usage", value: expect.stringContaining("25% used") }),
+      expect.objectContaining({ label: "Weekly usage", value: expect.stringContaining("10% used") }),
+    ]));
   });
 });
 
@@ -240,6 +263,33 @@ describe("Codex context usage", () => {
     expect(usage.estimatedTokens).toBeUndefined();
     expect(usage.limit).toBe(244_800);
     expect(usage.contributors?.reduce((sum, item) => sum + item.tokens, 0)).toBe(230_100);
+  });
+
+  it("shows the full window when Codex records a terminal zero-usage sentinel", () => {
+    const usage = latestCodexContextUsage([
+      line("event_msg", {
+        type: "token_count",
+        info: {
+          last_token_usage: {
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+          },
+          total_token_usage: {
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 475_000,
+          },
+          model_context_window: 475_000,
+        },
+      }),
+    ]);
+
+    expect(usage).toMatchObject({
+      tokens: 475_000,
+      reportedTokens: 475_000,
+      limit: 450_000,
+    });
   });
 
   it("forgets pre-compaction reasoning and honors a lower configured limit", () => {
@@ -294,6 +344,49 @@ describe("Codex context usage", () => {
     expect(usage.contributors?.find((item) => item.source === "shell")?.tokens).toBeLessThan(1_000);
     expect(usage.contributors?.reduce((sum, item) => sum + item.tokens, 0)).toBe(10_000);
     expect(usage.contributors?.reduce((sum, item) => sum + item.percent, 0)).toBe(100);
+  });
+
+  it("attributes the retained replacement history after compaction", () => {
+    const usage = latestCodexContextUsage([
+      message("assistant", "discarded before compaction"),
+      JSON.stringify({
+        type: "compacted",
+        payload: {
+          message: "",
+          replacement_history: [
+            {
+              type: "message",
+              role: "developer",
+              content: [{ type: "input_text", text: "<environment_context>retained</environment_context>" }],
+            },
+            {
+              type: "message",
+              role: "user",
+              content: [{ type: "input_text", text: "retained request ".repeat(100) }],
+            },
+            {
+              type: "compaction",
+              encrypted_content: "x".repeat(8_000),
+            },
+            {
+              type: "agent_message",
+              author: "child-agent",
+              content: [{ type: "output_text", text: "retained child result" }],
+            },
+          ],
+        },
+      }),
+      message("user", "new request"),
+      tokenCount(4_000),
+    ]);
+
+    expect(usage.contributors?.some((item) => item.source === "assistant")).toBe(false);
+    expect(usage.contributors?.find((item) => item.source === "instructions")?.tokens).toBeGreaterThan(0);
+    expect(usage.contributors?.find((item) => item.source === "user")?.tokens).toBeGreaterThan(400);
+    expect(usage.contributors?.find((item) => item.source === "compaction")?.tokens).toBeGreaterThan(1_000);
+    expect(usage.contributors?.find((item) => item.source === "messages")?.tokens).toBeGreaterThan(0);
+    expect(usage.contributors?.find((item) => item.source === "other")?.tokens).toBeLessThan(2_500);
+    expect(usage.contributors?.reduce((sum, item) => sum + item.tokens, 0)).toBe(4_000);
   });
 
   it("separates user, assistant, AGENTS.md, skills, and other injected context", () => {

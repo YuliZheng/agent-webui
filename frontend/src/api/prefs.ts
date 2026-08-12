@@ -120,6 +120,7 @@ export function adaptBackendPrefs(value: unknown): PrefsBlob {
         ? "default"
         : stringValue(source.defaultPermissionMode) as PrefsBlob["defaultPermissionMode"],
       defaultCodexModel: stringValue(source.defaultCodexModel),
+      defaultClaudeEffort: stringValue(source.defaultClaudeEffort),
       defaultCodexEffort: stringValue(source.defaultCodexEffort),
       defaultCodexServiceTier: source.defaultCodexServiceTier === "priority" ? "priority" : "",
       defaultCodexApproval: stringValue(source.defaultCodexApproval),
@@ -161,6 +162,7 @@ export function adaptBackendPrefs(value: unknown): PrefsBlob {
     defaultModel: stringValue(source.defaultClaudeModel),
     defaultPermissionMode: stringValue(source.defaultClaudePermissionMode) as PrefsBlob["defaultPermissionMode"],
     defaultCodexModel: stringValue(source.defaultCodexModel),
+    defaultClaudeEffort: stringValue(source.defaultClaudeEffort),
     defaultCodexEffort: stringValue(source.defaultCodexEffort),
     defaultCodexServiceTier: source.defaultCodexServiceTier === "priority" ? "priority" : "",
     defaultCodexApproval: codexApprovalFromBackend(source),
@@ -168,8 +170,8 @@ export function adaptBackendPrefs(value: unknown): PrefsBlob {
     showPeerSessions: booleanValue(source.showPeerSessions, EMPTY_PREFS.showPeerSessions),
     showSubagentSessions: booleanValue(source.showSubagentSessions, EMPTY_PREFS.showSubagentSessions),
     messageDisplayStyle: normalizeMessageDisplayStyle(source.messageDisplayStyle),
-    autoCompactWindow: null,
-    codexAutoCompactWindow: null,
+    autoCompactWindow: typeof source.autoCompactWindow === "number" ? source.autoCompactWindow : null,
+    codexAutoCompactWindow: typeof source.codexAutoCompactWindow === "number" ? source.codexAutoCompactWindow : null,
   };
 }
 
@@ -250,6 +252,7 @@ export function adaptFrontendPrefs(blob: PrefsBlob): UnknownRecord {
     defaultClaudeModel: blob.defaultModel,
     defaultClaudePermissionMode: blob.defaultPermissionMode === "default" ? "" : blob.defaultPermissionMode,
     defaultCodexModel: blob.defaultCodexModel,
+    defaultClaudeEffort: blob.defaultClaudeEffort,
     defaultCodexEffort: blob.defaultCodexEffort,
     defaultCodexServiceTier: blob.defaultCodexServiceTier,
     ...codex,
@@ -258,6 +261,11 @@ export function adaptFrontendPrefs(blob: PrefsBlob): UnknownRecord {
     showSubagentSessions: blob.showSubagentSessions,
     messageDisplayStyle: blob.messageDisplayStyle as MessageDisplayStyle,
   };
+  // These are read-only mirrors used by the frontend's context display. Older
+  // WebUI builds persisted manual overrides, so spreading `prior` above can
+  // otherwise resurrect a stale value on every unrelated preference save.
+  delete result.autoCompactWindow;
+  delete result.codexAutoCompactWindow;
   lastBackendPrefs = { ...result };
   return result;
 }

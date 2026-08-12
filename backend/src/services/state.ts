@@ -125,6 +125,13 @@ export class AppState {
   readonly interactions = new Map<string, Interaction>();
   readonly tasks = new Map<string, unknown[]>();
   readonly status = new Map<string, { status: "running" | "exited" | "failed"; webuiAlive: boolean; compacting?: boolean; lastBoundaryAt?: string }>();
+  readonly capacityRetries = new Map<string, {
+    turnId: string;
+    attempt: number;
+    maxAttempts: number;
+    delayMs: number;
+    retryAt: string;
+  }>();
   readonly attachmentRoot: string;
   private attachmentChain = Promise.resolve();
 

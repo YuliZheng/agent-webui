@@ -12,8 +12,20 @@ import PreviewChip from "./PreviewChip.vue";
 import AskUserQuestionInteractive from "./AskUserQuestionInteractive.vue";
 import InteractionCard from "../../InteractionCard.vue";
 
-const props = defineProps<{ pair: ToolPair }>();
-const open = ref(false);
+const props = defineProps<{
+  pair: ToolPair;
+  hideResultImages?: boolean;
+  expanded?: boolean | undefined;
+}>();
+const emit = defineEmits<{ (event: "update:expanded", value: boolean): void }>();
+const localOpen = ref(false);
+const open = computed({
+  get: () => props.expanded ?? localOpen.value,
+  set: (value: boolean) => {
+    localOpen.value = value;
+    emit("update:expanded", value);
+  },
+});
 const header = () => `▶ ${toolSummary(props.pair.use.name, props.pair.use.input)}`;
 
 const isErr = (v: unknown) => Array.isArray(v) ? false : typeof v === "object" && v !== null && (v as any).is_error === true;
@@ -72,7 +84,12 @@ const pendingPermission = computed(() => {
       <pre v-else class="text-xs whitespace-pre-wrap bg-[var(--cw-panel-2)] p-2 rounded-sm">{{ JSON.stringify(pair.use.input, null, 2) }}</pre>
       <SubagentBlock v-if="pair.subagentTimeline" :timeline="pair.subagentTimeline" />
       <WorkflowProgressBlock v-if="pair.workflow" :workflow="pair.workflow" class="mb-1" />
-      <ToolResult v-if="pair.result !== undefined" :value="pair.result" :is-error="isErr(pair.result)" />
+      <ToolResult
+        v-if="pair.result !== undefined"
+        :value="pair.result"
+        :is-error="isErr(pair.result)"
+        :hide-images="hideResultImages === true"
+      />
     </div>
   </div>
 </template>

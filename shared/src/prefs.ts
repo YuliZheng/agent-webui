@@ -31,6 +31,8 @@ export interface PrefsBlob {
   pinnedGroupIds: string[];
   pinnedSessionIds: string[];
   thinkingTrigger: string;
+  autoCompactWindow: number | null;
+  codexAutoCompactWindow: number | null;
   autoTitleEnabled: boolean;
   autoTitleFrequency: number;
   autoTitleLanguage: string;
@@ -62,6 +64,8 @@ export function createDefaultPrefs(): PrefsBlob {
     pinnedGroupIds: [],
     pinnedSessionIds: [],
     thinkingTrigger: "think",
+    autoCompactWindow: null,
+    codexAutoCompactWindow: null,
     autoTitleEnabled: true,
     autoTitleFrequency: DEFAULT_AUTO_TITLE_FREQUENCY,
     autoTitleLanguage: "auto",
@@ -101,6 +105,14 @@ function asString(value: unknown, fallback: string, maxLength = 4096): string {
 
 function asBoolean(value: unknown, fallback: boolean): boolean {
   return typeof value === "boolean" ? value : fallback;
+}
+
+function positiveSafeIntegerOrNull(value: unknown): number | null {
+  return typeof value === "number"
+    && Number.isSafeInteger(value)
+    && value > 0
+    ? value
+    : null;
 }
 
 function enumString(value: unknown, allowed: readonly string[], fallback = ""): string {
@@ -186,6 +198,10 @@ export function normalizePrefs(value: unknown): PrefsBlob {
       source.thinkingTrigger,
       defaults.thinkingTrigger,
       200,
+    ),
+    autoCompactWindow: positiveSafeIntegerOrNull(source.autoCompactWindow),
+    codexAutoCompactWindow: positiveSafeIntegerOrNull(
+      source.codexAutoCompactWindow,
     ),
     autoTitleEnabled: asBoolean(
       source.autoTitleEnabled,

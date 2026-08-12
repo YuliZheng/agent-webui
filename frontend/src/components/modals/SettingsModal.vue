@@ -5,11 +5,12 @@ import { usePrefsStore } from "../../stores/prefs.js";
 import { useSessionsStore } from "../../stores/sessions.js";
 import { useNotificationsStore } from "../../stores/notifications.js";
 import type { MessageDisplayStyle, PermissionMode, ThinkingTrigger } from "@claude-webui/shared/prefs";
-import { MODEL_CHOICES, PERMISSION_MODES, CODEX_MODEL_CHOICES, CODEX_APPROVAL_PRESETS, MESSAGE_DISPLAY_STYLE_OPTIONS, TITLE_LANGUAGE_CHOICES } from "@claude-webui/shared/prefs";
+import { MODEL_CHOICES, PERMISSION_MODES, CODEX_MODEL_CHOICES, CODEX_APPROVAL_PRESETS, CLAUDE_REASONING_EFFORTS, MESSAGE_DISPLAY_STYLE_OPTIONS, TITLE_LANGUAGE_CHOICES } from "@claude-webui/shared/prefs";
 import { applyTheme } from "../../util/theme.js";
 import { displayCwd } from "../../util/cwd-display.js";
 import { deleteSessions, retitleAll } from "../../api/sessions.js";
 import { requestNotifyPermission } from "../../util/os-notify.js";
+import { CODEX_REASONING_EFFORTS } from "../../util/codex-efforts.js";
 import {
   pwaInstallStatus,
   requestPwaInstall,
@@ -343,6 +344,17 @@ async function doRetitleAll() {
                 <option v-for="m in PERMISSION_MODES" :key="m" :value="m">{{ m }}</option>
               </select>
             </label>
+            <label class="block">
+              <div class="text-xs opacity-70 mb-1">defaultEffort</div>
+              <select
+                :value="prefs.defaultClaudeEffort"
+                @change="prefs.setDefaultClaudeEffort(($event.target as HTMLSelectElement).value)"
+                class="w-full text-sm font-mono rounded border border-[var(--cw-border)]  bg-[var(--cw-panel-bg)] text-[var(--cw-text)]  px-2 py-1 focus:outline-none focus:border-[var(--cw-accent)] [&>option]:bg-white [&>option]:text-[var(--cw-text)] dark:[&>option]:bg-[var(--cw-panel-2)] dark:[&>option]:text-[var(--cw-text)]"
+              >
+                <option value="" disabled>未设置 — 跟随外部 ~/.claude/settings.json</option>
+                <option v-for="e in CLAUDE_REASONING_EFFORTS" :key="e" :value="e">{{ e }}</option>
+              </select>
+            </label>
           </div>
           <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
             <label class="block">
@@ -364,7 +376,7 @@ async function doRetitleAll() {
                 class="w-full text-sm font-mono rounded border border-[var(--cw-border)]  bg-[var(--cw-panel-bg)] text-[var(--cw-text)]  px-2 py-1 focus:outline-none focus:border-[var(--cw-accent)] [&>option]:bg-white [&>option]:text-[var(--cw-text)] dark:[&>option]:bg-[var(--cw-panel-2)] dark:[&>option]:text-[var(--cw-text)]"
               >
                 <option value="">(default · medium)</option>
-                <option v-for="e in ['none','minimal','low','medium','high','xhigh','max']" :key="e" :value="e">{{ e }}</option>
+                <option v-for="e in CODEX_REASONING_EFFORTS" :key="e" :value="e">{{ e }}</option>
               </select>
             </label>
           </div>
@@ -388,7 +400,7 @@ async function doRetitleAll() {
                   :checked="prefs.defaultCodexServiceTier === 'priority'"
                   @change="prefs.setDefaultCodexFast(($event.target as HTMLInputElement).checked)"
                 />
-                <span class="text-sm">Use priority service tier</span>
+                <span class="text-sm">Use Fast service tier for supported models</span>
               </label>
             </div>
           </div>

@@ -265,27 +265,31 @@ async function readBackLines(path: string, size: number, maxBytes = BACK_SCAN_MA
 
 interface LatestMeaning {
   preview: string | null;
+  previewRole: "user" | "assistant" | null;
   lastTurnAt: string | null;
   priority: 0 | 1 | 2;
 }
 
 function latestMeaningDetail(lines: string[], agent: AgentKind): LatestMeaning {
-  let userFallback: { text: string; timestamp?: string } | undefined;
   for (let i = lines.length - 1; i >= 0; i--) {
     try {
       const record = asRecord(JSON.parse(lines[i] ?? ""));
       if (!record) continue;
       const value = agent === "claude" ? claudeMeaning(record) : codexMeaning(record);
-      if (value.priority === 2 && value.text) return { preview: cleanPreview(value.text), lastTurnAt: value.timestamp ?? null, priority: 2 };
-      if (!userFallback && value.priority === 1 && value.text) userFallback = { text: value.text, timestamp: value.timestamp };
+      if (value.priority > 0 && value.text) {
+        return {
+          preview: cleanPreview(value.text),
+          previewRole: value.priority === 2 ? "assistant" : "user",
+          lastTurnAt: value.timestamp ?? null,
+          priority: value.priority as 1 | 2,
+        };
+      }
     } catch { /* keep scanning */ }
   }
-  return userFallback
-    ? { preview: cleanPreview(userFallback.text), lastTurnAt: userFallback.timestamp ?? null, priority: 1 }
-    : { preview: null, lastTurnAt: null, priority: 0 };
+  return { preview: null, previewRole: null, lastTurnAt: null, priority: 0 };
 }
 
-function latestMeaning(lines: string[], agent: AgentKind): { preview: string | null; lastTurnAt: string | null } {
+function latestMeaning(lines: string[], agent: AgentKind): { preview: string | null; previewRole: "user" | "assistant" | null; lastTurnAt: string | null } {
   const { priority: _priority, ...summary } = latestMeaningDetail(lines, agent);
   return summary;
 }
@@ -430,6 +434,7 @@ function normalizeCachedSession(value: unknown): SessionRecord | null {
     agent,
     ...(agent === "codex" ? { subagent: record.subagent === true } : {}),
     preview: optionalString(record, "preview"),
+    previewRole: record.previewRole === "user" || record.previewRole === "assistant" ? record.previewRole : null,
     lastTurnAt: optionalString(record, "lastTurnAt"),
     parentSessionId: optionalString(record, "parentSessionId"),
   };
@@ -473,6 +478,7 @@ export class SessionIndex extends EventEmitter {
   private watchers: CloseableWatcher[] = [];
   private timers = new Map<string, NodeJS.Timeout>();
   private refreshes = new Map<string, Promise<void>>();
+  private pendingRefreshes = new Map<string, number>();
   private scanWork?: Promise<SessionRecord[]>;
   private poller?: NodeJS.Timeout;
   private polling = false;
@@ -563,12 +569,13 @@ export class SessionIndex extends EventEmitter {
             }
             if (info.size > existing.size) {
               const latest = latestMeaningDetail(await readAppendLines(path, existing.size, info.size), existing.agent);
-              const useLatest = latest.priority === 2 || !existing.preview;
+              const useLatest = latest.priority > 0 && !!latest.preview;
               record = {
                 ...existing,
                 size: info.size,
                 mtime: info.mtime.toISOString(),
                 preview: useLatest ? latest.preview : existing.preview,
+                previewRole: useLatest ? latest.previewRole : existing.previewRole,
                 lastTurnAt: useLatest && latest.preview ? latest.lastTurnAt : existing.lastTurnAt,
               };
             }
@@ -853,14 +860,31 @@ export class SessionIndex extends EventEmitter {
 
   private async refreshPath(path: string, attempt = 0): Promise<void> {
     const existing = this.refreshes.get(path);
-    if (existing) return existing;
-    const work = this.refreshPathOnce(path, attempt);
-    this.refreshes.set(path, work);
-    try {
-      await work;
-    } finally {
-      if (this.refreshes.get(path) === work) this.refreshes.delete(path);
+    if (existing) {
+      const queuedAttempt = this.pendingRefreshes.get(path);
+      this.pendingRefreshes.set(
+        path,
+        queuedAttempt === undefined ? attempt : Math.min(queuedAttempt, attempt),
+      );
+      return existing;
     }
+    const work = (async () => {
+      let nextAttempt = attempt;
+      try {
+        while (true) {
+          await this.refreshPathOnce(path, nextAttempt);
+          const queuedAttempt = this.pendingRefreshes.get(path);
+          if (queuedAttempt === undefined) return;
+          this.pendingRefreshes.delete(path);
+          nextAttempt = queuedAttempt;
+        }
+      } finally {
+        this.refreshes.delete(path);
+        this.pendingRefreshes.delete(path);
+      }
+    })();
+    this.refreshes.set(path, work);
+    return work;
   }
 
   private async refreshPathOnce(path: string, attempt: number): Promise<void> {
@@ -873,14 +897,16 @@ export class SessionIndex extends EventEmitter {
         if (entry.size === cached.size && nextMtime === cached.mtime) return;
         if (entry.size > cached.size) {
           const latest = latestMeaningDetail(await readAppendLines(path, cached.size, entry.size), cached.agent);
-          // An older assistant preview remains preferable to a newly-appended
-          // user prompt. Once an assistant line lands, `latest` replaces it.
-          const useLatest = latest.priority === 2 || !cached.preview;
+          // Preview the latest meaningful visible message regardless of role.
+          // A newly-appended user request must not leave an older assistant
+          // response in the sidebar until another assistant line arrives.
+          const useLatest = latest.priority > 0 && !!latest.preview;
           const updated: SessionRecord = {
             ...cached,
             size: entry.size,
             mtime: nextMtime,
             preview: useLatest ? latest.preview : cached.preview,
+            previewRole: useLatest ? latest.previewRole : cached.previewRole,
             lastTurnAt: useLatest && latest.preview ? latest.lastTurnAt : cached.lastTurnAt,
           };
           this.upsert(updated);
@@ -1000,6 +1026,7 @@ export class SessionIndex extends EventEmitter {
   async stop(): Promise<void> {
     this.watching = false;
     this.scanController?.abort();
+    this.pendingRefreshes.clear();
     for (const timer of this.timers.values()) clearTimeout(timer);
     this.timers.clear();
     if (this.cacheWriteTimer) clearTimeout(this.cacheWriteTimer);

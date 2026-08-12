@@ -5,6 +5,13 @@ export type ProcessStatus = "running" | "exited" | "failed";
 export type ColorPreference = "light" | "dark" | "system";
 export type { MessageDisplayStyle } from "./prefs.js";
 
+// Keep browser preflight and backend enforcement on one contract. The decoded
+// byte ceiling leaves room for base64/JSON overhead under the 64 MiB WebSocket
+// frame limit.
+export const MAX_CLAUDE_PROMPT_ATTACHMENTS = 8;
+export const MAX_CODEX_PROMPT_ATTACHMENTS = 32;
+export const MAX_PROMPT_ATTACHMENT_BYTES = 40 * 1024 * 1024;
+
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue =
   | JsonPrimitive
@@ -26,6 +33,7 @@ export interface SessionListItem {
   parentSessionId?: string | null;
   status?: ProcessStatus | null;
   preview?: string | null;
+  previewRole?: "user" | "assistant" | null;
   lastTurnAt?: string | null;
   lastBoundaryAt?: string | null;
   readAt?: string | null;
@@ -89,7 +97,10 @@ export interface AgentSelectOption {
 
 export interface AgentModelOption extends AgentSelectOption {
   supportedEfforts: AgentSelectOption[];
+  /** Service-tier ids accepted by Codex app-server for this model. */
+  serviceTiers?: AgentSelectOption[];
   defaultEffort?: string | null;
+  defaultServiceTier?: string | null;
   isDefault?: boolean;
 }
 
@@ -101,6 +112,7 @@ export interface AgentCapabilities {
   defaults: {
     model?: string | null;
     effort?: string | null;
+    serviceTier?: string | null;
     permissionMode?: string | null;
     sandboxMode?: string | null;
   };
@@ -248,6 +260,7 @@ export interface RpcRequestPayloads {
   "normalize-cwd": { cwd: string };
   "complete-path": { path: string };
   "read-local-file": { path: string; line?: number };
+  "reveal-local-path": { path: string };
   "new-session": {
     cwd: string;
     prompt: string;
@@ -324,6 +337,7 @@ export interface RpcResponsePayloads {
   "normalize-cwd": { cwd: string };
   "complete-path": { paths: string[] };
   "read-local-file": LocalFilePayload;
+  "reveal-local-path": { path: string; kind: "file" | "directory" };
   "new-session": { sessionId: string };
   prompt:
     | { sessionId: string; queued: boolean; steered?: never }
@@ -339,7 +353,7 @@ export interface RpcResponsePayloads {
   "get-agent-capabilities": AgentCapabilities;
   "set-model": { applies: "immediately" | "next-process" };
   "set-effort": { applies: "immediately" | "next-process" };
-  "set-service-tier": { applies: "immediately" };
+  "set-service-tier": { applies: "next-turn" };
   "set-permission-mode": { applies: "immediately" | "next-process" };
   "set-sandbox-mode": { applies: "immediately" | "next-process" };
   "interaction-respond": Record<string, never>;
@@ -393,6 +407,7 @@ const RPC_METHODS: ReadonlySet<string> = new Set<RpcMethod>([
   "normalize-cwd",
   "complete-path",
   "read-local-file",
+  "reveal-local-path",
   "new-session",
   "prompt",
   "stop",
@@ -506,6 +521,7 @@ export function isSessionListItem(value: unknown): value is SessionListItem {
   }
   return (
     isNullableString(value.preview) &&
+    (value.previewRole === undefined || value.previewRole === null || value.previewRole === "user" || value.previewRole === "assistant") &&
     isNullableString(value.lastTurnAt) &&
     isNullableString(value.lastBoundaryAt) &&
     isNullableString(value.readAt)

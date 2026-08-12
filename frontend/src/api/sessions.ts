@@ -1,4 +1,6 @@
 import type {
+  AgentCapabilities,
+  AgentKind,
   CliInfoResult,
   CliInfoTopic,
   CodexGoal,
@@ -13,10 +15,12 @@ import { DEFAULT_FORWARDED_SLASH_COMMANDS as DEFAULT_SLASH_COMMANDS } from "@cla
 import { request, WsError } from "./ws.js";
 import type { ContextUsage } from "../util/local-commands.js";
 
-// Must exceed the backend's longest sync-RPC timeout (Codex rawRequest 20s,
-// Claude process write). At 30s the backend covers its 20s ceiling; a truly
-// stuck WS is independently caught by the pong heartbeat (~63s → reconnect).
-const PROMPT_TIMEOUT_MS = 30_000;
+// A cold Codex send can legitimately perform initialize + thread/resume +
+// turn/start serially (each has a 20s backend ceiling), with a short active-turn
+// readiness wait in between. Keep the browser deadline above that full chain;
+// otherwise the UI can report failure while the backend accepts the prompt a
+// few seconds later.
+const PROMPT_TIMEOUT_MS = 90_000;
 const CODEX_GOAL_TIMEOUT_MS = 60_000;
 // Long timeout for new-session: agent spawn + first-turn setup can take a
 // while on a cold start; a truly stuck socket is caught independently by the
@@ -167,8 +171,15 @@ export async function sendPrompt(
     "prompt",
     params,
     onDispatched
-      ? { timeoutMs: PROMPT_TIMEOUT_MS, onSent: onDispatched }
-      : { timeoutMs: PROMPT_TIMEOUT_MS },
+      ? {
+          timeoutMs: PROMPT_TIMEOUT_MS,
+          onSent: onDispatched,
+          ...(clientUuid ? { retryOnReconnect: true } : {}),
+        }
+      : {
+          timeoutMs: PROMPT_TIMEOUT_MS,
+          ...(clientUuid ? { retryOnReconnect: true } : {}),
+        },
   );
 }
 
@@ -242,8 +253,16 @@ export async function setSessionEffort(id: string, effort: string): Promise<void
   await request("set-effort", { sessionId: id, effort });
 }
 
-export async function setSessionServiceTier(id: string, serviceTier: "" | "priority"): Promise<void> {
-  await request("set-service-tier", { sessionId: id, serviceTier });
+export async function setSessionServiceTier(id: string, serviceTier: "" | "priority"): Promise<"next-turn"> {
+  const result = await request<{ applies: "next-turn" }>("set-service-tier", { sessionId: id, serviceTier });
+  return result.applies;
+}
+
+export async function getAgentCapabilities(agent: AgentKind, cwd?: string): Promise<AgentCapabilities> {
+  return request<AgentCapabilities>("get-agent-capabilities", {
+    agent,
+    ...(cwd ? { cwd } : {}),
+  });
 }
 
 // Read-only CLI info (/mcp, /status, /doctor, …). Backend may invoke the CLI,
@@ -338,8 +357,16 @@ export async function searchContent(query: string): Promise<ContentMatch[]> {
 }
 
 export interface LineEntry { index: number; raw: string }
-export interface TailResponse { totalLines: number; fromIndex: number; lines: LineEntry[] }
+export interface TailResponse {
+  totalLines: number;
+  fromIndex: number;
+  lines: LineEntry[];
+  /** Absent on older servers; automatic gap repair must stay disabled there. */
+  supportsCompactRange?: boolean;
+}
 export interface RangeResponse { totalLines: number; lines: LineEntry[] }
+export type SessionTailPriority = "interactive" | "background";
+export interface SessionRangeOptions { mode?: "compact" }
 export interface FullContextUsageResponse extends ContextUsage {
   completeHistoryScan: true;
   recordsScanned: number;
@@ -347,28 +374,54 @@ export interface FullContextUsageResponse extends ContextUsage {
   compactionCount: number;
 }
 
+const SESSION_TAIL_TIMEOUT_MS = 8_000;
+
 // Fast initial-load: returns just the last `n` lines of a session jsonl.
 // Used on first visit to avoid streaming every line of long conversations
 // over WebSocket before paint.
-export async function readSessionTail(id: string, n: number): Promise<TailResponse> {
-  const q = new URLSearchParams({ n: String(n) });
-  const res = await fetch(`/api/sessions/${encodeURIComponent(id)}/tail?${q.toString()}`, {
-    credentials: "include",
-    cache: "no-store",
-  });
-  if (!res.ok) throw new Error(`read tail failed: ${res.status}`);
-  return res.json() as Promise<TailResponse>;
+export async function readSessionTail(
+  id: string,
+  n: number,
+  priority: SessionTailPriority = "interactive",
+): Promise<TailResponse> {
+  const q = new URLSearchParams({ n: String(n), priority });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SESSION_TAIL_TIMEOUT_MS);
+  try {
+    const res = await fetch(`/api/sessions/${encodeURIComponent(id)}/tail?${q.toString()}`, {
+      credentials: "include",
+      cache: "no-store",
+      signal: controller.signal,
+    });
+    if (!res.ok) throw new Error(`read tail failed: ${res.status}`);
+    return res.json() as Promise<TailResponse>;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 // Used by "Load earlier" to fetch a contiguous older index range.
-export async function readSessionRange(id: string, from: number, to: number): Promise<RangeResponse> {
+export async function readSessionRange(
+  id: string,
+  from: number,
+  to: number,
+  options: SessionRangeOptions = {},
+): Promise<RangeResponse> {
   const q = new URLSearchParams({ from: String(from), to: String(to) });
-  const res = await fetch(`/api/sessions/${encodeURIComponent(id)}/range?${q.toString()}`, {
-    credentials: "include",
-    cache: "no-store",
-  });
-  if (!res.ok) throw new Error(`read range failed: ${res.status}`);
-  return res.json() as Promise<RangeResponse>;
+  if (options.mode) q.set("mode", options.mode);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SESSION_TAIL_TIMEOUT_MS);
+  try {
+    const res = await fetch(`/api/sessions/${encodeURIComponent(id)}/range?${q.toString()}`, {
+      credentials: "include",
+      cache: "no-store",
+      signal: controller.signal,
+    });
+    if (!res.ok) throw new Error(`read range failed: ${res.status}`);
+    return res.json() as Promise<RangeResponse>;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 // Full-rollout, server-side streaming attribution. The response stays tiny:
@@ -391,10 +444,10 @@ export async function readFullCodexContextUsage(
 // Hit the backend's manual rescan endpoint. Pull-to-refresh on the sidebar
 // fires this so the foreign-claude-scanner and responding-tracker re-walk
 // state from disk, catching anything chokidar dropped.
-export async function refreshBackend(): Promise<{ ok: boolean; foreignAdopted: number }> {
+export async function refreshBackend(): Promise<{ sessions: SessionListItem[] }> {
   const r = await fetch("/api/refresh", { method: "POST", credentials: "include" });
   if (!r.ok) throw new Error(`refresh failed: ${r.status}`);
-  return r.json() as Promise<{ ok: boolean; foreignAdopted: number }>;
+  return r.json() as Promise<{ sessions: SessionListItem[] }>;
 }
 
 export { WsError as HttpError };

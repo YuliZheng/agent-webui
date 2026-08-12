@@ -1,15 +1,15 @@
-import { open } from "node:fs/promises";
 import type { AgentKind } from "@agent-webui/shared";
 import { asRecord, asString } from "../types.js";
+import { streamJsonlLines } from "./jsonl.js";
 
-const NORMAL_REQUEST_COUNT = 4;
-const CONTEXTUAL_REQUEST_COUNT = 6;
-const INITIAL_TAIL_BYTES = 512 * 1024;
-const MAX_TAIL_BYTES = 4 * 1024 * 1024;
-const MAX_RECORD_CHARS = 256 * 1024;
-const CURRENT_REQUEST_CHARS = 1_200;
-const SUPPORTING_REQUEST_CHARS = 520;
-const CONTEXT_TEXT_MAX_CHARS = 3_900;
+const TITLE_REQUEST_COUNT = 16;
+const TITLE_REQUEST_CACHE_COUNT = 64;
+const MAX_STREAM_REQUEST_CANDIDATES = 2_048;
+const TRAILING_REQUEST_COUNT = 4;
+const MAX_RECORD_BYTES = 1024 * 1024;
+const MAX_STORED_REQUEST_CHARS = 2_000;
+const REQUEST_CONTEXT_CHARS = 280;
+const CONTEXT_TEXT_MAX_CHARS = 5_400;
 const INCREMENTAL_REQUEST_COUNT = 12;
 const INCREMENTAL_REQUEST_CHARS = 250;
 const INCREMENTAL_CONTEXT_MAX_CHARS = 3_300;
@@ -50,6 +50,10 @@ function isCodexInjectedContext(text: string): boolean {
     || value.startsWith("<skills_instructions>")
     || value.startsWith("<apps_instructions>")
     || value.startsWith("<plugins_instructions>")
+    || value.startsWith("<recommended_plugins>")
+    || value.startsWith("<rollout_budget>")
+    || value.startsWith("<turn_aborted>")
+    || value.startsWith("<multi_agent_mode>")
     || value.startsWith("<environment_context>");
 }
 
@@ -103,13 +107,34 @@ function uniqueLatest(values: string[]): string[] {
   return result.reverse();
 }
 
+function evenlySampleRequests(values: string[], limit: number): string[] {
+  if (values.length <= limit) return values;
+  const indexes = new Set<number>();
+  for (let slot = 0; slot < limit; slot++) {
+    indexes.add(Math.round(slot * (values.length - 1) / (limit - 1)));
+  }
+  return [...indexes]
+    .sort((left, right) => left - right)
+    .map(index => values[index]!);
+}
+
 export function selectTitleRequests(values: string[]): string[] {
-  const unique = uniqueLatest(values);
-  const latest = unique.at(-1) ?? "";
-  const limit = isContextDependentTitleRequest(latest)
-    ? CONTEXTUAL_REQUEST_COUNT
-    : NORMAL_REQUEST_COUNT;
-  return unique.slice(-limit);
+  return evenlySampleRequests(uniqueLatest(values), TITLE_REQUEST_COUNT);
+}
+
+/**
+ * Maintain a richer in-memory timeline than the 16 requests sent to the model.
+ * This lets a hot session absorb later phases without rescanning its transcript
+ * on every title refresh, while keeping memory bounded per active session.
+ */
+export function appendConversationTitleRequests(
+  existing: string[],
+  incoming: string[],
+): string[] {
+  return evenlySampleRequests(
+    uniqueLatest([...existing, ...incoming]),
+    TITLE_REQUEST_CACHE_COUNT,
+  );
 }
 
 /**
@@ -127,119 +152,112 @@ export function appendIncrementalTitleRequests(
   return [unique[0]!, ...unique.slice(-(INCREMENTAL_REQUEST_COUNT - 1))];
 }
 
-export function formatIncrementalTitleContext(values: string[]): string {
+export function formatIncrementalTitleContext(
+  values: string[],
+  maxChars = INCREMENTAL_CONTEXT_MAX_CHARS,
+): string {
   const requests = appendIncrementalTitleRequests([], values);
   if (!requests.length) return "";
+  const limit = Math.max(600, Math.floor(maxChars));
+  const requestChars = Math.max(
+    80,
+    Math.min(INCREMENTAL_REQUEST_CHARS, Math.floor((limit - 180) / requests.length) - 8),
+  );
   return [
     "Completed user requests since the previous topic summary (oldest to newest):",
-    ...requests.map((text, index) => `${index + 1}. ${text}`),
-  ].join("\n").slice(0, INCREMENTAL_CONTEXT_MAX_CHARS);
+    ...requests.map((text, index) => `${index + 1}. ${text.slice(0, requestChars)}`),
+  ].join("\n").slice(0, limit);
+}
+
+export function formatTitleRequestContext(
+  values: string[],
+  maxChars = CONTEXT_TEXT_MAX_CHARS,
+): string {
+  const requests = selectTitleRequests(values);
+  if (!requests.length) return "";
+  const limit = Math.max(800, Math.floor(maxChars));
+  const requestChars = Math.max(
+    100,
+    Math.min(REQUEST_CONTEXT_CHARS, Math.floor((limit - 320) / requests.length) - 8),
+  );
+  const rows = [
+    "CONVERSATION-WIDE USER REQUEST SAMPLE (chronological, beginning to latest):",
+    "Infer the session's overall central task from the full timeline. Treat the final entries as recent progress, not automatically as the main topic.",
+    "",
+  ];
+  requests.forEach((text, index) => {
+    rows.push(`${index + 1}. ${text.slice(0, requestChars)}`);
+  });
+  return rows.join("\n").slice(0, limit);
+}
+
+interface LocatedTitleRequest {
+  text: string;
+  ordinal: number;
 }
 
 /**
- * Put the newest request first so it cannot be truncated behind older context
- * and so recency is structural, not merely implied by chronological order.
+ * Read the complete transcript with bounded per-record memory, while retaining
+ * a uniformly compacted request timeline plus the latest requests. Sampling by
+ * user-request ordinal, rather than file bytes, prevents one huge assistant or
+ * tool record from collapsing every middle landmark onto the same request.
  */
-export function formatTitleRequestContext(values: string[]): string {
-  const requests = selectTitleRequests(values);
-  const current = requests.at(-1);
-  if (!current) return "";
-  const rows = [
-    "CURRENT REQUEST (highest priority):",
-    current.slice(0, CURRENT_REQUEST_CHARS),
-  ];
-  const older = requests.slice(0, -1).reverse();
-  if (older.length) {
-    rows.push(
-      "",
-      "RECENT CONTEXT (newest first; use only to resolve references or continuing work):",
-    );
-    older.forEach((text, index) => {
-      rows.push(`Context ${index + 1}: ${text.slice(0, SUPPORTING_REQUEST_CHARS)}`);
-    });
-  }
-  return rows.join("\n").slice(0, CONTEXT_TEXT_MAX_CHARS);
-}
-
-function parseTailRequests(
-  data: Buffer,
-  startsMidRecord: boolean,
-  agent: AgentKind,
-): string[] {
-  let text = data.toString("utf8");
-  if (startsMidRecord) {
-    const firstNewline = text.indexOf("\n");
-    if (firstNewline < 0) return [];
-    text = text.slice(firstNewline + 1);
-  }
-  const result: string[] = [];
-  for (const raw of text.split(/\r?\n/)) {
-    if (!raw || raw.length > MAX_RECORD_CHARS) continue;
-    try {
-      const record = asRecord(JSON.parse(raw));
-      if (!record) continue;
-      const request = titleRequestText(record, agent);
-      if (request) result.push(request);
-    } catch {
-      // The last record may still be in flight; malformed bookkeeping records
-      // are irrelevant to title context and are isolated here.
-    }
-  }
-  return result;
-}
-
-async function tailTitleRequests(
+export async function sessionTitleRequests(
   path: string,
   agent: AgentKind,
-  desiredCount: number,
 ): Promise<string[]> {
-  const handle = await open(path, "r");
-  try {
-    const info = await handle.stat();
-    let windowBytes = Math.min(info.size, INITIAL_TAIL_BYTES);
-    while (windowBytes > 0) {
-      const start = Math.max(0, info.size - windowBytes);
-      const data = Buffer.allocUnsafe(info.size - start);
-      let offset = 0;
-      while (offset < data.length) {
-        const read = await handle.read(data, offset, data.length - offset, start + offset);
-        if (!read.bytesRead) break;
-        offset += read.bytesRead;
+  let candidates: LocatedTitleRequest[] = [];
+  const trailing: LocatedTitleRequest[] = [];
+  let ordinal = 0;
+  let stride = 1;
+  let previousRequest = "";
+
+  for await (const line of streamJsonlLines(path, {
+    maxRecordBytes: MAX_RECORD_BYTES,
+    prefixBytes: 0,
+  })) {
+    if (!line.raw) continue;
+    try {
+      const record = asRecord(JSON.parse(line.raw));
+      if (!record) continue;
+      const request = titleRequestText(record, agent);
+      // Codex commonly records the same user input in two adjacent transport
+      // envelopes. Keep intentional later repeats out too: they add no topic
+      // information and would otherwise crowd out distinct landmarks.
+      if (!request || request.toLocaleLowerCase() === previousRequest.toLocaleLowerCase()) continue;
+      previousRequest = request;
+      const compactText = request.length <= MAX_STORED_REQUEST_CHARS
+        ? request
+        : `${request.slice(0, 1_500)} … ${request.slice(-400)}`;
+      const located = { text: compactText, ordinal: ordinal++ };
+      if (located.ordinal % stride === 0) candidates.push(located);
+      if (candidates.length > MAX_STREAM_REQUEST_CANDIDATES) {
+        stride *= 2;
+        candidates = candidates.filter(item => item.ordinal % stride === 0);
       }
-      const requests = parseTailRequests(data.subarray(0, offset), start > 0, agent);
-      const selected = selectTitleRequests(requests);
-      const latest = selected.at(-1) ?? "";
-      const required = isContextDependentTitleRequest(latest)
-        ? CONTEXTUAL_REQUEST_COUNT
-        : desiredCount;
-      if (selected.length >= required || start === 0 || windowBytes >= MAX_TAIL_BYTES) {
-        return requests;
-      }
-      windowBytes = Math.min(info.size, MAX_TAIL_BYTES, windowBytes * 2);
+      trailing.push(located);
+      if (trailing.length > TRAILING_REQUEST_COUNT) trailing.shift();
+    } catch {
+      // A partially written final record or unrelated malformed bookkeeping
+      // record cannot invalidate the rest of the conversation-wide sample.
     }
-    return [];
-  } finally {
-    await handle.close();
   }
+  const selected = [...candidates, ...trailing]
+    .sort((left, right) => left.ordinal - right.ordinal);
+  return appendConversationTitleRequests([], selected.map(item => item.text));
 }
 
 /**
- * Build one bounded, recent-first model context. A hot session with enough
- * observed prompts performs no disk read. After a backend restart (or for a
- * manual re-title), a small reverse tail read fills the missing context without
- * indexing or scanning the complete transcript.
+ * Build a bounded model context that represents the complete conversation.
+ * The scan has bounded memory and keeps only a small set of timeline landmarks,
+ * so manual re-title and restart recovery do not collapse to the last few turns.
  */
 export async function recentSessionTitleContext(
   path: string,
   agent: AgentKind,
   observedRequests: string[] = [],
 ): Promise<string> {
+  const transcript = await sessionTitleRequests(path, agent);
   const observed = selectTitleRequests(observedRequests);
-  const latest = observed.at(-1) ?? "";
-  const desired = isContextDependentTitleRequest(latest)
-    ? CONTEXTUAL_REQUEST_COUNT
-    : NORMAL_REQUEST_COUNT;
-  if (observed.length >= desired) return formatTitleRequestContext(observed);
-  const transcript = await tailTitleRequests(path, agent, desired);
   return formatTitleRequestContext([...transcript, ...observed]);
 }

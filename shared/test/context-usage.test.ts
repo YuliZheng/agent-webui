@@ -56,6 +56,96 @@ describe("Codex full context usage accumulator", () => {
     expect(result.contributors?.some((item) => item.source === "user")).toBe(true);
   });
 
+  it("counts the paired detailed and boundary records as one compaction", () => {
+    const accumulator = new CodexContextUsageAccumulator();
+    accumulator.pushRawLine(JSON.stringify({
+      timestamp: "2026-07-27T05:30:07.136Z",
+      type: "compacted",
+      payload: { message: "summary" },
+    }));
+    accumulator.pushRawLine(message("user", "new request"));
+    accumulator.pushRawLine(usage(15_000));
+    accumulator.pushRawLine(JSON.stringify({
+      timestamp: "2026-07-27T05:30:07.210Z",
+      type: "event_msg",
+      payload: { type: "context_compacted" },
+    }));
+
+    const result = accumulator.result();
+    expect(result.compactionCount).toBe(1);
+    expect(result.tokens).toBe(15_000);
+    expect(result.contributors?.some((item) => item.source === "compaction")).toBe(true);
+    expect(result.contributors?.some((item) => item.source === "user")).toBe(true);
+  });
+
+  it("rebuilds replacement history and separates the encrypted compaction summary", () => {
+    const result = summarizeCodexContextUsage([
+      message("assistant", "discarded before compaction ".repeat(200)),
+      JSON.stringify({
+        type: "compacted",
+        payload: {
+          message: "",
+          replacement_history: [
+            {
+              type: "message",
+              role: "developer",
+              content: [{ type: "input_text", text: "<environment_context>retained</environment_context>" }],
+            },
+            {
+              type: "message",
+              role: "user",
+              content: [{ type: "input_text", text: "retained request ".repeat(100) }],
+            },
+            {
+              type: "compaction",
+              encrypted_content: "x".repeat(8_000),
+            },
+            {
+              type: "agent_message",
+              author: "child-agent",
+              content: [{ type: "output_text", text: "retained child result" }],
+            },
+          ],
+        },
+      }),
+      message("user", "new request"),
+      usage(4_000),
+    ]);
+
+    expect(result.contributors?.some((item) => item.source === "assistant")).toBe(false);
+    expect(result.contributors?.find((item) => item.source === "instructions")?.tokens).toBeGreaterThan(0);
+    expect(result.contributors?.find((item) => item.source === "user")?.tokens).toBeGreaterThan(400);
+    expect(result.contributors?.find((item) => item.source === "compaction")?.tokens).toBeGreaterThan(1_000);
+    expect(result.contributors?.find((item) => item.source === "messages")?.tokens).toBeGreaterThan(0);
+    expect(result.contributors?.find((item) => item.source === "other")?.tokens).toBeLessThan(2_500);
+    expect(result.contributors?.reduce((sum, item) => sum + item.tokens, 0)).toBe(4_000);
+  });
+
+  it("keeps Codex's full-window sentinel when a turn fails before generating", () => {
+    const result = summarizeCodexContextUsage([
+      line("event_msg", {
+        type: "token_count",
+        info: {
+          last_token_usage: {
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+          },
+          total_token_usage: {
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 475_000,
+          },
+          model_context_window: 475_000,
+        },
+      }),
+    ]);
+
+    expect(result.tokens).toBe(475_000);
+    expect(result.reportedTokens).toBe(475_000);
+    expect(result.limit).toBe(450_000);
+  });
+
   it("calibrates the stable hidden Codex base separately from the changing estimate gap", () => {
     const accumulator = new CodexContextUsageAccumulator();
     accumulator.pushRawLine(message("user", "hello"));

@@ -21,6 +21,15 @@ export const TITLE_LANGUAGE_CHOICES = [
   { value: "简体中文", label: "简体中文 (Chinese)" },
 ] as const;
 
+/** Effort levels accepted by `claude --effort` (Codex has its own wider list). */
+export const CLAUDE_REASONING_EFFORTS = [
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+] as const;
+
 export const PERMISSION_MODES = [
   "default",
   "acceptEdits",
@@ -51,6 +60,8 @@ export const MODEL_CHOICES = [
 // Codex model picker list + default. Codex sessions use these instead of the
 // claude MODEL_CHOICES. Default mirrors ~/.codex/config.toml's typical model.
 export const CODEX_MODEL_CHOICES = [
+  "deepseek-v4-flash",
+  "deepseek-v4-pro",
   "gpt-5.6-sol",
   "gpt-5.6-terra",
   "gpt-5.6-luna",
@@ -164,6 +175,10 @@ export interface PrefsBlob {
   // no per-session override. Empty string means "no flag" — CLI/wrapper default
   // wins. Free-form string; the FE picker lists MODEL_CHOICES but accepts any.
   defaultModel: string;
+  // Default reasoning effort passed as `--effort` to new sessions. Empty
+  // string means "no flag" — the CLI's own default (CLAUDE_CODE_EFFORT_LEVEL)
+  // wins. One of CLAUDE_REASONING_EFFORTS when non-empty.
+  defaultClaudeEffort: string;
   // Default permission mode passed as `--permission-mode` similarly. Empty
   // string means "no flag". Must be one of PERMISSION_MODES when non-empty;
   // validated by the backend put-prefs action.
@@ -215,6 +230,7 @@ export const EMPTY_PREFS: PrefsBlob = {
   scratchEnabled: true,
   scratchDir: null,
   defaultModel: "deepseek-v4-pro",
+  defaultClaudeEffort: "",
   defaultPermissionMode: "",
   defaultCodexModel: "",
   defaultCodexEffort: "",

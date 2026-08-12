@@ -118,9 +118,6 @@ onMounted(async () => {
     else { me = await getMe(); }
     await Promise.all(tasks);
     ui.setHome(me.home);
-    // Warm tails for the most-recent sessions so the first tap is instant.
-    void live.prefetchTails();
-
     // History wiring: restore selection from URL on first load, replace the
     // initial history entry so it carries a sessionId state, and listen for
     // popstate (mouse-back / mobile back-gesture) to switch sessions.
@@ -128,6 +125,14 @@ onMounted(async () => {
     if (initialId) ui.selectFromHistory(initialId);
     initializeAppHistory(initialId);
     window.addEventListener("popstate", onPopState);
+
+    // Let a deep-linked session mount and engage its history before spending
+    // disk/CPU on background tail warming. Idle callback keeps cold-index work
+    // out of the critical first paint; the timeout fallback covers Safari.
+    const warmRecentTails = () => { void live.prefetchTails(); };
+    const idleWindow = window as typeof window & { requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number };
+    if (idleWindow.requestIdleCallback) idleWindow.requestIdleCallback(warmRecentTails, { timeout: 1500 });
+    else window.setTimeout(warmRecentTails, 250);
 
     // Re-pull the sessions list to re-anchor preview / lastTurnAt /
     // lastBoundaryAt — only `notification` events have a replay buffer
@@ -137,7 +142,7 @@ onMounted(async () => {
     // again. Debounced 5s so rapid focus-toggle / unlock spam doesn't
     // hammer the API.
     let lastResyncAt = 0;
-    let resyncWork: Promise<void> | null = null;
+    let resyncWork: Promise<boolean> | null = null;
     const RESYNC_MIN_GAP_MS = 5000;
     function resyncSessions(force = false) {
       const now = Date.now();
@@ -221,12 +226,11 @@ onMounted(async () => {
         sessions.clearAllStatus();
         resyncSessions();
         void live.prefetchTails();
-        // Force per-session re-subscribe with fresh nextLineIndex. ws.ts
-        // auto-re-subscribes after reconnect using the OLD captured `from`,
-        // which makes the backend replay the entire session every time. Cheap
-        // to fix here: tear down + re-engage anchors on what the cache already
-        // has, so backend only streams genuinely new lines.
-        void live.refreshEngaged();
+        // HTTP catch-up is independent of the rebuilt socket and closes any
+        // final gap immediately. Force this reconnect snapshot because the
+        // previous successful tail may still be inside its normal freshness
+        // window even though the disconnected interval lost new records.
+        void live.refreshEngaged(true);
       }
     });
 
@@ -261,25 +265,28 @@ onMounted(async () => {
       //       server-side replay buffer, so any session-touched /
       //       session-renamed events that fired while we were hidden are lost.
       //       resyncSessions() re-pulls the list (debounced 5s).
-      //   (3) the active chat content — even if (1) finds the socket alive,
-      //       events the backend pushed during the OS-frozen window may have
-      //       been silently dropped. Force a re-subscribe here so the backend
-      //       re-streams from the cache's current nextLineIndex.
-      // Tail re-subscribe (live.refreshEngaged) is disruptive — each call
-      // tears down + rebuilds the backend tail, and a reorder/drop among
-      // those frames can leave the session with NO tail (live.ts watchdog
-      // catches it 3s later, but mid-burst it's a real gap). Only do it
-      // once per sweep, and only when bytes could actually have been
-      // dropped: a genuine suspend froze the page, or the tab spent a long
-      // time hidden (mobile OSes drop in-flight WS bytes for backgrounded
-      // pages without freezing timers). A visible desktop tab that merely
-      // went unclicked gets neither — its socket never lost bytes.
-      const shouldRefreshTail = longSuspend || hiddenMs >= LONG_SUSPEND_MS;
+      //   (3) the active chat content — mobile lifecycle events are not
+      //       reliable enough to infer whether bytes were missed from hidden
+      //       duration alone. A short app switch can freeze/drop the socket
+      //       without crossing LONG_SUSPEND_MS. Always perform one small HTTP
+      //       tail catch-up for the open chat on foreground; it never rebuilds
+      //       the WS subscription. The retry sweep only repeats after failure.
       let refreshedTail = false;
+      let refreshTailWork: Promise<void> | null = null;
       const tryRefreshTail = () => {
-        if (!shouldRefreshTail || refreshedTail || !wsConnected.value) return;
-        refreshedTail = true;
-        void live.refreshEngaged();
+        if (refreshedTail || refreshTailWork) return;
+        const sid = ui.selectedSessionId;
+        if (!sid || sessions.isPending(sid)) {
+          refreshedTail = true;
+          return;
+        }
+        // The selected chat is the user-visible source of truth. Refresh it
+        // directly even if a lifecycle/MainPane race has not yet recreated its
+        // per-session WS subscription; idle sessions can still have a final
+        // assistant batch that the suspended phone missed.
+        refreshTailWork = live.refreshSession(sid, true)
+          .then(() => { refreshedTail = true; })
+          .finally(() => { refreshTailWork = null; });
       };
       for (const [i, delay] of RESUME_RETRY_DELAYS_MS.entries()) {
         setTimeout(() => {

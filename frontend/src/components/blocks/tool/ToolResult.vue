@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 import { useLightboxStore } from "../../../stores/lightbox.js";
+import { extractToolResultImages } from "../../../util/tool-result-images.js";
 
-const props = defineProps<{ value: unknown; isError?: boolean }>();
+const props = defineProps<{ value: unknown; isError?: boolean; hideImages?: boolean }>();
 
 interface Display { text: string; lines: number; chars: number }
 
@@ -10,19 +11,8 @@ interface Display { text: string; lines: number; chars: number }
 //   { type: "image", source: { type: "base64", media_type, data } }
 // Rendered as data-URL thumbnails; entries missing that shape fall back to
 // the literal "[image]" text in the body.
-interface ResultImage { url: string }
-
-const images = computed<ResultImage[]>(() => {
-  if (!Array.isArray(props.value)) return [];
-  const out: ResultImage[] = [];
-  for (const b of props.value as any[]) {
-    const s = b?.type === "image" ? b.source : null;
-    if (s?.type === "base64" && typeof s.media_type === "string" && typeof s.data === "string") {
-      out.push({ url: `data:${s.media_type};base64,${s.data}` });
-    }
-  }
-  return out;
-});
+const images = computed(() => extractToolResultImages(props.value));
+const visibleImages = computed(() => props.hideImages ? [] : images.value);
 
 const display = computed<Display>(() => {
   const v = props.value;
@@ -46,10 +36,10 @@ const display = computed<Display>(() => {
   return { text, lines: text.split("\n").length, chars: text.length };
 });
 
-const expanded = ref(props.isError === true);
+const expanded = ref(props.isError === true || images.value.length > 0);
 // Images count toward collapsing too: an image-only result has text="" and
 // would otherwise paint every base64 thumbnail expanded on load.
-const collapsedByDefault = computed(() => display.value.lines > 10 || display.value.chars > 1000 || images.value.length > 0);
+const collapsedByDefault = computed(() => display.value.lines > 10 || display.value.chars > 1000);
 const open = computed({
   get() { return expanded.value || !collapsedByDefault.value; },
   set(v) { expanded.value = v; },
@@ -65,15 +55,15 @@ const lightbox = useLightboxStore();
     </div>
     <template v-if="open">
       <pre v-if="display.text" class="whitespace-pre-wrap text-xs mt-1">{{ display.text }}</pre>
-      <div v-if="images.length" class="flex flex-wrap gap-2 mt-1">
+      <div v-if="visibleImages.length" class="flex flex-wrap gap-2 mt-1">
         <button
-          v-for="(img, i) in images"
+          v-for="(img, i) in visibleImages"
           :key="i"
           type="button"
-          class="block rounded overflow-hidden border border-[var(--cw-border)]  bg-[var(--cw-panel-bg)] hover:opacity-90 active:opacity-80 transition cursor-zoom-in"
+          class="flex h-[200px] w-[200px] max-w-full items-center justify-center rounded overflow-hidden border border-[var(--cw-border)]  bg-[var(--cw-panel-bg)] hover:opacity-90 active:opacity-80 transition cursor-zoom-in"
           @click.stop="lightbox.open(img.url, '[image]')"
         >
-          <img :src="img.url" alt="[image]" loading="lazy" decoding="async" class="block max-h-[200px] object-contain" />
+          <img :src="img.url" alt="[image]" loading="lazy" decoding="async" class="block max-h-full max-w-full object-contain" />
         </button>
       </div>
     </template>

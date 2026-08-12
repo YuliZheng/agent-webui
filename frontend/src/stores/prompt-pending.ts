@@ -1,8 +1,9 @@
 import { defineStore } from "pinia";
 
-// Per-session optimistic "I just hit Send" bubbles, shown at the bottom of the
-// timeline so a typed/queued message appears instantly instead of waiting for
-// the backend round-trip + the real record to land on disk.
+// Per-session optimistic "I just hit Send" bubbles, shown immediately in the
+// timeline instead of waiting for the backend round-trip + the real record to
+// land on disk. Mid-turn Codex steers are anchored at their send boundary;
+// ordinary pending/queued prompts remain at the live tail.
 //
 // Persisted to localStorage so a page refresh in the window between Send and
 // the real record landing doesn't drop the message. This matters most for
@@ -29,6 +30,9 @@ export interface PendingPrompt {
   // Physical source-line high-water mark at send time. Used by reconciliation
   // so historical identical prompts cannot clear a newly-created bubble.
   startedAtLineCount: number;
+  // Backend session-file size at send time. Lets the sidebar detect when a
+  // durable record has overtaken this optimistic entry without opening it.
+  startedAtSessionSize?: number;
   agent: "claude" | "codex";
   // codex only: the session was mid-turn at send time, so the backend routed
   // this through turn/steer (injected into the live turn) rather than
@@ -81,6 +85,19 @@ export const usePromptPendingStore = defineStore("promptPending", {
   state: (): State => ({ bySession: loadAll() }),
   getters: {
     pending: (s) => (id: string): PendingPrompt[] => s.bySession[id] ?? [],
+    latestStartedAt: (s) => (id: string): number => {
+      let latest = 0;
+      for (const entry of s.bySession[id] ?? []) {
+        if (
+          typeof entry.startedAt === "number"
+          && Number.isFinite(entry.startedAt)
+          && entry.startedAt > latest
+        ) {
+          latest = entry.startedAt;
+        }
+      }
+      return latest;
+    },
   },
   actions: {
     persist() {
@@ -95,6 +112,7 @@ export const usePromptPendingStore = defineStore("promptPending", {
         text: string;
         imageCount: number;
         startedAtLineCount: number;
+        startedAtSessionSize?: number;
         agent: "claude" | "codex";
         steered?: boolean;
         phase?: PendingPrompt["phase"];
@@ -111,6 +129,9 @@ export const usePromptPendingStore = defineStore("promptPending", {
         imageCount: entry.imageCount,
         startedAt: Date.now(),
         startedAtLineCount: entry.startedAtLineCount,
+        ...(typeof entry.startedAtSessionSize === "number"
+          ? { startedAtSessionSize: entry.startedAtSessionSize }
+          : {}),
         agent: entry.agent,
         phase: entry.phase ?? "sending",
         ...(entry.steered ? { steered: true } : {}),

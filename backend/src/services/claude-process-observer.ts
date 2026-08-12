@@ -46,7 +46,11 @@ async function forEachBounded<T>(
 }
 
 async function procStartTime(pid: number): Promise<string | undefined> {
-  if (process.platform === "win32") return undefined;
+  // /proc is Linux-specific. macOS has kill(pid, 0) for liveness, but no
+  // compatible process-start tick at this path, so treat its registrations as
+  // unverified and apply the existing age limit instead of rejecting every
+  // fresh Claude registration.
+  if (process.platform !== "linux") return undefined;
   try {
     const line = await readFile(`/proc/${pid}/stat`, "utf8");
     return line.slice(line.lastIndexOf(")") + 2).split(" ")[19];
@@ -188,7 +192,7 @@ export class ClaudeProcessObserver extends EventEmitter {
         // process identity; avoid rereading and reparsing every file every
         // fifteen seconds.
         if (!pidAlive(prior.pid)) throw new Error("Inactive registration");
-        if (prior.startTime && process.platform !== "win32") {
+        if (prior.startTime && process.platform === "linux") {
           const actualStart = await procStartTime(prior.pid);
           if (!actualStart || actualStart !== prior.startTime) throw new Error("Stale PID registration");
         } else if (Date.now() - info.mtimeMs > this.maxUnverifiedAgeMs) {
@@ -203,7 +207,7 @@ export class ClaudeProcessObserver extends EventEmitter {
         const startTime = typeof startTimeRaw === "string" || typeof startTimeRaw === "number" ? String(startTimeRaw) : undefined;
         if (!sessionId || !SESSION_ID.test(sessionId) || !Number.isSafeInteger(pid) || pid <= 0 || !pidAlive(pid)) throw new Error("Inactive registration");
         const actualStart = await procStartTime(pid);
-        if (startTime && process.platform !== "win32") {
+        if (startTime && process.platform === "linux") {
           if (!actualStart || actualStart !== startTime) throw new Error("Stale PID registration");
         } else if (Date.now() - info.mtimeMs > this.maxUnverifiedAgeMs) {
           throw new Error("Unverified registration is too old");

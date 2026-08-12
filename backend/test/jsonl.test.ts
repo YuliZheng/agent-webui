@@ -22,6 +22,7 @@ import {
   preserveIndexes,
   readRange,
   readTail,
+  readTailSnapshot,
   resetJsonlIndexIoCounters,
   snapshotJsonl,
   streamJsonlLines,
@@ -86,6 +87,16 @@ describe("JSONL indexing and tails", () => {
     expect(preserveIndexes(await readRange(path, 0), raw => raw !== "ignore")).toEqual([{ index: 0, raw: "a" }, { index: 2, raw: "c" }]);
   });
 
+  it("returns tail lines and the physical line count from one snapshot", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-webui-tail-snapshot-"));
+    const path = join(root, "a.jsonl");
+    await writeFile(path, "zero\none\ntwo\npartial");
+    expect(await readTailSnapshot(path, 2, "interactive")).toEqual({
+      lines: [{ index: 1, raw: "one" }, { index: 2, raw: "two" }],
+      lineCount: 3,
+    });
+  });
+
   it("invalidates its line index after append and keeps tail indexes absolute", async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-webui-index-")); const path = join(root, "a.jsonl");
     await writeFile(path, `${"x".repeat(1024 * 1024)}\none\ntwo\n`);
@@ -125,6 +136,36 @@ describe("JSONL indexing and tails", () => {
     resetJsonlIndexIoCounters();
     await Promise.all(paths.map(path => readTail(path, 1)));
     expect(jsonlColdIndexConcurrency()).toEqual({ active: 0, peak: 1 });
+  });
+
+  it("runs an interactive tail before queued background cold indexes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-webui-index-priority-"));
+    const blockerPath = join(root, "blocker.jsonl");
+    const backgroundPath = join(root, "background.jsonl");
+    const interactivePath = join(root, "interactive.jsonl");
+    const chunk = "x".repeat(1024 * 1024 - 1);
+    await Promise.all([
+      writeFile(blockerPath, `${Array(16).fill(chunk).join("\n")}\n`),
+      writeFile(backgroundPath, `${Array(2).fill(chunk).join("\n")}\n`),
+      writeFile(interactivePath, `${Array(2).fill(chunk).join("\n")}\n`),
+    ]);
+
+    const completionOrder: string[] = [];
+    const blocker = readTail(blockerPath, 1, "background")
+      .then(() => { completionOrder.push("blocker"); });
+    while (jsonlColdIndexConcurrency().active === 0) {
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
+    const background = readTail(backgroundPath, 1, "background")
+      .then(() => { completionOrder.push("background"); });
+    // Let the background request finish stat() and enter the permit queue while
+    // the 16 MiB blocker is still yielding between chunks.
+    await new Promise<void>(resolve => setTimeout(resolve, 10));
+    const interactive = readTail(interactivePath, 1, "interactive")
+      .then(() => { completionOrder.push("interactive"); });
+
+    await Promise.all([blocker, background, interactive]);
+    expect(completionOrder).toEqual(["blocker", "interactive", "background"]);
   });
 
   it("restores a sparse index after a backend restart and scans only appended bytes", async () => {
@@ -186,6 +227,15 @@ describe("JSONL indexing and tails", () => {
     expect(jsonlIndexIoCounters()).toEqual({ fullBytes: 0, appendedBytes: 0 });
   });
 
+  it("keeps compressed multi-image Codex records above the legacy 4 MiB ceiling", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-webui-compressed-images-"));
+    const path = join(root, "images.jsonl");
+    const record = "x".repeat(4 * 1024 * 1024 + 128 * 1024);
+    await writeFile(path, `${record}\n`);
+
+    expect((await readTail(path, 1))[0]).toEqual({ index: 0, raw: record });
+  });
+
   it("keeps line indexes in a strict least-recently-used resident bound", async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-webui-index-lru-"));
     const paths = await Promise.all(Array.from({ length: MAX_LINE_INDEX_CACHE_ENTRIES + 2 }, async (_, index) => {
@@ -226,6 +276,26 @@ describe("JSONL indexing and tails", () => {
     const lines = await readRange(path, 0, Number.MAX_SAFE_INTEGER);
     expect(lines.length).toBeLessThanOrEqual(MAX_READ_RANGE_LINES);
     expect(lines.reduce((total, item) => total + Buffer.byteLength(item.raw), 0)).toBeLessThanOrEqual(MAX_READ_RESPONSE_BYTES);
+  });
+
+  it("omits oversized records while retaining physical indexes under a compact range budget", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-webui-range-compact-"));
+    const path = join(root, "compact.jsonl");
+    const records = [
+      JSON.stringify({ type: "user", message: { content: "first" } }),
+      JSON.stringify({ type: "assistant", message: { content: "x".repeat(8_192) } }),
+    ];
+    await writeFile(path, `${records.join("\n")}\n`);
+
+    const lines = await readRange(path, 0, Number.MAX_SAFE_INTEGER, {
+      maxBytes: 512,
+      maxRecordBytes: 128,
+      priority: "interactive",
+    });
+
+    expect(lines.some(line => line.index === 1 && JSON.parse(line.raw).type === "agent-webui-record-omitted")).toBe(true);
+    expect(lines.map(line => line.index)).toEqual(expect.arrayContaining([0, 1]));
+    expect(lines.reduce((total, item) => total + Buffer.byteLength(item.raw), 0)).toBeLessThanOrEqual(512);
   });
 
   it("bounds a giant partial record and resumes at the next newline", async () => {
@@ -316,17 +386,40 @@ describe("JSONL indexing and tails", () => {
     expect(lines[1]?.prefix).toContain('"type":"file-history-snapshot"');
   });
 
-  it("resumes from from, completes partial bytes, and emits confirmed truncation", async () => {
+  it("resets an unverifiable resume cursor, completes partial bytes, and resets after truncation", async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-webui-tail-")); const path = join(root, "a.jsonl");
     await writeFile(path, "zero\none\npart"); const events: any[] = [];
     const tailer = new JsonlTailer(path, { from: 1, pollMs: 60_000, truncateVerifyMs: 5 }, event => events.push(event));
     await tailer.start();
-    expect(events[0]).toEqual({ type: "stream-truncate", keepCount: 2 });
-    expect(events[1].lines).toEqual([{ index: 1, raw: "one" }]);
+    expect(events[0]).toEqual({ type: "stream-reset" });
+    expect(events[1].lines).toEqual([{ index: 0, raw: "zero" }, { index: 1, raw: "one" }]);
     await appendFile(path, "ial\nnext\n"); await tailer.check();
     expect(events.at(-1).lines).toEqual([{ index: 2, raw: "partial" }, { index: 3, raw: "next" }]);
     await truncate(path, Buffer.byteLength("zero\n")); await tailer.check();
-    expect(events.some(event => event.type === "stream-truncate" && event.keepCount === 1)).toBe(true);
+    expect(events.slice(-2)).toEqual([
+      { type: "stream-reset" },
+      { type: "stream-batch", lines: [{ index: 0, raw: "zero" }] },
+    ]);
+    await tailer.stop();
+  });
+
+  it("does not trust a reconnect cursor after same-length bytes changed while disconnected", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-webui-reconnect-rewrite-")); const path = join(root, "a.jsonl");
+    await writeFile(path, "new-zero\nnew-one\n"); const events: any[] = [];
+    const tailer = new JsonlTailer(path, { from: 2, pollMs: 60_000 }, event => events.push(event));
+
+    await tailer.start();
+
+    expect(events).toEqual([
+      { type: "stream-reset" },
+      {
+        type: "stream-batch",
+        lines: [
+          { index: 0, raw: "new-zero" },
+          { index: 1, raw: "new-one" },
+        ],
+      },
+    ]);
     await tailer.stop();
   });
 
@@ -369,6 +462,50 @@ describe("JSONL indexing and tails", () => {
     await tailer.check();
     expect(events.some(event => event.type === "stream-reset")).toBe(true);
     expect(events.some(event => event.type === "stream-batch" && event.lines[0]?.raw === "new-zero")).toBe(true);
+    await tailer.stop();
+  });
+
+  it("resets and replays when existing lines are rewritten without changing the line count", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-webui-rewrite-same-count-")); const path = join(root, "a.jsonl");
+    await writeFile(path, "old-zero\nold-one\n"); const events: any[] = [];
+    // A fresh subscription may honor tailN, but a later rewrite must replay
+    // the full file so the client can discard every potentially stale slot.
+    const tailer = new JsonlTailer(path, { from: 0, tailN: 1, pollMs: 60_000 }, event => events.push(event));
+    await tailer.start(); events.length = 0;
+
+    // Keep both byte size and physical line count unchanged. A truncate event
+    // would incorrectly promise that the client's two cached rows are valid.
+    await new Promise(resolve => setTimeout(resolve, 5));
+    await writeFile(path, "new-zero\nnew-one\n");
+    await tailer.check();
+
+    expect(events[0]).toEqual({ type: "stream-reset" });
+    expect(events[1]).toEqual({
+      type: "stream-batch",
+      lines: [
+        { index: 0, raw: "new-zero" },
+        { index: 1, raw: "new-one" },
+      ],
+    });
+    expect(events.some(event => event.type === "stream-truncate")).toBe(false);
+    await tailer.stop();
+  });
+
+  it("resets and replaces the retained prefix when a rewrite also shrinks the file", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-webui-rewrite-shrink-")); const path = join(root, "a.jsonl");
+    await writeFile(path, "old-zero\nold-one\n"); const events: any[] = [];
+    const tailer = new JsonlTailer(path, { from: 0, pollMs: 60_000, truncateVerifyMs: 5 }, event => events.push(event));
+    await tailer.start(); events.length = 0;
+
+    await writeFile(path, "new-zero\n");
+    await tailer.check();
+
+    expect(events[0]).toEqual({ type: "stream-reset" });
+    expect(events[1]).toEqual({
+      type: "stream-batch",
+      lines: [{ index: 0, raw: "new-zero" }],
+    });
+    expect(events.some(event => event.type === "stream-truncate")).toBe(false);
     await tailer.stop();
   });
 });

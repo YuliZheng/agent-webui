@@ -8,11 +8,15 @@ import { useDraftsStore } from "../stores/drafts.js";
 import { useImageDraftsStore } from "../stores/image-drafts.js";
 import { usePromptPendingStore } from "../stores/prompt-pending.js";
 import { useBackgroundTasksStore } from "../stores/background-tasks.js";
+import { useLiveStore } from "../stores/live.js";
 import { displayCwd } from "../util/cwd-display.js";
 import { avatarGradient, avatarText, gradientForIndex, paletteColor } from "../util/avatar.js";
 import { imTime } from "../util/time.js";
 import { nowMs, formatElapsed } from "../util/now-tick.js";
 import { currentTurnBackgroundTasks } from "../util/runtime-work.js";
+import { effectiveSessionActivityIso } from "../util/session-recency.js";
+import { isReadOnlySubagentSession } from "../util/session-access.js";
+import { latestSidebarPendingPrompt } from "../util/pending-prompt-reconciliation.js";
 import { APP_BACK_PRIORITY, registerAppBackHandler } from "../util/app-back.js";
 import { setPwaLayerActive } from "../util/pwa-history.js";
 import { retitleSession, setSessionTitle } from "../api/sessions.js";
@@ -38,7 +42,9 @@ const drafts = useDraftsStore();
 const imageDrafts = useImageDraftsStore();
 const promptPending = usePromptPendingStore();
 const backgroundTasks = useBackgroundTasksStore();
+const live = useLiveStore();
 const item = computed(() => sessions.byId[props.id]);
+const isReadOnlySubagent = computed(() => isReadOnlySubagentSession(item.value));
 // Count of running background tasks (subagents / workflows / background
 // shells) for this session — small ⟳N badge next to the status dot.
 const bgRunning = computed(() => currentTurnBackgroundTasks(
@@ -47,6 +53,13 @@ const bgRunning = computed(() => currentTurnBackgroundTasks(
 ).length);
 
 const status = computed(() => sessions.statusBySession[props.id] ?? null);
+const capacityRetry = computed(() => sessions.capacityRetryBySession[props.id] ?? null);
+const capacityRetryWaitSeconds = computed(() => {
+  if (!capacityRetry.value) return 0;
+  return Math.max(0, Math.ceil(
+    (Date.parse(capacityRetry.value.retryAt) - nowMs.value) / 1_000,
+  ));
+});
 const selected = computed(() => ui.selectedSessionId === props.id);
 const cwd = computed(() => displayCwd(item.value?.cwd, ui.home));
 const cwdRaw = computed(() => item.value?.cwd ?? "");
@@ -88,12 +101,15 @@ const avatarChar = computed(() => titleEmoji.value || avatarText({
   cwd: cwdRaw.value,
   id: props.id,
 }));
-// Prefer the per-message lastTurnAt the backend sends back with each list
-// row — file mtime can be touched by sidechain writes that don't represent
-// user-visible activity. Fall back to mtime when the backend hasn't been
-// updated to populate the new field.
+// Draft edits and optimistic sends are user-visible activity immediately.
+// Otherwise prefer backend lastTurnAt; file mtime is only the compatibility
+// fallback because sidechain writes can touch it without visible activity.
 const lastActivity = computed(() => {
-  return item.value?.lastTurnAt || item.value?.mtime || "";
+  return effectiveSessionActivityIso(
+    item.value,
+    drafts.editedAt(props.id),
+    promptPending.latestStartedAt(props.id),
+  );
 });
 const timeLabel = computed(() => (lastActivity.value ? imTime(lastActivity.value) : ""));
 // Last message preview: shown as the row's secondary line. If the backend
@@ -105,10 +121,11 @@ const preview = computed(() => item.value?.preview ?? null);
 // the chat, WeChat-style. Priority order, highest first:
 //   1. Draft text the user is composing  →  "[Draft] xxx"
 //   2. Pending images attached to draft  →  "📷 N images attached"
-//   3. Optimistic prompt (just clicked Send, jsonl not yet observed)
-//   4. Claude is mid-turn (running)      →  "Claude is thinking…"
-//   5. Backend's stored last-message preview (fallback)
-type PreviewKind = "draft" | "images" | "pending" | "thinking" | "preview" | "none";
+//   3. Capacity retry in progress         →  "Model busy · retry N/M"
+//   4. Optimistic prompt (just clicked Send, jsonl not yet observed)
+//   5. Backend's stored latest visible message (user or assistant)
+//   6. Agent is mid-turn, but no visible message has landed yet
+type PreviewKind = "draft" | "images" | "retry" | "pending" | "thinking" | "preview" | "none";
 interface LivePreview { text: string; kind: PreviewKind }
 
 const livePreview = computed<LivePreview>(() => {
@@ -120,8 +137,21 @@ const livePreview = computed<LivePreview>(() => {
     return { text: `📷 ${imgCount} image${imgCount === 1 ? "" : "s"} attached`, kind: "images" };
   }
 
-  const pending = promptPending.pending(props.id);
-  const pp = pending[pending.length - 1];
+  if (capacityRetry.value) {
+    const wait = capacityRetryWaitSeconds.value > 0
+      ? ` · next in ${capacityRetryWaitSeconds.value}s`
+      : "";
+    return {
+      text: `Model busy · retry ${capacityRetry.value.attempt}/${capacityRetry.value.maxAttempts}${wait}`,
+      kind: "retry",
+    };
+  }
+
+  const pp = latestSidebarPendingPrompt(promptPending.pending(props.id), {
+    backendPreview: preview.value,
+    now: nowMs.value,
+    sessionSize: item.value?.size ?? 0,
+  });
   if (pp?.text) {
     return { text: pp.text, kind: "pending" };
   }
@@ -140,7 +170,9 @@ const livePreview = computed<LivePreview>(() => {
     // row says "thinking" for minutes with nothing visibly happening.
     const verb = sessions.compactingBySession[props.id]
       ? "🗜 Compacting context…"
-      : `${item.value?.agent === "codex" ? "Codex" : "Claude"} is thinking…`;
+      : (item.value?.previewRole === "assistant" ? preview.value : "")
+        || live.turnProgress[props.id]
+        || `${item.value?.agent === "codex" ? "Codex is starting work…" : "Claude is thinking…"}`;
     return {
       text: elapsed ? `${verb} ${elapsed}` : verb,
       kind: "thinking",
@@ -832,11 +864,16 @@ function onTitleKey(e: KeyboardEvent) {
             class="text-[9px] opacity-40 leading-none shrink-0"
             title="Manually renamed — auto-retitle skips this session until you click Auto"
           >✎</span>
+          <span
+            v-if="isReadOnlySubagent"
+            class="shrink-0 rounded bg-[color-mix(in_srgb,var(--cw-info)_14%,transparent)] px-1 py-0.5 text-[9px] font-medium leading-none text-[var(--cw-info)]"
+            title="子 Agent 记录，只读"
+          >只读</span>
         </div>
         <span
           v-if="timeLabel"
           class="cw-session-time shrink-0 text-[11px] opacity-50 leading-none whitespace-nowrap"
-          :title="item?.mtime"
+          :title="lastActivity"
         >{{ timeLabel }}</span>
       </div>
       <!-- Bottom row: preview (flex-1, truncates) + status dot / unread.
@@ -851,15 +888,23 @@ function onTitleKey(e: KeyboardEvent) {
           class="cw-session-preview flex-1 min-w-0 text-[13px] truncate"
           :class="{
             'opacity-60': livePreview.kind === 'preview',
-            'text-[var(--cw-info)]': livePreview.kind === 'draft' || livePreview.kind === 'images',
+             'text-[var(--cw-info)]': livePreview.kind === 'draft' || livePreview.kind === 'images',
+             'text-[var(--cw-warning)]': livePreview.kind === 'retry',
             'opacity-70 italic': livePreview.kind === 'thinking',
             'opacity-70': livePreview.kind === 'pending',
           }"
           :title="livePreview.text"
         >{{ livePreview.text }}</div>
         <div v-else class="flex-1 min-w-0" />
-        <div class="shrink-0 flex items-center gap-1.5 leading-none">
-          <span
+         <div class="shrink-0 flex items-center gap-1.5 leading-none">
+           <span
+             v-if="capacityRetry"
+             class="text-[11px] leading-none font-medium text-[var(--cw-warning)]"
+             :title="`Selected model is busy. Automatic retry ${capacityRetry.attempt} of ${capacityRetry.maxAttempts}.`"
+           >⟳{{ capacityRetry.attempt }}/{{ capacityRetry.maxAttempts }}<template
+             v-if="capacityRetryWaitSeconds > 0"
+           > {{ capacityRetryWaitSeconds }}s</template></span>
+           <span
             v-if="bgRunning > 0"
             class="text-[11px] leading-none text-[var(--cw-info)] flex items-center gap-0.5"
             :title="`${bgRunning} background task${bgRunning === 1 ? '' : 's'} running`"

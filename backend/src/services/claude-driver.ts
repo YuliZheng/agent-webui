@@ -28,11 +28,13 @@ export function claudeSpawnArgs(
   resumeId: string | undefined,
   model: string | undefined,
   permissionMode: string | undefined,
+  effort: string | undefined,
 ): string[] {
   const args = ["--print", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--permission-prompt-tool", "stdio"];
   if (resumeId) args.push("--resume", resumeId);
   if (model) args.push("--model", model);
   if (permissionMode) args.push("--permission-mode", permissionMode);
+  if (effort) args.push("--effort", effort);
   return args;
 }
 
@@ -124,7 +126,7 @@ export class ClaudeDriver extends EventEmitter {
         try { process.kill(pid, 0); } catch { continue; }
         if (this.owned.get(sessionId)?.child.pid === pid) continue;
         // On Linux, reject a stale registration if its recorded /proc start tick differs.
-        if (process.platform !== "win32" && value?.startTime !== undefined) {
+        if (process.platform === "linux" && value?.startTime !== undefined) {
           try {
             const statLine = await readFile(`/proc/${pid}/stat`, "utf8");
             const actual = statLine.slice(statLine.lastIndexOf(")") + 2).split(" ")[19];
@@ -163,7 +165,8 @@ export class ClaudeDriver extends EventEmitter {
     const prefs = await this.state.prefs.get();
     const model = this.effective(options.model) ?? this.effective(settings?.model) ?? this.effective(prefs.defaultClaudeModel as string | undefined);
     const permission = this.effective(options.permissionMode) ?? this.effective(settings?.permissionMode) ?? this.effective(prefs.defaultClaudePermissionMode as string | undefined);
-    const args = claudeSpawnArgs(resumeId, model, permission);
+    const effort = this.effective(options.effort) ?? this.effective(settings?.effort) ?? this.effective(prefs.defaultClaudeEffort as string | undefined);
+    const args = claudeSpawnArgs(resumeId, model, permission, effort);
     const child = this.spawnProcess(this.binary, args, {
       cwd, shell: false, stdio: ["pipe", "pipe", "pipe"], windowsHide: true,
       env: { ...process.env, AGENT_WEBUI: "1", ...(resumeId ? { AGENT_WEBUI_RESUME_SESSION_ID: resumeId } : {}) },
@@ -195,12 +198,12 @@ export class ClaudeDriver extends EventEmitter {
       const line = proc.buffer.slice(0, newline).trim(); proc.buffer = proc.buffer.slice(newline + 1);
       if (!line) continue;
       let event: Record<string, unknown> | null = null;
-      try { event = asRecord(JSON.parse(line)); } catch { this.emit("error", { sessionId: proc.sessionId, message: "Malformed Claude stream record" }); }
+      try { event = asRecord(JSON.parse(line)); } catch { this.emit("driver-error", { sessionId: proc.sessionId, message: "Malformed Claude stream record" }); }
       if (event) this.handle(proc, event);
     }
     if (proc.buffer.length > 4 * 1024 * 1024) {
       proc.buffer = "";
-      this.emit("error", { sessionId: proc.sessionId, message: "Claude produced an oversized unframed response; stream buffer was reset" });
+      this.emit("driver-error", { sessionId: proc.sessionId, message: "Claude produced an oversized unframed response; stream buffer was reset" });
     }
   }
 

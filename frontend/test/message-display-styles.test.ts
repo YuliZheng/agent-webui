@@ -170,13 +170,23 @@ describe("message display style CSS", () => {
 
   it("treats Fast as a last-choice-wins Codex service-tier toggle", () => {
     expect(pillRowVue).toContain('setSessionServiceTier');
-    expect(pillRowVue).toContain('return tier === "priority"');
+    expect(pillRowVue).toContain('getAgentCapabilities');
     expect(pillRowVue).toContain('pendingFastTier.value = next');
     expect(pillRowVue).toContain('while (pendingFastTier.value !== null)');
     expect(pillRowVue).toContain('pendingFastTier.value === requested');
-    expect(pillRowVue).toContain(':aria-pressed="fastMode"');
+    expect(pillRowVue).toContain('const fastSupported = computed');
+    expect(pillRowVue).toContain('const confirmedTier = requested === "priority" ? "priority" : "standard"');
+    expect(pillRowVue).toContain('fastSupportKnown');
+    expect(pillRowVue).toContain('fastUnavailable');
+    expect(pillRowVue).toContain(':disabled="fastUnavailable"');
+    expect(pillRowVue).toContain('applies from the next turn');
+    expect(pillRowVue).toContain(':aria-pressed="fastKnown ? fastMode : \'mixed\'"');
     expect(pillRowVue).toContain(':aria-busy="fastBusy"');
     expect(pillRowVue).not.toContain(':disabled="fastBusy"');
+    const existingSessionTier = pillRowVue.indexOf("return codexEff.value.serviceTier;");
+    const capabilityDefaultTier = pillRowVue.indexOf("const defaultTier = codexCapabilities.value?.defaults.serviceTier;");
+    expect(existingSessionTier).toBeGreaterThan(-1);
+    expect(capabilityDefaultTier).toBeGreaterThan(existingSessionTier);
     expect(pillRowVue).toContain('class="pill-pop-item pill-pop-fast"');
     expect(pillRowVue).toContain("'pill-pop-fast-active': fastMode");
     expect(pillRowVue).toContain('class="fast-toggle"');

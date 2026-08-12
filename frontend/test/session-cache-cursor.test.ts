@@ -29,4 +29,32 @@ describe("session cache physical cursor", () => {
     expect(cache.bySession["cursor-b"]?.lines).toHaveLength(3);
     await cache.clear("cursor-b");
   });
+
+  it("atomically replaces the old snapshot with a shorter reset replay", async () => {
+    const cache = useSessionCacheStore();
+    cache.appendBatch("rewrite-a", [
+      { index: 0, raw: "old-zero" },
+      { index: 1, raw: "old-one" },
+    ]);
+
+    cache.replaceBatch("rewrite-a", [
+      { index: 0, raw: "new-zero" },
+    ]);
+
+    expect(cache.bySession["rewrite-a"]?.lines).toEqual(["new-zero"]);
+    expect(cache.bySession["rewrite-a"]?.nextLineIndex).toBe(1);
+    await cache.clear("rewrite-a");
+  });
+
+  it("replaces an oversized-record placeholder when a larger backend replays the exact line", async () => {
+    const cache = useSessionCacheStore();
+    cache.appendBatch("images-a", [{
+      index: 4,
+      raw: JSON.stringify({ type: "agent-webui-record-omitted", bytes: 4_500_000 }),
+    }]);
+    cache.appendBatch("images-a", [{ index: 4, raw: JSON.stringify({ type: "response_item", payload: { type: "message" } }) }]);
+
+    expect(cache.bySession["images-a"]?.lines[4]).toContain('"type":"response_item"');
+    await cache.clear("images-a");
+  });
 });

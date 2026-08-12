@@ -10,6 +10,7 @@ vi.mock("../src/api/ws.js", () => ({
 import {
   isForwardedSlashCommand,
   clearSessionGoal,
+  getAgentCapabilities,
   getSessionGoal,
   listSessions,
   newSession,
@@ -32,7 +33,7 @@ describe("sessions API slash command escaping", () => {
     expect(requestMock).toHaveBeenCalledWith(
       "prompt",
       { sessionId: "s1", prompt: " /not-a-command", images: [] },
-      { timeoutMs: 30_000 },
+      { timeoutMs: 90_000 },
     );
   });
 
@@ -41,7 +42,7 @@ describe("sessions API slash command escaping", () => {
     expect(requestMock).toHaveBeenCalledWith(
       "prompt",
       { sessionId: "s1", prompt: "/compact", images: [] },
-      { timeoutMs: 30_000 },
+      { timeoutMs: 90_000 },
     );
   });
 
@@ -50,26 +51,43 @@ describe("sessions API slash command escaping", () => {
     expect(requestMock).toHaveBeenCalledWith(
       "prompt",
       { sessionId: "s1", prompt: "/init", images: [] },
-      { timeoutMs: 30_000 },
+      { timeoutMs: 90_000 },
     );
   });
 
-  it("forwards the WebSocket dispatch callback without changing the payload", async () => {
+  it("forwards dispatch and safely retries an idempotent prompt across reconnects", async () => {
     const onDispatched = vi.fn();
     await sendPrompt("s1", "hello", undefined, "client-1", undefined, onDispatched);
     expect(requestMock).toHaveBeenCalledWith(
       "prompt",
       { sessionId: "s1", prompt: "hello", images: [], clientUuid: "client-1" },
-      { timeoutMs: 30_000, onSent: onDispatched },
+      { timeoutMs: 90_000, onSent: onDispatched, retryOnReconnect: true },
     );
   });
 
   it("sends Fast as the priority service tier instead of a reasoning effort", async () => {
-    await setSessionServiceTier("s1", "priority");
+    requestMock.mockResolvedValueOnce({ applies: "next-turn" });
+    await expect(setSessionServiceTier("s1", "priority")).resolves.toBe("next-turn");
     expect(requestMock).toHaveBeenCalledWith(
       "set-service-tier",
       { sessionId: "s1", serviceTier: "priority" },
     );
+  });
+
+  it("requests Codex model service-tier capabilities for the current cwd", async () => {
+    const capabilities = {
+      agent: "codex",
+      models: [],
+      permissionModes: [],
+      sandboxModes: [],
+      defaults: { serviceTier: "priority" },
+    };
+    requestMock.mockResolvedValueOnce(capabilities);
+    await expect(getAgentCapabilities("codex", "C:\\work")).resolves.toEqual(capabilities);
+    expect(requestMock).toHaveBeenCalledWith("get-agent-capabilities", {
+      agent: "codex",
+      cwd: "C:\\work",
+    });
   });
 
   it("preserves an explicit Fast-off override when creating a draft session", async () => {
@@ -126,17 +144,66 @@ describe("sessions API HTTP reads", () => {
     })) as unknown as typeof fetch;
     vi.stubGlobal("fetch", fetchMock);
 
-    await readSessionTail("abc/def", 200);
+    await readSessionTail("abc/def", 200, "interactive");
     await readSessionRange("abc/def", 10, 20);
+    await readSessionRange("abc/def", 10, 20, { mode: "compact" });
 
-    expect(fetchMock).toHaveBeenCalledWith("/api/sessions/abc%2Fdef/tail?n=200", {
-      credentials: "include",
-      cache: "no-store",
-    });
-    expect(fetchMock).toHaveBeenCalledWith("/api/sessions/abc%2Fdef/range?from=10&to=20", {
-      credentials: "include",
-      cache: "no-store",
-    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/sessions/abc%2Fdef/tail?n=200&priority=interactive",
+      expect.objectContaining({
+        credentials: "include",
+        cache: "no-store",
+        signal: expect.any(AbortSignal),
+      }),
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/sessions/abc%2Fdef/range?from=10&to=20",
+      expect.objectContaining({
+        credentials: "include",
+        cache: "no-store",
+        signal: expect.any(AbortSignal),
+      }),
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/sessions/abc%2Fdef/range?from=10&to=20&mode=compact",
+      expect.objectContaining({
+        credentials: "include",
+        cache: "no-store",
+        signal: expect.any(AbortSignal),
+      }),
+    );
+  });
+
+  it("aborts a wedged mobile tail request instead of showing syncing forever", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = vi.fn((_url: RequestInfo | URL, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new Error("tail aborted")), { once: true });
+      })) as unknown as typeof fetch;
+      vi.stubGlobal("fetch", fetchMock);
+
+      const result = expect(readSessionTail("slow", 60)).rejects.toThrow("tail aborted");
+      await vi.advanceTimersByTimeAsync(8_000);
+      await result;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("aborts a wedged history-range request so loading earlier stays retryable", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = vi.fn((_url: RequestInfo | URL, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new Error("range aborted")), { once: true });
+      })) as unknown as typeof fetch;
+      vi.stubGlobal("fetch", fetchMock);
+
+      const result = expect(readSessionRange("slow", 0, 200)).rejects.toThrow("range aborted");
+      await vi.advanceTimersByTimeAsync(8_000);
+      await result;
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("requests a server-side full-rollout usage summary without transcript rows", async () => {

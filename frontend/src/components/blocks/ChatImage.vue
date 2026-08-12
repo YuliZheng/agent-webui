@@ -31,13 +31,17 @@ const loaded = ref(false);
 // recover them, because the other full-res images still hold the budget).
 // The lightbox (open handler in the parent) still loads the full original.
 const thumbSrc = computed(() =>
-  `${props.src}${props.src.includes("?") ? "&" : "?"}thumb=1`,
+  props.src.startsWith("data:")
+    ? props.src
+    : `${props.src}${props.src.includes("?") ? "&" : "?"}thumb=1`,
 );
 // Cache-bust on retry only — first load uses the clean thumb URL so the normal
 // HTTP cache still works. `&r=N` forces the browser to re-fetch + re-decode
 // rather than reuse the failed-decode cache entry.
 const effectiveSrc = computed(() =>
-  retry.value === 0 ? thumbSrc.value : `${thumbSrc.value}&r=${retry.value}`,
+  retry.value === 0 || props.src.startsWith("data:")
+    ? thumbSrc.value
+    : `${thumbSrc.value}&r=${retry.value}`,
 );
 
 function onError() {
@@ -69,7 +73,7 @@ function manualReload() {
 const dims = ref<{ w: number; h: number } | null>(null);
 const dimsLabel = computed(() => (dims.value ? `${dims.value.w}×${dims.value.h}` : ""));
 onMounted(async () => {
-  if (!props.compact) return;
+  if (!props.compact || props.src.startsWith("data:")) return;
   try {
     const url = `${props.src}${props.src.includes("?") ? "&" : "?"}meta=1`;
     const r = await fetch(url, { credentials: "same-origin" });
@@ -129,7 +133,7 @@ onMounted(async () => {
   <button
     v-else
     type="button"
-    class="block rounded overflow-hidden border border-[color:color-mix(in_srgb,var(--cw-accent)_30%,transparent)] bg-[var(--cw-panel-bg)] hover:opacity-90 active:opacity-80 transition cursor-zoom-in"
+    class="flex h-40 w-[12rem] items-center justify-center rounded overflow-hidden border border-[color:color-mix(in_srgb,var(--cw-accent)_30%,transparent)] bg-[var(--cw-panel-bg)] hover:opacity-90 active:opacity-80 transition cursor-zoom-in"
     @click="emit('open')"
     :title="alt"
   >
@@ -138,7 +142,7 @@ onMounted(async () => {
       :alt="alt"
       loading="lazy"
       decoding="async"
-      class="block max-h-40 max-w-[12rem] object-contain"
+      class="block max-h-full max-w-full object-contain"
       @error="onError"
       @load="onLoad"
     />

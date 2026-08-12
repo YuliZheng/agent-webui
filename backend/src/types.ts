@@ -15,6 +15,7 @@ export interface SessionListItem {
   parentSessionId?: string | null;
   status?: ProcessStatus | null;
   preview?: string | null;
+  previewRole?: "user" | "assistant" | null;
   lastTurnAt?: string | null;
   lastBoundaryAt?: string | null;
   readAt?: string | null;
