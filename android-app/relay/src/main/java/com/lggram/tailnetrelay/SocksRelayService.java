@@ -6,7 +6,11 @@ import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Intent;
+import android.content.pm.ServiceInfo;
+import android.os.Build;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.util.Log;
 
 import java.io.IOException;
@@ -30,9 +34,12 @@ public final class SocksRelayService extends Service {
     private static final String CHANNEL_ID = "tailnet_relay";
     private static final int NOTIFICATION_ID = 1;
     private static final int CONNECT_TIMEOUT_MS = 10_000;
+    private static final long HEALTH_CHECK_MS = 15_000;
 
     private static final AtomicBoolean RUNNING = new AtomicBoolean(false);
+    private static final AtomicBoolean SOCKS_STARTING = new AtomicBoolean(false);
     private static final AtomicBoolean SOCKS_LISTENING = new AtomicBoolean(false);
+    private static final AtomicInteger SOCKS_RESTART_FAILURES = new AtomicInteger(0);
     private static final AtomicInteger WEB_LISTENERS = new AtomicInteger(0);
     private static final AtomicInteger ACTIVE_CONNECTIONS = new AtomicInteger(0);
     private static final AtomicLong TOTAL_CONNECTIONS = new AtomicLong(0);
@@ -40,10 +47,13 @@ public final class SocksRelayService extends Service {
 
     private final ExecutorService acceptExecutor = Executors.newFixedThreadPool(3);
     private final ExecutorService connectionExecutor = Executors.newCachedThreadPool();
+    private final Handler healthHandler = new Handler(Looper.getMainLooper());
+    private final Runnable healthCheck = this::runHealthCheck;
     private final ReverseProxyServer windowsWebBridge = createWebBridge(RelayTarget.WINDOWS);
     private final ReverseProxyServer macbookWebBridge = createWebBridge(RelayTarget.MACBOOK);
     private final ReverseProxyServer[] webBridges = { windowsWebBridge, macbookWebBridge };
     private volatile ServerSocket socksServerSocket;
+    private volatile boolean explicitStop;
 
     private ReverseProxyServer createWebBridge(RelayTarget target) {
         return new ReverseProxyServer(
@@ -103,14 +113,26 @@ public final class SocksRelayService extends Service {
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         if (intent != null && ACTION_STOP.equals(intent.getAction())) {
+            explicitStop = true;
+            RelayRestartScheduler.cancel(this);
             stopRelay();
             stopSelf();
             return START_NOT_STICKY;
         }
 
+        explicitStop = false;
         createNotificationChannel();
-        startForeground(NOTIFICATION_ID, buildNotification());
+        Notification notification = buildNotification();
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(
+                    NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
+        } else {
+            startForeground(NOTIFICATION_ID, notification);
+        }
         startRelayIfNeeded();
+        RelayRestartScheduler.scheduleRegular(this);
         return START_STICKY;
     }
 
@@ -121,48 +143,98 @@ public final class SocksRelayService extends Service {
 
     @Override
     public void onDestroy() {
+        boolean shouldRecover = !explicitStop && RUNNING.get();
         stopRelay();
         acceptExecutor.shutdownNow();
         connectionExecutor.shutdownNow();
+        if (shouldRecover) RelayRestartScheduler.scheduleAfterTaskRemoved(this);
         super.onDestroy();
+    }
+
+    @Override
+    public void onTaskRemoved(Intent rootIntent) {
+        if (!explicitStop && RUNNING.get()) {
+            RelayRestartScheduler.scheduleAfterTaskRemoved(this);
+        }
+        super.onTaskRemoved(rootIntent);
     }
 
     private void startRelayIfNeeded() {
         if (RUNNING.compareAndSet(false, true)) {
             lastError = "";
-            startSocksListener();
         }
+        startSocksListenerIfNeeded();
         for (ReverseProxyServer webBridge : webBridges) webBridge.start();
+        scheduleHealthCheck();
     }
 
-    private void startSocksListener() {
-        acceptExecutor.execute(() -> {
-            try {
-                ServerSocket listener = new ServerSocket();
-                listener.setReuseAddress(true);
-                listener.bind(new InetSocketAddress(
-                        InetAddress.getByName(RelayPolicy.LISTEN_HOST),
-                        RelayPolicy.LISTEN_PORT));
-                socksServerSocket = listener;
-                SOCKS_LISTENING.set(true);
-                Log.i(TAG, "Listening on " + RelayPolicy.LISTEN_HOST + ":"
-                        + RelayPolicy.LISTEN_PORT);
-                refreshNotification();
-                while (RUNNING.get()) {
-                    Socket client = listener.accept();
-                    client.setTcpNoDelay(true);
-                    connectionExecutor.execute(() -> handleClient(client));
+    private void runHealthCheck() {
+        if (!RUNNING.get()) return;
+        startSocksListenerIfNeeded();
+        for (ReverseProxyServer webBridge : webBridges) webBridge.start();
+        healthHandler.postDelayed(healthCheck, HEALTH_CHECK_MS);
+    }
+
+    private void scheduleHealthCheck() {
+        healthHandler.removeCallbacks(healthCheck);
+        if (RUNNING.get()) healthHandler.postDelayed(healthCheck, HEALTH_CHECK_MS);
+    }
+
+    private void startSocksListenerIfNeeded() {
+        if (!RUNNING.get()
+                || SOCKS_LISTENING.get()
+                || !SOCKS_STARTING.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            acceptExecutor.execute(() -> {
+                ServerSocket listener = null;
+                try {
+                    listener = new ServerSocket();
+                    listener.setReuseAddress(true);
+                    listener.bind(new InetSocketAddress(
+                            InetAddress.getByName(RelayPolicy.LISTEN_HOST),
+                            RelayPolicy.LISTEN_PORT));
+                    socksServerSocket = listener;
+                    SOCKS_LISTENING.set(true);
+                    SOCKS_RESTART_FAILURES.set(0);
+                    Log.i(TAG, "Listening on " + RelayPolicy.LISTEN_HOST + ":"
+                            + RelayPolicy.LISTEN_PORT);
+                    refreshNotification();
+                    while (RUNNING.get()) {
+                        Socket client = listener.accept();
+                        client.setTcpNoDelay(true);
+                        connectionExecutor.execute(() -> handleClient(client));
+                    }
+                } catch (IOException error) {
+                    if (RUNNING.get()) {
+                        recordError("SOCKS listener failed", error);
+                    }
+                } finally {
+                    SOCKS_LISTENING.set(false);
+                    SOCKS_STARTING.set(false);
+                    clearSocksServerSocket(listener);
+                    if (RUNNING.get()) {
+                        int failures = SOCKS_RESTART_FAILURES.incrementAndGet();
+                        long retryMs = RelayRetryPolicy.listenerRetryDelayMs(failures);
+                        healthHandler.postDelayed(this::startSocksListenerIfNeeded, retryMs);
+                        refreshNotification();
+                    }
                 }
-            } catch (IOException error) {
-                if (RUNNING.get()) {
-                    recordError("SOCKS listener failed", error);
-                }
-            } finally {
-                SOCKS_LISTENING.set(false);
-                closeSocksServerSocket();
-                refreshNotification();
+            });
+        } catch (RuntimeException error) {
+            // A health callback can race Service.onDestroy() after its RUNNING
+            // check but before the executor is shut down. Never let that
+            // rejected submission crash the main thread or pin STARTING=true.
+            SOCKS_STARTING.set(false);
+            Log.w(TAG, "SOCKS listener restart was rejected", error);
+            if (RUNNING.get()) {
+                int failures = SOCKS_RESTART_FAILURES.incrementAndGet();
+                healthHandler.postDelayed(
+                        this::startSocksListenerIfNeeded,
+                        RelayRetryPolicy.listenerRetryDelayMs(failures));
             }
-        });
+        }
     }
 
     private void handleClient(Socket client) {
@@ -226,7 +298,7 @@ public final class SocksRelayService extends Service {
     private void recordError(String context, IOException error) {
         lastError = error.getClass().getSimpleName() + ": " + error.getMessage();
         Log.w(TAG, context, error);
-        refreshNotification();
+        if (RUNNING.get()) refreshNotification();
     }
 
     private void relayBidirectionally(Socket client, Socket tailnet) throws IOException {
@@ -269,7 +341,10 @@ public final class SocksRelayService extends Service {
 
     private void stopRelay() {
         RUNNING.set(false);
+        healthHandler.removeCallbacksAndMessages(null);
+        SOCKS_STARTING.set(false);
         SOCKS_LISTENING.set(false);
+        SOCKS_RESTART_FAILURES.set(0);
         WEB_LISTENERS.set(0);
         for (ReverseProxyServer webBridge : webBridges) webBridge.stop();
         closeSocksServerSocket();
@@ -279,6 +354,17 @@ public final class SocksRelayService extends Service {
     private void closeSocksServerSocket() {
         ServerSocket listener = socksServerSocket;
         socksServerSocket = null;
+        if (listener != null) {
+            try {
+                listener.close();
+            } catch (IOException ignored) {
+                // Already closed.
+            }
+        }
+    }
+
+    private void clearSocksServerSocket(ServerSocket listener) {
+        if (socksServerSocket == listener) socksServerSocket = null;
         if (listener != null) {
             try {
                 listener.close();
@@ -315,14 +401,6 @@ public final class SocksRelayService extends Service {
                 activityIntent,
                 PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
 
-        Intent stopIntent = new Intent(this, SocksRelayService.class)
-                .setAction(ACTION_STOP);
-        PendingIntent stopPendingIntent = PendingIntent.getService(
-                this,
-                1,
-                stopIntent,
-                PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
-
         String status;
         if (!isRunning()) {
             status = "Starting SOCKS " + RelayPolicy.LISTEN_PORT
@@ -341,12 +419,6 @@ public final class SocksRelayService extends Service {
                 .setContentIntent(activityPendingIntent)
                 .setOngoing(true)
                 .setCategory(Notification.CATEGORY_SERVICE)
-                .addAction(
-                        new Notification.Action.Builder(
-                                null,
-                                getString(R.string.notification_stop),
-                                stopPendingIntent)
-                                .build())
                 .build();
     }
 

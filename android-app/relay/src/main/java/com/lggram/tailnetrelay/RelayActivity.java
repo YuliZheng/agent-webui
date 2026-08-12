@@ -1,11 +1,15 @@
 package com.lggram.tailnetrelay;
 
+import android.Manifest;
 import android.annotation.SuppressLint;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.ActivityNotFoundException;
 import android.content.Intent;
 import android.graphics.Typeface;
+import android.content.pm.PackageManager;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -98,7 +102,7 @@ public final class RelayActivity extends Activity {
 
         Button stop = new Button(this);
         stop.setText("Stop relay");
-        stop.setOnClickListener(view -> stopRelay());
+        stop.setOnClickListener(view -> confirmStopRelay());
         if (!managedProfile) {
             stop.setVisibility(View.GONE);
         }
@@ -106,6 +110,7 @@ public final class RelayActivity extends Activity {
 
         setContentView(root);
         if (managedProfile) {
+            requestNotificationPermissionIfNeeded();
             startRelay();
         }
     }
@@ -129,6 +134,16 @@ public final class RelayActivity extends Activity {
         handler.postDelayed(this::updateStatus, 250);
     }
 
+    private void requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(
+                    new String[] { Manifest.permission.POST_NOTIFICATIONS },
+                    7302);
+        }
+    }
+
     private void stopRelay() {
         if (!managedProfile) {
             return;
@@ -137,6 +152,18 @@ public final class RelayActivity extends Activity {
                 .setAction(SocksRelayService.ACTION_STOP);
         startService(intent);
         handler.postDelayed(this::updateStatus, 250);
+    }
+
+    private void confirmStopRelay() {
+        if (!managedProfile) {
+            return;
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("Stop Tailnet Relay?")
+                .setMessage("Personal-profile Agent links will stop working until the relay is started again.")
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Stop relay", (dialog, which) -> stopRelay())
+                .show();
     }
 
     private void openAgentWebUi(RelayTarget target) {
@@ -169,6 +196,7 @@ public final class RelayActivity extends Activity {
                 ? "Status: running"
                 : "Status: starting or stopped");
         status.append("\nMode: work SOCKS + two Web bridges");
+        status.append("\nRecovery: listener self-heal + 15 min watchdog");
         status.append("\nActive connections: ")
                 .append(SocksRelayService.activeConnections());
         status.append("\nTotal connections: ")
