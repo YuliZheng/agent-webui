@@ -9,8 +9,8 @@ import {
 } from "../src/services/session-title-generator.js";
 
 describe("Codex session title generation", () => {
-  it("uses the requested lightweight 5.3 Codex model", () => {
-    expect(SESSION_TITLE_MODEL).toBe("gpt-5.3-codex-spark");
+  it("uses Luna for lightweight background title generation", () => {
+    expect(SESSION_TITLE_MODEL).toBe("gpt-5.6-luna");
     expect(SESSION_TITLE_REASONING_EFFORT).toBe("low");
   });
 

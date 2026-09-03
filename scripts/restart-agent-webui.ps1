@@ -20,13 +20,39 @@ param(
   [ValidateNotNullOrEmpty()]
   [string]$ListenHost = "0.0.0.0",
 
+  [ValidateRange(5, 300)]
+  [int]$StartupTimeoutSeconds = 60,
+
+  [ValidateRange(5, 86400)]
+  [int]$ShutdownTimeoutSeconds = 60,
+
+  [ValidateRange(5, 86400)]
+  [int]$DrainTimeoutSeconds = 7200,
+
+  [ValidateRange(5, 86400)]
+  [int]$DrainNoProgressTimeoutSeconds = 3600,
+
+  [ValidateRange(1, 30)]
+  [int]$DrainReadyGraceSeconds = 3,
+
+  [string]$AccessToken = "",
+
   [switch]$ForceBuild,
   [switch]$BuildOnly,
   [switch]$StartOnly,
 
+  # Wait for every active turn, including restart-safe persistent turns. This
+  # closes the race between an external idle check and the actual drain.
+  [switch]$RequireFullyIdle,
+
   # Refuse to stop an unrelated port owner by default. Use this only after
   # manually confirming that the process on -Port is safe to terminate.
-  [switch]$ForcePortOwner
+  [switch]$ForcePortOwner,
+
+  # Explicit break-glass switches. Normal restarts never interrupt active turns
+  # and never force-kill a backend that is still shutting down.
+  [switch]$ForceActiveTurns,
+  [switch]$ForceShutdown
 )
 
 Set-StrictMode -Version Latest
@@ -220,6 +246,180 @@ function Test-AgentWebuiProcess($processInfo, $knownPid) {
   )
 }
 
+function Get-ObjectPropertyValue($object, [string]$name) {
+  if ($null -eq $object) { return $null }
+  $property = $object.PSObject.Properties |
+    Where-Object { $_.Name -eq $name } |
+    Select-Object -First 1
+  if ($property) { return $property.Value }
+  return $null
+}
+
+function Get-DrainAccessToken {
+  if ($AccessToken.Trim()) { return $AccessToken.Trim() }
+  if ([string]$env:AGENT_WEBUI_TOKEN) { return ([string]$env:AGENT_WEBUI_TOKEN).Trim() }
+  $tokenPath = Join-Path ([Environment]::GetFolderPath("UserProfile")) ".agent-webui\token"
+  if (-not (Test-Path -LiteralPath $tokenPath -PathType Leaf)) {
+    throw "Cannot drain Agent WebUI without an access token. Pass -AccessToken or set AGENT_WEBUI_TOKEN."
+  }
+  $value = (Get-Content -LiteralPath $tokenPath -Raw).Trim()
+  if (-not $value) { throw "Agent WebUI token file is empty: $tokenPath" }
+  return $value
+}
+
+function Invoke-AgentWebuiRequest($client, [string]$method, [string]$path) {
+  $httpMethod = switch ($method) {
+    "GET" { [Net.Http.HttpMethod]::Get }
+    "POST" { [Net.Http.HttpMethod]::Post }
+    "DELETE" { [Net.Http.HttpMethod]::Delete }
+    default { throw "Unsupported HTTP method: $method" }
+  }
+  $request = [Net.Http.HttpRequestMessage]::new($httpMethod, "http://127.0.0.1:$Port$path")
+  if ($method -eq "POST") {
+    $request.Content = [Net.Http.StringContent]::new("{}", [Text.Encoding]::UTF8, "application/json")
+  }
+  try {
+    $response = $client.SendAsync($request).GetAwaiter().GetResult()
+    try {
+      $content = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+      $body = $null
+      if ($content) {
+        try { $body = $content | ConvertFrom-Json } catch { $body = $content }
+      }
+      return [pscustomobject]@{ StatusCode = [int]$response.StatusCode; Body = $body }
+    } finally {
+      $response.Dispose()
+    }
+  } finally {
+    $request.Dispose()
+  }
+}
+
+function Cancel-AgentWebuiDrain {
+  try {
+    $client = [Net.Http.HttpClient]::new()
+    $client.Timeout = [TimeSpan]::FromSeconds(5)
+    $client.DefaultRequestHeaders.Authorization = [Net.Http.Headers.AuthenticationHeaderValue]::new("Bearer", (Get-DrainAccessToken))
+    try { [void](Invoke-AgentWebuiRequest $client "DELETE" "/api/admin/drain") } finally { $client.Dispose() }
+  } catch {
+    Write-Warning "Could not cancel drain mode automatically: $($_.Exception.Message)"
+  }
+}
+
+function Wait-ExistingServerDrain {
+  $owners = @(Get-ListeningProcessIds)
+  if (-not $owners.Count) { return $false }
+
+  $knownPid = 0
+  if (Test-Path -LiteralPath $pidPath -PathType Leaf) {
+    [void][int]::TryParse((Get-Content -LiteralPath $pidPath -Raw).Trim(), [ref]$knownPid)
+  }
+  foreach ($processId in $owners) {
+    $processInfo = Get-CimInstance Win32_Process -Filter "ProcessId = $processId"
+    if (-not (Test-AgentWebuiProcess $processInfo $knownPid)) {
+      if ($ForcePortOwner) {
+        Write-Warning "Skipping drain because port $Port is owned by an unrecognized process; no access token was sent to it."
+        return $false
+      }
+      throw "Refusing to send the drain credential to unrecognized port owner PID $processId."
+    }
+  }
+
+  if ($ForceActiveTurns) {
+    Write-Warning "-ForceActiveTurns bypassed the active-turn drain. Running conversations may be interrupted."
+    return $false
+  }
+
+  $client = [Net.Http.HttpClient]::new()
+  $client.Timeout = [TimeSpan]::FromSeconds(10)
+  $client.DefaultRequestHeaders.Authorization = [Net.Http.Headers.AuthenticationHeaderValue]::new("Bearer", (Get-DrainAccessToken))
+  $supportsDrain = $false
+  try {
+    $started = Invoke-AgentWebuiRequest $client "POST" "/api/admin/drain"
+    if ($started.StatusCode -eq 404) {
+      Write-Warning "The running backend predates the drain endpoint. Using a one-time authenticated idle check; new turns cannot be blocked until this upgrade completes."
+    } elseif ($started.StatusCode -ge 200 -and $started.StatusCode -lt 300) {
+      $supportsDrain = $true
+      Write-Host "Restart handoff enabled; persistent Codex turns remain accepted while non-migratable work is paused." -ForegroundColor Yellow
+    } else {
+      throw "Drain request failed with HTTP $($started.StatusCode)."
+    }
+
+    $wallDeadline = (Get-Date).AddSeconds($DrainTimeoutSeconds)
+    $progressDeadline = (Get-Date).AddSeconds($DrainNoProgressTimeoutSeconds)
+    $readySince = $null
+    $lastFingerprint = $null
+    while ($true) {
+      if ($supportsDrain) {
+        $status = Invoke-AgentWebuiRequest $client "GET" "/api/admin/drain"
+        if ($status.StatusCode -ne 200) { throw "Drain status failed with HTTP $($status.StatusCode)." }
+        $active = @($status.Body.activeTurns)
+        $activeCount = [int]$status.Body.activeCount
+        $blockingValue = Get-ObjectPropertyValue $status.Body "blockingActiveCount"
+        $blockingActiveCount = if ($null -eq $blockingValue) { $activeCount } else { [int]$blockingValue }
+        $admissionCount = [int]$status.Body.admissionCount
+        $ready = if ($RequireFullyIdle) {
+          $activeCount -eq 0 -and $admissionCount -eq 0
+        } else {
+          [bool]$status.Body.ready
+        }
+      } else {
+        $status = Invoke-AgentWebuiRequest $client "GET" "/api/sessions"
+        if ($status.StatusCode -ne 200) { throw "Legacy idle check failed with HTTP $($status.StatusCode)." }
+        $sessionList = Get-ObjectPropertyValue $status.Body "sessions"
+        $sessions = if ($null -ne $sessionList) { @($sessionList) } else { @($status.Body) }
+        $active = @($sessions | Where-Object {
+          $statusValue = Get-ObjectPropertyValue $_ "status"
+          $aliveValue = Get-ObjectPropertyValue $_ "webuiAlive"
+          $statusValue -eq "running" -and $aliveValue -ne $false
+        })
+        $activeCount = $active.Count
+        $blockingActiveCount = $activeCount
+        $admissionCount = 0
+        $ready = $activeCount -eq 0
+      }
+
+      $ids = @($active | ForEach-Object {
+        $sessionId = Get-ObjectPropertyValue $_ "sessionId"
+        if ($sessionId) { $sessionId }
+        else { Get-ObjectPropertyValue $_ "id" }
+      } | Sort-Object)
+      $fingerprint = "$activeCount|$blockingActiveCount|$admissionCount|$($ids -join ',')"
+      if ($fingerprint -ne $lastFingerprint) {
+        $lastFingerprint = $fingerprint
+        $progressDeadline = (Get-Date).AddSeconds($DrainNoProgressTimeoutSeconds)
+        Write-Host "Drain status: $activeCount active turn(s), $blockingActiveCount blocking turn(s), $admissionCount admission(s)." -ForegroundColor DarkGray
+      }
+
+      if ($ready) {
+        if ($null -eq $readySince) { $readySince = Get-Date }
+        if (((Get-Date) - $readySince).TotalSeconds -ge $DrainReadyGraceSeconds) {
+          $readyDescription = if ($RequireFullyIdle) { "no active turns" } else { "no blocking work" }
+          Write-Host "The backend had $readyDescription for $DrainReadyGraceSeconds seconds; it is safe to restart." -ForegroundColor Green
+          return $supportsDrain
+        }
+      } else {
+        $readySince = $null
+      }
+
+      if ((Get-Date) -ge $wallDeadline) {
+        throw "Drain timed out after $DrainTimeoutSeconds seconds; the running server was not stopped."
+      }
+      if ((Get-Date) -ge $progressDeadline) {
+        throw "Drain made no observable progress for $DrainNoProgressTimeoutSeconds seconds; the running server was not stopped."
+      }
+      Start-Sleep -Milliseconds 1000
+    }
+  } catch {
+    if ($supportsDrain) {
+      try { [void](Invoke-AgentWebuiRequest $client "DELETE" "/api/admin/drain") } catch { Write-Warning "Drain cancellation failed: $($_.Exception.Message)" }
+    }
+    throw
+  } finally {
+    $client.Dispose()
+  }
+}
+
 function Stop-ExistingServer {
   $knownPid = 0
   if (Test-Path -LiteralPath $pidPath -PathType Leaf) {
@@ -239,11 +439,15 @@ function Stop-ExistingServer {
 
     Write-Host "Stopping Agent WebUI on port $Port (PID $processId)..." -ForegroundColor Yellow
     Stop-Process -Id $processId
-    $deadline = (Get-Date).AddSeconds(10)
+    $deadline = (Get-Date).AddSeconds($ShutdownTimeoutSeconds)
     while ((Get-Date) -lt $deadline -and (Get-Process -Id $processId -ErrorAction SilentlyContinue)) {
       Start-Sleep -Milliseconds 200
     }
     if (Get-Process -Id $processId -ErrorAction SilentlyContinue) {
+      if (-not $ForceShutdown) {
+        throw "Agent WebUI PID $processId did not exit within $ShutdownTimeoutSeconds seconds. It was not force-killed; inspect it or rerun with -ForceShutdown."
+      }
+      Write-Warning "-ForceShutdown is force-killing Agent WebUI PID $processId."
       Stop-Process -Id $processId -Force
     }
   }
@@ -260,6 +464,28 @@ function Start-Server {
   }
   $node = Get-Command node.exe -ErrorAction Stop
   $arguments = @("dist/server.js", "--host", $ListenHost, "--port", [string]$Port)
+  $codexRuntime = $env:AGENT_WEBUI_CODEX_RUNTIME
+  # The backend owns the default (persistent). Only pass an override when the
+  # operator explicitly requests one, so the launcher cannot silently drift
+  # back to the non-resumable stdio runtime.
+  if (-not [string]::IsNullOrWhiteSpace($codexRuntime)) {
+    $arguments += @("--codex-runtime", $codexRuntime.Trim())
+  }
+  $codexBinary = $env:AGENT_WEBUI_CODEX_BINARY
+  if ([string]::IsNullOrWhiteSpace($codexBinary)) {
+    $bundledCodex = Get-ChildItem `
+      -Path (Join-Path $env:LOCALAPPDATA "OpenAI\Codex\bin\*\codex.exe") `
+      -File `
+      -ErrorAction SilentlyContinue |
+      Sort-Object LastWriteTime -Descending |
+      Select-Object -First 1
+    if ($bundledCodex) {
+      $codexBinary = $bundledCodex.FullName
+    }
+  }
+  if (-not [string]::IsNullOrWhiteSpace($codexBinary)) {
+    $arguments += @("--codex-binary", $codexBinary)
+  }
   $process = Start-Process `
     -FilePath $node.Source `
     -ArgumentList $arguments `
@@ -271,7 +497,7 @@ function Start-Server {
   Set-Content -LiteralPath $pidPath -Value $process.Id -Encoding ascii
 
   $healthUri = "http://127.0.0.1:$Port/api/me"
-  $deadline = (Get-Date).AddSeconds(20)
+  $deadline = (Get-Date).AddSeconds($StartupTimeoutSeconds)
   $healthy = $false
   $client = [Net.Http.HttpClient]::new()
   $client.Timeout = [TimeSpan]::FromSeconds(2)
@@ -291,17 +517,44 @@ function Start-Server {
       }
       Start-Sleep -Milliseconds 250
     }
+    # Avoid a false timeout when the server becomes ready at the deadline.
+    if (-not $healthy -and -not $process.HasExited) {
+      try {
+        $response = $client.GetAsync($healthUri).GetAwaiter().GetResult()
+        $status = [int]$response.StatusCode
+        $response.Dispose()
+        $healthy = $status -eq 200 -or $status -eq 401
+      } catch {
+        # The diagnostics below distinguish a live process from a listener.
+      }
+    }
   } finally {
     $client.Dispose()
   }
 
   if (-not $healthy) {
-    $details = if (Test-Path -LiteralPath $stderrPath -PathType Leaf) {
-      (Get-Content -LiteralPath $stderrPath -Tail 20) -join [Environment]::NewLine
+    $processState = if ($process.HasExited) {
+      "Process PID $($process.Id) exited with code $($process.ExitCode)."
     } else {
-      "No stderr log was created."
+      "Process PID $($process.Id) is still running."
     }
-    throw "Agent WebUI did not become healthy on port $Port.`n$details"
+    $listeners = @(Get-ListeningProcessIds)
+    $listenerState = if ($listeners.Count) {
+      "Listening PID(s) on port ${Port}: $($listeners -join ', ')."
+    } else {
+      "No process is listening on port $Port."
+    }
+    $stderrTail = if ((Test-Path -LiteralPath $stderrPath -PathType Leaf) -and (Get-Item -LiteralPath $stderrPath).Length) {
+      "stderr:`n$((Get-Content -LiteralPath $stderrPath -Tail 20) -join [Environment]::NewLine)"
+    } else {
+      "stderr was empty."
+    }
+    $stdoutTail = if ((Test-Path -LiteralPath $stdoutPath -PathType Leaf) -and (Get-Item -LiteralPath $stdoutPath).Length) {
+      "stdout:`n$((Get-Content -LiteralPath $stdoutPath -Tail 20) -join [Environment]::NewLine)"
+    } else {
+      "stdout was empty."
+    }
+    throw "Agent WebUI did not become healthy on port $Port within $StartupTimeoutSeconds seconds.`n$processState`n$listenerState`n$stderrTail`n$stdoutTail"
   }
 
   Write-Host "Agent WebUI is running: http://127.0.0.1:$Port/ (PID $($process.Id))" -ForegroundColor Green
@@ -348,7 +601,13 @@ try {
   # memory, so a failed build leaves the current instance usable. Only take the
   # short restart window after every required production output is ready.
   Invoke-ConditionalBuild
-  Stop-ExistingServer
+  $drainSupported = Wait-ExistingServerDrain
+  try {
+    Stop-ExistingServer
+  } catch {
+    if ($drainSupported -and @(Get-ListeningProcessIds).Count) { Cancel-AgentWebuiDrain }
+    throw
+  }
   Start-Server
 } finally {
   if ($ownsMutex) { $mutex.ReleaseMutex() }

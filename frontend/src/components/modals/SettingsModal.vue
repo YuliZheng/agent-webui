@@ -231,7 +231,7 @@ async function doRetitleAll() {
         <section class="mb-5">
           <div class="text-xs uppercase tracking-wider opacity-70 mb-1">Notifications</div>
           <p class="text-xs opacity-60 mb-2">
-            Show an OS notification when a reply finishes while this window is in the background.
+            Show a system notification when a reply finishes in the background. Supported phone launchers also show an app-icon dot or count while that notification is unread.
           </p>
           <button
             type="button"

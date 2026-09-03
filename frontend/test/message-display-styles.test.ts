@@ -58,6 +58,15 @@ describe("message display style CSS", () => {
     expect(css).toContain("linear-gradient(to bottom, transparent, var(--cw-wechat-user-bg");
   });
 
+  it("renders sparse WeChat-style timestamps without turning every message into metadata", () => {
+    expect(messageListVue).toContain('type TimeRow = { kind: "time"');
+    expect(messageListVue).toContain("withMessageTimeRows(rows, previousConversationTimestamp");
+    expect(messageListVue).toContain("v-if=\"row.kind === 'time'\"");
+    expect(messageListVue).toContain("<time :datetime=\"row.datetime\">{{ row.label }}</time>");
+    expect(css).toContain(".cw-message-time");
+    expect(css).toContain("font-variant-numeric: tabular-nums");
+  });
+
   it("does not position the composer as an overlay in any style", () => {
     const promptInputRules = [...css.matchAll(/\.cw-[^{]*cw-prompt-input[^{]*\{([^}]*)\}/g)];
     expect(promptInputRules.length).toBeGreaterThan(0);
@@ -315,7 +324,9 @@ describe("message display style CSS", () => {
     expect(contextFooterVue).not.toContain("usageOpen");
     expect(contextFooterVue).not.toContain("toggleUsage");
     expect(contextFooterVue).not.toContain("cw-context-usage-chevron");
-    expect(contextFooterVue).toContain('v-if="limit"');
+    expect(contextFooterVue).toContain('v-if="showAll || limit"');
+    expect(contextFooterVue).toContain('const usageScope = ref<UsageScope>("all")');
+    expect(contextFooterVue).toContain("threadUsage");
     expect(contextFooterVue).toContain("Scanning the full rollout for source attribution");
     expect(contextFooterVue).toContain("Full rollout scan complete");
     expect(contextFooterVue).toContain("bounded compatibility fallback until restart");

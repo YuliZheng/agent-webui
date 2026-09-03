@@ -8,6 +8,8 @@
 // Each codex line is a rollout record: { timestamp, type, payload }.
 //   - event_msg/user_message  → user bubble (clean typed text, incl. image trailer)
 //   - event_msg/agent_message → assistant bubble (final answer text)
+//   - event_msg/item_completed UserMessage/AgentMessage → bubbles for newer
+//     Codex CLI rollouts that omit the legacy clean-message events
 //   - event_msg/thread_rolled_back → logically drop the last N turns
 //   - event_msg/turn_aborted → "[Request interrupted by user]" marker (parity
 //     with claude's interrupt), appended to the aborted turn
@@ -22,6 +24,11 @@
 // collapse them into one ToolCall row (exactly how claude tool pairs work).
 
 import { toolResultImageUrl } from "../util/tool-result-images.js";
+import {
+  codexVisibleMessage,
+  codexVisibleMessageFromJson,
+  type CodexVisibleMessage,
+} from "@agent-webui/shared/codex";
 
 function sourceIndexField(lineIndex: number | undefined): Record<string, number> {
   return typeof lineIndex === "number" && Number.isSafeInteger(lineIndex)
@@ -29,11 +36,19 @@ function sourceIndexField(lineIndex: number | undefined): Record<string, number>
     : {};
 }
 
-function claudeUser(uuid: string, text: string, lineIndex?: number): string {
+function timestampField(timestamp: unknown): Record<string, string | number> {
+  return (typeof timestamp === "string" && timestamp.trim())
+    || (typeof timestamp === "number" && Number.isFinite(timestamp))
+    ? { timestamp: timestamp as string | number }
+    : {};
+}
+
+function claudeUser(uuid: string, text: string, lineIndex?: number, timestamp?: unknown): string {
   return JSON.stringify({
     type: "user",
     uuid,
     ...sourceIndexField(lineIndex),
+    ...timestampField(timestamp),
     message: { role: "user", content: text },
   });
 }
@@ -177,16 +192,17 @@ function attachOmittedRecord(rawUser: string, pending: PendingOmittedRecord): st
   return JSON.stringify(record);
 }
 
-function claudeAssistantText(uuid: string, text: string, lineIndex?: number): string {
+function claudeAssistantText(uuid: string, text: string, lineIndex?: number, timestamp?: unknown): string {
   return JSON.stringify({
     type: "assistant",
     uuid,
     ...sourceIndexField(lineIndex),
+    ...timestampField(timestamp),
     message: { role: "assistant", model: "codex", content: [{ type: "text", text }] },
   });
 }
 
-function claudeAssistantImages(uuid: string, content: unknown[], lineIndex?: number): string | null {
+function claudeAssistantImages(uuid: string, content: unknown[], lineIndex?: number, timestamp?: unknown): string | null {
   const images = content.flatMap(block => {
     const url = toolResultImageUrl(block);
     return url ? [{ type: "image_url", image_url: url }] : [];
@@ -196,24 +212,27 @@ function claudeAssistantImages(uuid: string, content: unknown[], lineIndex?: num
     type: "assistant",
     uuid,
     ...sourceIndexField(lineIndex),
+    ...timestampField(timestamp),
     message: { role: "assistant", model: "codex", content: images },
   });
 }
 
-function claudeToolUse(callId: string, name: string, input: unknown, lineIndex?: number): string {
+function claudeToolUse(callId: string, name: string, input: unknown, lineIndex?: number, timestamp?: unknown): string {
   return JSON.stringify({
     type: "assistant",
     uuid: callId,
     ...sourceIndexField(lineIndex),
+    ...timestampField(timestamp),
     message: { role: "assistant", model: "codex", content: [{ type: "tool_use", id: callId, name, input: input ?? {} }] },
   });
 }
 
-function claudeToolResult(callId: string, output: unknown, lineIndex?: number): string {
+function claudeToolResult(callId: string, output: unknown, lineIndex?: number, timestamp?: unknown): string {
   return JSON.stringify({
     type: "user",
     uuid: `${callId}:result`,
     ...sourceIndexField(lineIndex),
+    ...timestampField(timestamp),
     message: { role: "user", content: [{ type: "tool_result", tool_use_id: callId, content: output }] },
   });
 }
@@ -271,13 +290,33 @@ function normalizedCodexToolOutput(output: unknown): unknown {
   });
 }
 
-function claudeCompactBoundary(uuid: string): string {
+function claudeCompactBoundary(uuid: string, compactSummary = "", timestamp?: unknown): string {
   return JSON.stringify({
     type: "system",
     subtype: "compact_boundary",
     uuid,
     content: "Conversation compacted",
     compactMetadata: { trigger: "manual" },
+    ...timestampField(timestamp),
+    ...(compactSummary ? { compactSummary } : {}),
+  });
+}
+
+function readableCompactionSummary(payload: Record<string, unknown>): string {
+  const value = typeof payload.message === "string"
+    ? payload.message
+    : typeof payload.summary === "string"
+      ? payload.summary
+      : "";
+  return value.trim();
+}
+
+function claudeEmptyCompletion(uuid: string, timestamp?: unknown): string {
+  return JSON.stringify({
+    type: "system",
+    subtype: "empty_completion",
+    uuid,
+    ...timestampField(timestamp),
   });
 }
 
@@ -318,6 +357,10 @@ function isEmptyCompleteLine(line: string | undefined): boolean {
   return typeof line === "string" && line.includes('"uuid":"empty-complete-');
 }
 
+function isCompactBoundaryLine(line: string | undefined): boolean {
+  return typeof line === "string" && line.includes('"subtype":"compact_boundary"');
+}
+
 function adaptLineCached(rawLine: string, lineIndex: number): string[] {
   const key = lineIndex + " " + rawLine;
   let out = adaptCache.get(key);
@@ -337,6 +380,7 @@ export function codexRolloutToClaudeLines(
   let current: string[] | null = null;
   let pendingImages: PendingCodexImages | null = null;
   let pendingOmitted: PendingOmittedRecord | null = null;
+  let recentVisibleMessage: (CodexVisibleMessage & { sourceLineIndex: number }) | null = null;
   const add = (line: string) => {
     if (!current) { current = []; turns.push(current); }
     current.push(line);
@@ -356,7 +400,47 @@ export function codexRolloutToClaudeLines(
     if (omitted) pendingOmitted = omitted;
     if (pendingImages && lineIndex - pendingImages.sourceLineIndex > 4) pendingImages = null;
     if (pendingOmitted && lineIndex - pendingOmitted.sourceLineIndex > 4) pendingOmitted = null;
+    const parsedVisibleMessage = codexVisibleMessageFromJson(rawLine);
+    const visibleMessage = parsedVisibleMessage?.transport === "response"
+      ? null
+      : parsedVisibleMessage;
+    const duplicateVisibleMessage = Boolean(
+      visibleMessage
+      && recentVisibleMessage
+      && visibleMessage.transport !== recentVisibleMessage.transport
+      && visibleMessage.role === recentVisibleMessage.role
+      && visibleMessage.text === recentVisibleMessage.text
+      && lineIndex - recentVisibleMessage.sourceLineIndex <= 4,
+    );
+    if (visibleMessage && !duplicateVisibleMessage) {
+      recentVisibleMessage = { ...visibleMessage, sourceLineIndex: lineIndex };
+    }
+    if (duplicateVisibleMessage) {
+      if (visibleMessage?.role === "user") {
+        pendingImages = null;
+        pendingOmitted = null;
+      }
+      return;
+    }
     for (const line of adaptLineCached(rawLine, lineIndex)) {
+      // A manual compaction is persisted as a compact boundary followed by a
+      // task_complete with no assistant message. That empty completion belongs
+      // to the maintenance operation, not to the user's preceding turn.
+      // Suppress only this adjacent pair so genuine empty turns still retain
+      // their recovery card.
+      if (isEmptyCompleteLine(line) && current && isCompactBoundaryLine(current.at(-1))) {
+        continue;
+      }
+      // Codex persists a rich `compacted` record and also emits the lighter
+      // context_compacted event. They describe one boundary. Keep one card and
+      // prefer the record that carries a readable summary, whichever arrives
+      // first on this app-server version.
+      if (isCompactBoundaryLine(line) && current && isCompactBoundaryLine(current.at(-1))) {
+        if (line.includes('"compactSummary":') && !current.at(-1)!.includes('"compactSummary":')) {
+          current[current.length - 1] = line;
+        }
+        continue;
+      }
       if (line === ROLLBACK_SENTINEL) {
         const drop = rollbackCount(rawLine);
         if (drop > 0) turns.splice(Math.max(0, turns.length - drop), drop);
@@ -393,19 +477,48 @@ export function codexToClaudeLines(rawLine: string, lineIndex?: number): string[
   try { rec = JSON.parse(rawLine) as Record<string, unknown>; } catch { return []; }
   const p = (rec.payload ?? {}) as Record<string, unknown>;
 
+  if (rec.type === "compacted" || rec.type === "context_compacted") {
+    return [claudeCompactBoundary(
+      stableId("compact", lineIndex),
+      readableCompactionSummary(p),
+      rec.timestamp,
+    )];
+  }
+
   if (rec.type === "event_msg") {
     if (p.type === "user_message" && typeof p.message === "string") {
       const id = typeof p.id === "string" ? p.id : codexLineId(lineIndex);
-      return [USER_SENTINEL + claudeUser(id, p.message, lineIndex)];
+      return [USER_SENTINEL + claudeUser(id, p.message, lineIndex, rec.timestamp)];
     }
     if (p.type === "agent_message" && typeof p.message === "string") {
-      return [claudeAssistantText(stableId("a", lineIndex), p.message, lineIndex)];
+      return [claudeAssistantText(stableId("a", lineIndex), p.message, lineIndex, rec.timestamp)];
+    }
+    const completedMessage = codexVisibleMessage(rec);
+    if (completedMessage?.transport === "item-completed" && completedMessage.role === "user") {
+      return [USER_SENTINEL + claudeUser(
+        completedMessage.id ?? codexLineId(lineIndex),
+        completedMessage.text,
+        lineIndex,
+        rec.timestamp,
+      )];
+    }
+    if (completedMessage?.transport === "item-completed" && completedMessage.role === "assistant") {
+      return [claudeAssistantText(
+        completedMessage.id ?? stableId("a", lineIndex),
+        completedMessage.text,
+        lineIndex,
+        rec.timestamp,
+      )];
     }
     if (p.type === "thread_rolled_back") {
       return [ROLLBACK_SENTINEL];
     }
     if (p.type === "context_compacted") {
-      return [claudeCompactBoundary(stableId("compact", lineIndex))];
+      return [claudeCompactBoundary(
+        stableId("compact", lineIndex),
+        readableCompactionSummary(p),
+        rec.timestamp,
+      )];
     }
     if (p.type === "turn_aborted") {
       // Interrupt marker — same text claude writes when you stop a turn. No
@@ -413,14 +526,10 @@ export function codexToClaudeLines(rawLine: string, lineIndex?: number): string[
       // starting a new one: keeps display-turn count aligned with codex's
       // user-message turns (rollback/rewind splices by that count) and lets it
       // be dropped together with the turn it belongs to on rewind.
-      return [claudeUser(stableId("abort", lineIndex), "[Request interrupted by user]", lineIndex)];
+      return [claudeUser(stableId("abort", lineIndex), "[Request interrupted by user]", lineIndex, rec.timestamp)];
     }
     if (p.type === "task_complete" && p.last_agent_message === null) {
-      return [claudeAssistantText(
-        stableId("empty-complete", lineIndex),
-        "Turn ended without a final response. Send another message to retry or continue.",
-        lineIndex,
-      )];
+      return [claudeEmptyCompletion(stableId("empty-complete", lineIndex), rec.timestamp)];
     }
     return [];
   }
@@ -434,19 +543,19 @@ export function codexToClaudeLines(rawLine: string, lineIndex?: number): string[
       try { args = typeof rawArgs === "string" ? JSON.parse(rawArgs) : (rawArgs ?? {}); } catch { args = { raw: rawArgs }; }
       if (name === "exec_command" || name === "shell") {
         const cmd = (args as { cmd?: string; command?: string }).cmd ?? (args as { command?: string }).command ?? "";
-        return [claudeToolUse(callId, "Bash", { command: cmd }, lineIndex)];
+        return [claudeToolUse(callId, "Bash", { command: cmd }, lineIndex, rec.timestamp)];
       }
       // apply_patch / web_search / mcp / custom tools → generic tool-call row.
-      return [claudeToolUse(callId, name, args, lineIndex)];
+      return [claudeToolUse(callId, name, args, lineIndex, rec.timestamp)];
     }
     if ((p.type === "function_call_output" || p.type === "custom_tool_call_output") && callId) {
-      return [claudeToolResult(callId, normalizedCodexToolOutput(p.output), lineIndex)];
+      return [claudeToolResult(callId, normalizedCodexToolOutput(p.output), lineIndex, rec.timestamp)];
     }
     // Text from assistant response_item/message is duplicated by the clean
     // agent_message event, but native image blocks are not. Preserve images
     // alone so generated/tool-forwarded media can reach AssistantBlock.
     if (p.type === "message" && p.role === "assistant" && Array.isArray(p.content)) {
-      const imageRecord = claudeAssistantImages(stableId("assistant-images", lineIndex), p.content, lineIndex);
+      const imageRecord = claudeAssistantImages(stableId("assistant-images", lineIndex), p.content, lineIndex, rec.timestamp);
       return imageRecord ? [imageRecord] : [];
     }
     // response_item/message (developer + injected env_context + assistant

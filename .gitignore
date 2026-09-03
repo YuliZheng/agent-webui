@@ -28,6 +28,8 @@ previews/
 # Local QA and implementation notes
 .qa-visual/
 progress.md
+/$tmp/
+/taildiag.json
 
 # Accidental TypeScript config emit
 frontend/vite.config.js

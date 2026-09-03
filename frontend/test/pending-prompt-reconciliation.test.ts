@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  isCodexDurableUserMessage,
   latestSidebarPendingPrompt,
   matchedCodexPendingPromptIds,
   normalizePendingUserText,
@@ -15,6 +16,17 @@ function userLanding(message: string, clientId?: string): string {
       ...(clientId ? { client_id: clientId } : {}),
       message,
       images: [],
+    },
+  });
+}
+
+function itemUserLanding(message: string, id = "item-user"): string {
+  return JSON.stringify({
+    timestamp: "2026-08-28T09:48:26.072Z",
+    type: "event_msg",
+    payload: {
+      type: "item_completed",
+      item: { type: "UserMessage", id, content: [{ type: "text", text: message }] },
     },
   });
 }
@@ -48,6 +60,25 @@ describe("Codex optimistic prompt reconciliation", () => {
       [JSON.stringify({ type: "event_msg", payload: { type: "turn_started" } }), userLanding("继续")],
       [{ id: "legacy-entry", text: "继续", startedAtLineCount: 1 }],
     )).toEqual(["legacy-entry"]);
+  });
+
+  it("reconciles item_completed user messages and deduplicates companion transports", () => {
+    const response = JSON.stringify({
+      type: "response_item",
+      payload: { type: "message", role: "user", content: [{ type: "input_text", text: "new prompt" }] },
+    });
+    expect(matchedCodexPendingPromptIds(
+      [response, itemUserLanding("new prompt")],
+      [
+        { id: "pending-1", text: "new prompt", startedAtLineCount: 0 },
+        { id: "pending-2", text: "new prompt", startedAtLineCount: 0 },
+      ],
+    )).toEqual(["pending-1"]);
+    expect(isCodexDurableUserMessage(itemUserLanding("new prompt"))).toBe(true);
+    expect(isCodexDurableUserMessage(JSON.stringify({
+      type: "response_item",
+      payload: { type: "message", role: "user", content: [{ type: "input_text", text: "<environment_context>hidden</environment_context>" }] },
+    }))).toBe(false);
   });
 
   it("normalizes attachment trailers before legacy text matching", () => {

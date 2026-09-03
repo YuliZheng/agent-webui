@@ -1,3 +1,11 @@
+import {
+  codexVisibleMessageFromJson,
+  codexVisibleMessagePriority,
+  isCodexInjectedContextText,
+  sameCodexVisibleMessage,
+  type CodexVisibleMessage,
+} from "@agent-webui/shared/codex";
+
 const ATTACH_TRAILERS = [
   "\n\nAttached files (read with the Read tool to view):",
   // Pre-PDF wording — still present in historical session jsonls.
@@ -61,9 +69,11 @@ export interface PendingPromptProbeRange {
 
 interface CodexUserLanding {
   index: number;
+  lastSourceIndex: number;
   text: string;
   clientId: string | null;
   used: boolean;
+  message: CodexVisibleMessage;
 }
 
 export function normalizePendingUserText(text: string): string {
@@ -78,29 +88,44 @@ function collectCodexUserLandings(raw: readonly string[]): CodexUserLanding[] {
   const result: CodexUserLanding[] = [];
   for (let index = 0; index < raw.length; index++) {
     const line = raw[index];
-    if (!line || line.indexOf('"user_message"') < 0) continue;
-    let record: {
-      payload?: {
-        type?: unknown;
-        message?: unknown;
-        client_id?: unknown;
-      };
-    };
-    try {
-      record = JSON.parse(line);
-    } catch {
+    if (!line) continue;
+    const message = codexVisibleMessageFromJson(line);
+    if (!message || message.role !== "user" || isCodexInjectedContextText(message.text)) continue;
+    const previous = result.at(-1);
+    if (
+      previous
+      && index - previous.lastSourceIndex <= 4
+      && previous.message.transport !== message.transport
+      && sameCodexVisibleMessage(previous.message, message)
+    ) {
+      previous.lastSourceIndex = index;
+      previous.clientId ??= message.clientId ?? null;
+      if (codexVisibleMessagePriority(message) > codexVisibleMessagePriority(previous.message)) {
+        previous.message = message;
+        previous.text = normalizePendingUserText(message.text);
+      }
       continue;
     }
-    const payload = record.payload;
-    if (payload?.type !== "user_message" || typeof payload.message !== "string") continue;
     result.push({
       index,
-      text: normalizePendingUserText(payload.message),
-      clientId: typeof payload.client_id === "string" ? payload.client_id : null,
+      lastSourceIndex: index,
+      text: normalizePendingUserText(message.text),
+      clientId: message.clientId ?? null,
       used: false,
+      message,
     });
   }
   return result;
+}
+
+export function isCodexDurableUserMessage(raw: string | undefined): boolean {
+  if (!raw) return false;
+  const message = codexVisibleMessageFromJson(raw);
+  return Boolean(
+    message
+    && message.role === "user"
+    && !isCodexInjectedContextText(message.text),
+  );
 }
 
 /**
@@ -124,7 +149,7 @@ export function pendingPromptProbeRange(
 
 /**
  * Returns optimistic prompt ids whose durable Codex user-message record has
- * arrived.
+ * arrived, across response, legacy-event, and item_completed transports.
  *
  * New Codex records echo the WebUI's optimistic id as `client_id`. That is the
  * authoritative reconciliation key and deliberately does not depend on the
@@ -167,6 +192,7 @@ export function matchedCodexPendingPromptIds(
     // optimistic entries can legitimately be contained in one user record.
     if (normalized.length > 0 && landed.some((record) =>
       record.index >= entry.startedAtLineCount &&
+      record.text !== normalized &&
       record.text.includes(normalized)
     )) {
       matched.push(entry.id);

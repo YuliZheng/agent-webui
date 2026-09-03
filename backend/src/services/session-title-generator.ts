@@ -26,7 +26,7 @@ export type SessionTitleGenerator = (
   request: SessionTitleRequest,
 ) => Promise<GeneratedSessionTitle>;
 
-export const SESSION_TITLE_MODEL = "gpt-5.3-codex-spark";
+export const SESSION_TITLE_MODEL = "gpt-5.6-luna";
 export const SESSION_TITLE_REASONING_EFFORT = "low";
 const TITLE_TIMEOUT_MS = 45_000;
 export const SESSION_TITLE_TEXT_MAX_CHARS = 6_400;

@@ -250,6 +250,77 @@ describe("session scanning", () => {
     expect(fork?.parentSessionId).toBe("root-id");
   });
 
+  it("infers a Codex fork parent from adjacent copied session metadata", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-webui-codex-copied-meta-"));
+    const forkPath = join(root, "rollout-copied-meta.jsonl");
+    await writeFile(forkPath, [
+      JSON.stringify({
+        timestamp: "2026-08-29T20:38:57.732Z",
+        type: "session_meta",
+        payload: { id: "child-id", cwd: root, source: "vscode" },
+      }),
+      JSON.stringify({
+        timestamp: "2026-08-29T20:38:57.739Z",
+        type: "session_meta",
+        payload: { id: "parent-id", cwd: root, source: "vscode", thread_source: "user" },
+      }),
+      JSON.stringify({
+        timestamp: "2026-08-29T20:38:57.740Z",
+        type: "event_msg",
+        payload: { type: "task_started" },
+      }),
+      "",
+    ].join("\n"));
+
+    const fork = await scanCodexFile(forkPath);
+    expect(fork?.id).toBe("child-id");
+    expect(fork?.parentSessionId).toBe("parent-id");
+    expect(fork?.subagent).toBe(false);
+  });
+
+  it("backfills copied-metadata fork parents from a v1 cache without losing previews", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-webui-codex-cache-upgrade-"));
+    const claudeRoot = join(root, "claude");
+    const codexRoot = join(root, "codex");
+    const cachePath = join(root, "session-index.json");
+    await Promise.all([mkdir(claudeRoot), mkdir(codexRoot)]);
+    const forkPath = join(codexRoot, "rollout-cached-fork.jsonl");
+    await writeFile(forkPath, [
+      JSON.stringify({ type: "session_meta", payload: { id: "cached-child", cwd: root } }),
+      JSON.stringify({ type: "session_meta", payload: { id: "cached-parent", cwd: root } }),
+      "",
+    ].join("\n"));
+    const info = await stat(forkPath);
+    await writeFile(cachePath, JSON.stringify({
+      version: 1,
+      records: [{
+        id: "cached-child",
+        path: forkPath,
+        cwd: root,
+        agent: "codex",
+        subagent: false,
+        mtime: info.mtime.toISOString(),
+        size: info.size,
+        preview: "keep this preview",
+        previewRole: "assistant",
+        lastTurnAt: "2026-08-29T20:00:00.000Z",
+        parentSessionId: null,
+      }],
+      previewComplete: [forkPath],
+      previewScanned: [forkPath],
+    }));
+
+    const index = new SessionIndex({ claudeRoot, codexRoot, cachePath });
+    await index.scan();
+    expect(index.get("cached-child")).toMatchObject({
+      parentSessionId: "cached-parent",
+      preview: "keep this preview",
+      previewRole: "assistant",
+    });
+    const persisted = JSON.parse(await readFile(cachePath, "utf8")) as { version: number };
+    expect(persisted.version).toBe(2);
+  });
+
   it("excludes subagents and does not follow symlink directories", async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-webui-walk-")); const claudeRoot = join(root, "claude"); const codexRoot = join(root, "codex");
     await mkdir(join(claudeRoot, "project", "subagents"), { recursive: true }); await mkdir(codexRoot, { recursive: true });

@@ -359,19 +359,37 @@ export async function scanCodexFile(path: string, previewBytes = BACK_SCAN_MAX):
   await scanJsonlHead(path, fileStat.size, line => {
     try {
       const record = asRecord(JSON.parse(line));
-      if (record?.type !== "session_meta") return false;
+      // Codex app-server forks currently start with two adjacent metadata
+      // records: a fresh child session_meta followed by the copied source
+      // session_meta. The first record does not carry parent_thread_id, so the
+      // copied record's different ID is the only durable parent signal.
+      if (record?.type !== "session_meta") return id !== undefined;
       const payload = asRecord(record.payload);
-      id = asString(payload?.id) ?? asString(payload?.thread_id) ?? asString(payload?.session_id);
-      cwd = asString(payload?.cwd);
+      const metadataId = asString(payload?.id) ?? asString(payload?.thread_id) ?? asString(payload?.session_id);
       const source = asRecord(payload?.source);
       const sourceSubagent = asRecord(source?.subagent);
       const threadSpawn = asRecord(sourceSubagent?.thread_spawn);
-      subagent = asString(payload?.thread_source) === "subagent" || sourceSubagent !== null;
-      const parent = asString(payload?.parent_thread_id)
+      const metadataParent = asString(payload?.parent_thread_id)
         ?? asString(threadSpawn?.parent_thread_id)
         ?? asString(payload?.session_id);
-      parentSessionId = parent && parent !== id ? parent : null;
-      return true;
+      if (id) {
+        if (!parentSessionId) {
+          const inferredParent = metadataParent && metadataParent !== id
+            ? metadataParent
+            : metadataId && metadataId !== id
+              ? metadataId
+              : null;
+          parentSessionId = inferredParent;
+        }
+        return true;
+      }
+      id = metadataId;
+      cwd = asString(payload?.cwd);
+      subagent = asString(payload?.thread_source) === "subagent" || sourceSubagent !== null;
+      parentSessionId = metadataParent && metadataParent !== id ? metadataParent : null;
+      // Explicit parent metadata is complete. Otherwise inspect exactly the
+      // next record for the copied source session_meta used by Codex forks.
+      return parentSessionId !== null;
     } catch { /* continue */ }
     return false;
   });
@@ -391,14 +409,14 @@ export async function scanCodexFile(path: string, previewBytes = BACK_SCAN_MAX):
 }
 
 interface PersistedSessionIndex {
-  version: 1;
+  version: 1 | 2;
   records: SessionRecord[];
   previewComplete: string[];
   previewScanned: string[];
 }
 
 const emptyPersistedSessionIndex = (): PersistedSessionIndex => ({
-  version: 1,
+  version: 2,
   records: [],
   previewComplete: [],
   previewScanned: [],
@@ -451,7 +469,12 @@ function normalizePersistedSessionIndex(value: unknown): PersistedSessionIndex {
   const previewScanned = Array.isArray(record?.previewScanned)
     ? record.previewScanned.filter((item): item is string => typeof item === "string")
     : [];
-  return { version: 1, records, previewComplete, previewScanned };
+  return {
+    version: record?.version === 2 ? 2 : 1,
+    records,
+    previewComplete,
+    previewScanned,
+  };
 }
 
 export interface SessionIndexOptions {
@@ -561,7 +584,23 @@ export class SessionIndex extends EventEmitter {
         let record: SessionRecord | null = null;
         let didColdScan = false;
         try {
-          const existing = existingByPath.get(path);
+          let existing = existingByPath.get(path);
+          // Cache v1 predates duplicate-session_meta fork detection. Refresh
+          // only Codex head metadata once, while retaining cached previews and
+          // recency so upgrading does not cause a full-history rescan.
+          if (existing && agent === "codex" && persisted.version < 2) {
+            const metadata = await scanCodexFile(path, 0);
+            if (metadata?.id === existing.id) {
+              existing = {
+                ...existing,
+                cwd: metadata.cwd,
+                parentSessionId: metadata.parentSessionId,
+                subagent: metadata.subagent,
+              };
+            } else {
+              existing = undefined;
+            }
+          }
           if (existing) {
             const info = await stat(path);
             if (info.size === existing.size && info.mtime.toISOString() === existing.mtime) {
@@ -605,7 +644,7 @@ export class SessionIndex extends EventEmitter {
             coldScanned === 1 ||
             coldScanned % SESSION_COLD_SCAN_CHECKPOINT_EVERY === 0
           ) {
-            await this.persistScanCheckpoint(checkpointByPath).catch(() => undefined);
+            await this.persistScanCheckpoint(checkpointByPath, persisted.version).catch(() => undefined);
           }
           await delay(
             Math.max(0, this.options.coldScanPaceMs ?? SESSION_COLD_SCAN_PACE_MS),
@@ -653,11 +692,14 @@ export class SessionIndex extends EventEmitter {
     return this.list();
   }
 
-  private async persistScanCheckpoint(recordsByPath: ReadonlyMap<string, SessionRecord>): Promise<void> {
+  private async persistScanCheckpoint(
+    recordsByPath: ReadonlyMap<string, SessionRecord>,
+    version: PersistedSessionIndex["version"] = 2,
+  ): Promise<void> {
     if (!this.cacheStore) return;
     const paths = new Set(recordsByPath.keys());
     await this.cacheStore.put({
-      version: 1,
+      version,
       records: [...recordsByPath.values()],
       previewComplete: [...this.previewComplete].filter(path => paths.has(path)),
       previewScanned: [...this.previewScanned].filter(path => paths.has(path)),
@@ -667,7 +709,7 @@ export class SessionIndex extends EventEmitter {
   private async persistCache(): Promise<void> {
     if (!this.cacheStore || !this.hasScanned) return;
     await this.cacheStore.put({
-      version: 1,
+      version: 2,
       records: [...this.records.values()],
       previewComplete: [...this.previewComplete],
       previewScanned: [...this.previewScanned],

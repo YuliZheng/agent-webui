@@ -5,6 +5,8 @@ import { join } from "node:path";
 const promptInput = readFileSync(join(process.cwd(), "src/components/PromptInput.vue"), "utf8");
 const liveStore = readFileSync(join(process.cwd(), "src/stores/live.ts"), "utf8");
 const messageList = readFileSync(join(process.cwd(), "src/components/MessageList.vue"), "utf8");
+const mainPane = readFileSync(join(process.cwd(), "src/components/MainPane.vue"), "utf8");
+const sessionRow = readFileSync(join(process.cwd(), "src/components/SessionRow.vue"), "utf8");
 const userPromptBlock = readFileSync(join(process.cwd(), "src/components/blocks/UserPromptBlock.vue"), "utf8");
 const pendingReconciliation = readFileSync(
   join(process.cwd(), "src/util/pending-prompt-reconciliation.ts"),
@@ -83,8 +85,12 @@ describe("send feedback latency", () => {
     expect(liveStore).toContain("usePromptPendingStore().moveSession(draftId, sessionId)");
     expect(liveStore).toContain("useDraftsStore().moveSession(draftId, sessionId)");
     expect(liveStore).toContain("sessions.recordPromotion(draftId, sessionId)");
-    expect(messageList).toContain('prompt.phase === "dispatched"');
+    expect(messageList).toContain("hasPendingTurnStart(pendingPrompts.value)");
     expect(messageList).toContain("running || compacting || optimisticallyStarting");
+    expect(mainPane).toContain("isWorking.value || optimisticallyStarting.value");
+    expect(mainPane).toContain('v-else-if="showsWorkingState || isCompacting"');
+    expect(sessionRow).toContain('status.value === "running" ||');
+    expect(sessionRow).toContain("optimisticallyStarting.value ||");
   });
 
   it("reconciles Codex bubbles by client id, with a bounded legacy fallback", () => {

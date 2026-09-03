@@ -1,10 +1,13 @@
 import { toolSummary } from "../parser/tool-summaries.js";
+import { codexVisibleMessage } from "@agent-webui/shared/codex";
 
 export type CodexRuntimeProgressEvent =
   | { type: "start"; preview: string; timestamp?: string }
-  | { type: "update"; label: string; preview: string; timestamp?: string }
+  | { type: "assistant"; preview: string; timestamp?: string }
+  | { type: "compaction-complete"; timestamp?: string }
   | { type: "tool-start"; callId: string; label: string }
-  | { type: "tool-complete"; callId: string };
+  | { type: "tool-complete"; callId: string }
+  | { type: "terminal"; timestamp?: string };
 
 function compact(value: string, limit = 96): string {
   const text = value.replace(/\s+/g, " ").trim();
@@ -19,20 +22,25 @@ export function codexRuntimeProgressEvent(raw: string): CodexRuntimeProgressEven
   const payload = (record.payload ?? {}) as Record<string, unknown>;
   const timestamp = typeof record.timestamp === "string" ? record.timestamp : undefined;
 
-  if (record.type === "event_msg") {
-    if (payload.type === "user_message") {
-      const preview = typeof payload.message === "string" ? compact(payload.message, 80) : "";
+  const message = codexVisibleMessage(record);
+  if (message) {
+    if (message.role === "user") {
+      const preview = compact(message.text, 80);
       return { type: "start", preview, ...(timestamp ? { timestamp } : {}) };
     }
-    if (payload.type === "agent_message" && typeof payload.message === "string") {
-      const message = compact(payload.message);
-      const preview = compact(payload.message, 80);
-      return message ? {
-        type: "update",
-        label: `Latest update · ${message}`,
-        preview,
-        ...(timestamp ? { timestamp } : {}),
-      } : null;
+    const preview = compact(message.text, 80);
+    return { type: "assistant", preview, ...(timestamp ? { timestamp } : {}) };
+  }
+
+  if (record.type === "event_msg") {
+    const kind = typeof payload.type === "string"
+      ? payload.type
+      : typeof payload.kind === "string" ? payload.kind : "";
+    if (kind === "task_complete" || kind === "turn_complete" || kind === "turn_aborted") {
+      return { type: "terminal", ...(timestamp ? { timestamp } : {}) };
+    }
+    if (kind === "context_compacted") {
+      return { type: "compaction-complete", ...(timestamp ? { timestamp } : {}) };
     }
     return null;
   }

@@ -16,7 +16,13 @@ export interface TitleEntry {
   /** Hidden rolling context used by the automatic title generator. */
   topicSummary?: string;
 }
-export interface ReadEntry { at: string }
+export interface ReadEntry {
+  at?: string;
+  /** Latest completed assistant turn accounted for in unreadCount. */
+  unreadAt?: string;
+  /** Global unread assistant-turn count shared by every client. */
+  unreadCount?: number;
+}
 export interface SessionSetting {
   model?: string;
   effort?: string;

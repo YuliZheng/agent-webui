@@ -22,6 +22,10 @@ interface PerSession {
   // Monotonic in-memory content generation. A flush only clears `dirty` when
   // the generation it snapshotted is still current after the async IDB write.
   revision: number;
+  // Changes only when transcript line content changes. UI derivations key off
+  // this instead of `revision`, because cursor/coverage metadata updates do
+  // not require reparsing the whole conversation.
+  contentRevision: number;
   saveTimer: ReturnType<typeof setTimeout> | null;
 }
 
@@ -77,6 +81,7 @@ export const useSessionCacheStore = defineStore("session-cache", {
           restoreEpoch: 0,
           dirty: false,
           revision: 0,
+          contentRevision: 0,
           saveTimer: null,
         };
       }
@@ -126,6 +131,7 @@ export const useSessionCacheStore = defineStore("session-cache", {
           next[i] = c ?? "";
         }
         entry.lines = next;
+        entry.contentRevision++;
         if (cached.nextLineIndex > entry.nextLineIndex) {
           entry.nextLineIndex = cached.nextLineIndex;
         }
@@ -166,29 +172,49 @@ export const useSessionCacheStore = defineStore("session-cache", {
         if (it.index > maxIdx) maxIdx = it.index;
         if (it.index < minIdx) minIdx = it.index;
       }
-      // Build a fresh array from current entry.lines + room for any new high
-      // indices, then write the batch into it. Working on a plain Array avoids
-      // triggering Vue array reactivity per-slot.
       const wasEmpty = entry.lines.every((line) => !line);
       const targetLen = Math.max(entry.lines.length, maxIdx + 1);
-      const next = new Array<string>(targetLen);
-      for (let i = 0; i < entry.lines.length; i++) next[i] = entry.lines[i] ?? "";
-      for (let i = entry.lines.length; i < targetLen; i++) next[i] = "";
+      let contentChanged = targetLen !== entry.lines.length;
+      if (!contentChanged) {
+        contentChanged = items.some(({ index, raw }) => shouldReplaceCachedLine(entry.lines[index], raw));
+      }
+      // Identical HTTP-tail and WS replay batches are common immediately
+      // after opening a conversation. Preserve the array identity when they
+      // add no content so Vue does not reparse and rerender the whole timeline.
+      let next = entry.lines;
+      if (contentChanged) {
+        next = new Array<string>(targetLen);
+        for (let i = 0; i < entry.lines.length; i++) next[i] = entry.lines[i] ?? "";
+        for (let i = entry.lines.length; i < targetLen; i++) next[i] = "";
+      }
       for (const { index, raw } of items) {
         // Forward-stream wins over backfill: same rule as appendLine. If the
         // slot already had content, that came from a higher-priority source
         // (live WS, or a prior tail) — don't clobber.
         if (shouldReplaceCachedLine(next[index], raw)) next[index] = raw;
       }
-      entry.lines = next;
-      if (maxIdx + 1 > entry.nextLineIndex) entry.nextLineIndex = maxIdx + 1;
-      if (entry.loadedFromIndex === null || wasEmpty || minIdx < entry.loadedFromIndex) entry.loadedFromIndex = minIdx;
+      if (contentChanged) {
+        entry.lines = next;
+        entry.contentRevision++;
+      }
+      let metadataChanged = false;
+      if (maxIdx + 1 > entry.nextLineIndex) {
+        entry.nextLineIndex = maxIdx + 1;
+        metadataChanged = true;
+      }
+      if (entry.loadedFromIndex === null || wasEmpty || minIdx < entry.loadedFromIndex) {
+        entry.loadedFromIndex = minIdx;
+        metadataChanged = true;
+      }
       // firstLoadedIndex tracks lowest non-empty index for "Load earlier".
       if (entry.firstLoadedIndex === 0 && entry.lines[0] === "" && minIdx > 0) {
         entry.firstLoadedIndex = minIdx;
+        metadataChanged = true;
       } else if (minIdx < entry.firstLoadedIndex) {
         entry.firstLoadedIndex = minIdx;
+        metadataChanged = true;
       }
+      if (!contentChanged && !metadataChanged) return;
       entry.revision++;
       entry.dirty = true;
       this.scheduleSave(id);
@@ -214,16 +240,19 @@ export const useSessionCacheStore = defineStore("session-cache", {
       entry.restoreEpoch++;
       entry.hydrated = true;
       entry.revision++;
+      entry.contentRevision++;
       entry.dirty = true;
       this.scheduleSave(id);
     },
     appendLine(id: string, lineIndex: number, raw: string) {
       const entry = this.ensure(id);
       const wasEmpty = entry.lines.every((line) => !line);
+      let contentChanged = false;
       // Forward append (subscribe stream): grow nextLineIndex.
       if (lineIndex >= entry.nextLineIndex) {
         while (entry.lines.length < lineIndex) entry.lines.push("");
         entry.lines[lineIndex] = raw;
+        contentChanged = true;
         entry.nextLineIndex = lineIndex + 1;
         // First time we see a real line, anchor firstLoadedIndex.
         if (entry.firstLoadedIndex === 0 && entry.lines[0] === "" && lineIndex > 0) {
@@ -236,10 +265,12 @@ export const useSessionCacheStore = defineStore("session-cache", {
         // firstLoadedIndex without touching nextLineIndex.
         if (shouldReplaceCachedLine(entry.lines[lineIndex], raw)) {
           entry.lines[lineIndex] = raw;
+          contentChanged = true;
           if (lineIndex < entry.firstLoadedIndex) entry.firstLoadedIndex = lineIndex;
         }
       }
       if (entry.loadedFromIndex === null || wasEmpty || lineIndex < entry.loadedFromIndex) entry.loadedFromIndex = lineIndex;
+      if (contentChanged) entry.contentRevision++;
       entry.revision++;
       entry.dirty = true;
       this.scheduleSave(id);
@@ -352,7 +383,10 @@ export const useSessionCacheStore = defineStore("session-cache", {
     truncateTo(id: string, keepCount: number) {
       const entry = this.bySession[id];
       if (!entry) return;
-      if (entry.lines.length > keepCount) entry.lines = entry.lines.slice(0, keepCount);
+      if (entry.lines.length > keepCount) {
+        entry.lines = entry.lines.slice(0, keepCount);
+        entry.contentRevision++;
+      }
       // stream-truncate is the server's exact physical line count. It must
       // move the cursor both backward (rewind) and forward (initial subscribe
       // where trailing records were filtered from the visible transcript).

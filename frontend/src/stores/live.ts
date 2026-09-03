@@ -23,6 +23,7 @@ import { osNotify } from "../util/os-notify.js";
 import type { InteractionAdded, InteractionRemoved } from "@claude-webui/shared/api";
 import { shouldNotifyForSession } from "../util/session-visibility.js";
 import { codexRuntimeProgressEvent } from "../util/codex-runtime-progress.js";
+import { isCodexDurableUserMessage } from "../util/pending-prompt-reconciliation.js";
 
 interface State {
   globalUnsub: (() => void) | null;
@@ -55,7 +56,9 @@ interface State {
 //      the backend can end up with no tail at all for this session while
 //      its global pub keeps emitting.
 // Watchdog: on session-touched for an engaged session, arm a 3 s timer.
-// Any stream-line / stream-batch arrival clears it. If it fires, pull one
+// A valid stream-line / non-empty stream-batch arrival clears it. Control
+// frames such as stream-reset/cursor do not prove that visible content caught
+// up. If it fires, pull one
 // ground-truth HTTP tail. Rebuilding the WS subscription here created a worse
 // race; future touched events keep HTTP catch-up alive while WS self-heals.
 const staleStreamTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -72,6 +75,20 @@ const STALE_STREAM_HTTP_MIN_GAP_MS = 15_000;
 // and the later completion notification still count as one unread reply.
 const earlyAssistantUnread = new Set<string>();
 const activeToolLabels = new Map<string, Map<string, string>>();
+// The global preview/notification channel can reach the browser while the
+// independent transcript tail is stalled. When an assistant reply becomes
+// visible for the conversation currently on screen, debounce one authoritative
+// HTTP catch-up. This repair is intentionally independent of WS control frames:
+// a mobile-resume stream-reset/cursor must not cancel it.
+const viewedTranscriptRepairTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const VIEWED_TRANSCRIPT_REPAIR_MS = 200;
+
+function clearStaleStreamTimer(id: string): void {
+  const timer = staleStreamTimers.get(id);
+  if (!timer) return;
+  clearTimeout(timer);
+  staleStreamTimers.delete(id);
+}
 
 function compactSidebarPreview(value: string): string {
   const text = value.replace(/\s+/g, " ").trim();
@@ -86,6 +103,15 @@ function isNewerTurnTimestamp(
   if (!Number.isFinite(nextMs)) return false;
   const previousMs = previous ? Date.parse(previous) : Number.NaN;
   return !Number.isFinite(previousMs) || nextMs > previousMs;
+}
+
+// A selected conversation is only "read" when the user can actually see it.
+// Installed PWAs remain alive while minimized or behind another window, so
+// selection alone must not suppress their unread badge and OS notification.
+function isSessionActivelyViewed(id: string, selectedSessionId: string | null): boolean {
+  if (id !== selectedSessionId) return false;
+  if (typeof document === "undefined") return true;
+  return document.visibilityState === "visible" && document.hasFocus();
 }
 
 function timestampCovers(
@@ -159,13 +185,7 @@ const FORCED_TAIL_SUPERSEDE_MS = 2_000;
 const TAIL_GAP_REPAIR_LINES = 1_000;
 
 function isCodexUserMessage(raw: string | undefined): boolean {
-  if (!raw?.includes('"event_msg"') || !raw.includes('"user_message"')) return false;
-  try {
-    const record = JSON.parse(raw) as { type?: unknown; payload?: { type?: unknown } };
-    return record.type === "event_msg" && record.payload?.type === "user_message";
-  } catch {
-    return false;
-  }
+  return isCodexDurableUserMessage(raw);
 }
 
 function recentCodexGapStart(
@@ -278,15 +298,21 @@ const perfEngageAt = new Map<string, number>();
 // we missed during a brief disconnect (page refresh, sleep, network blip).
 const NOTIF_SEQ_KEY = "cw:lastNotifSeq:v1";
 const ENGAGE_TAIL_N = 200;
-// Smaller tail for the on-tap HTTP fetch: fewer bytes over the proxy = faster
-// first paint. The WS subscribe still asks for ENGAGE_TAIL_N and fills the
-// rest once the socket is alive; background prefetch (PREFETCH_TAIL_N) keeps
-// recent sessions fully warm so most taps render instantly from cache.
-const ENGAGE_HTTP_TAIL_N = 60;
+// Keep the on-tap/foreground HTTP catch-up deliberately tiny. Real-world
+// Codex tails can put hundreds of KiB into just 60 physical records; over the
+// phone's Tailnet relay that kept the user-facing “同步最新” state open even
+// though only the newest reply was needed. The WS subscribe still replays 200
+// records, background warming keeps 200, and a missing current-turn anchor is
+// repaired asynchronously through the compact range endpoint.
+const ENGAGE_HTTP_TAIL_N = 20;
 const PREFETCH_TAIL_N = 200;
 // How many of the most-recent sessions to keep warm via background tail
 // prefetch. Recency-ordered (sessions.list is mtime-desc).
 const PREFETCH_LIMIT = 8;
+// With a very large archive, speculative cold indexes monopolize disk for
+// minutes and make the chat the user actually taps wait behind them. The local
+// IDB restore below is still useful; only the network/disk prefetch is skipped.
+const MAX_NETWORK_PREFETCH_SESSION_COUNT = 200;
 let prefetchWork: Promise<void> | null = null;
 
 function loadLastNotifSeq(): number | undefined {
@@ -357,13 +383,16 @@ export const useLiveStore = defineStore("live", {
     turnProgress: {},
   }),
   actions: {
-    observeTurnProgressLine(id: string, raw: string) {
+    observeTurnProgressLine(id: string, raw: string, sourceIndex?: number) {
       const event = codexRuntimeProgressEvent(raw);
       if (!event) return;
       if (event.type === "start") {
         activeToolLabels.delete(id);
-        this.turnProgress[id] = "Codex is starting work…";
-        const item = useSessionsStore().byId[id];
+        this.turnProgress[id] = "Codex is working…";
+        const sessions = useSessionsStore();
+        sessions.setStatus(id, "running", true, false);
+        if (event.timestamp) sessions.setBoundaryAt(id, event.timestamp);
+        const item = sessions.byId[id];
         if (item && event.preview) {
           item.preview = event.preview;
           item.previewRole = "user";
@@ -371,14 +400,31 @@ export const useLiveStore = defineStore("live", {
         }
         return;
       }
-      if (event.type === "update") {
-        this.turnProgress[id] = event.label;
+      if (event.type === "assistant") {
         const item = useSessionsStore().byId[id];
         if (item && event.preview) {
           item.preview = event.preview;
           item.previewRole = "assistant";
           if (event.timestamp) item.lastTurnAt = event.timestamp;
         }
+        return;
+      }
+      if (event.type === "terminal") {
+        const sessions = useSessionsStore();
+        sessions.setStatus(id, "exited", false, false);
+        if (event.timestamp) sessions.setBoundaryAt(id, event.timestamp);
+        usePromptPendingStore().settleDispatched(id, {
+          ...(typeof sourceIndex === "number" ? { sourceIndex } : {}),
+          ...(event.timestamp ? { timestamp: event.timestamp } : {}),
+        });
+        delete this.turnProgress[id];
+        activeToolLabels.delete(id);
+        return;
+      }
+      if (event.type === "compaction-complete") {
+        // The durable record repairs a missed realtime `compacting:false`
+        // push without changing the surrounding turn's running state.
+        useSessionsStore().setCompacting(id, false);
         return;
       }
       if (event.type === "tool-start") {
@@ -389,9 +435,37 @@ export const useLiveStore = defineStore("live", {
         return;
       }
       const labels = activeToolLabels.get(id);
-      const label = labels?.get(event.callId) ?? "Action";
       labels?.delete(event.callId);
-      this.turnProgress[id] = `✓ Completed · ${label.replace(/^⚙\s*/, "")}`;
+      // A completed tool is already visible as a settled card in the
+      // transcript. Keeping "Completed · exec" in the live status strip made
+      // an otherwise healthy turn look frozen between tool calls. If another
+      // concurrent tool remains, keep showing that one; otherwise return to
+      // the honest generic running state until the next observable activity.
+      const remaining = labels && labels.size > 0
+        ? Array.from(labels.values()).at(-1)
+        : undefined;
+      if (!remaining) activeToolLabels.delete(id);
+      this.turnProgress[id] = remaining ?? "Codex is working…";
+    },
+    scheduleViewedTranscriptRepair(id: string) {
+      const previous = viewedTranscriptRepairTimers.get(id);
+      if (previous) clearTimeout(previous);
+      const timer = setTimeout(() => {
+        viewedTranscriptRepairTimers.delete(id);
+        if (useUiStore().selectedSessionId !== id) return;
+        // If the session was opened while the turn completed, its initial tail
+        // request may have captured the pre-reply file. Let that request settle,
+        // then force a second read instead of coalescing onto the stale snapshot.
+        const initialFetch = tailFetchWork.get(id)?.promise;
+        void (async () => {
+          if (initialFetch) await initialFetch.catch(() => undefined);
+          if (useUiStore().selectedSessionId !== id) return;
+          await this.refreshSession(id, true);
+        })().catch((error) => {
+          console.warn(`[live] viewed transcript repair failed for ${id}: ${(error as Error).message}`);
+        });
+      }, VIEWED_TRANSCRIPT_REPAIR_MS);
+      viewedTranscriptRepairTimers.set(id, timer);
     },
     startGlobal() {
       if (this.globalUnsub) return;
@@ -466,7 +540,9 @@ export const useLiveStore = defineStore("live", {
           sessions.addOrTouch(merged);
 
           const row = sessions.byId[id];
-          const isViewed = id === useUiStore().selectedSessionId;
+          const selectedSessionId = useUiStore().selectedSessionId;
+          const isSelected = id === selectedSessionId;
+          const isActivelyViewed = isSessionActivelyViewed(id, selectedSessionId);
           const assistantPreviewAdvanced = !!newPreview
             && newPreviewRole === "assistant"
             // Ignore a stale/out-of-order event that addOrTouch rejected.
@@ -478,9 +554,15 @@ export const useLiveStore = defineStore("live", {
               || isNewerTurnTimestamp(row.lastTurnAt, previousLastTurnAt)
             );
 
-          if (isViewed) {
+          // Keep the selected transcript warm even when the installed app is
+          // behind another window, so it is current when the user returns.
+          if (isSelected && assistantPreviewAdvanced) {
+            this.scheduleViewedTranscriptRepair(id);
+          }
+
+          if (isActivelyViewed) {
             // Prevent a transient selection/promotion race from leaving a
-            // badge on the conversation that is already on screen. Merely
+            // badge on the conversation the user is actually seeing. Merely
             // skipping the next bump is insufficient if an earlier preview
             // already added one.
             if (newPreviewRole === "user") {
@@ -576,8 +658,13 @@ export const useLiveStore = defineStore("live", {
         if (id && at) {
           const row = sessions.byId[id];
           if (row) {
-            if (!row.readAt || at > row.readAt) row.readAt = at;
-            sessions.reconcileRead(row);
+            if (!row.readAt || isNewerTurnTimestamp(at, row.readAt)) row.readAt = at;
+            const unreadCount = msg.unreadCount;
+            if (Number.isSafeInteger(unreadCount) && Number(unreadCount) >= 0) {
+              sessions.setUnread(id, Number(unreadCount));
+            } else {
+              sessions.reconcileRead(row);
+            }
           }
         }
       } else if (kind === "session-status") {
@@ -726,17 +813,10 @@ export const useLiveStore = defineStore("live", {
           if (seq <= stored) return;
           saveLastNotifSeq(seq);
         }
-        // Foreground AND tab-visible session: the assistant reply renders
-        // inline in the message list, the toast/badge on top is noise.
-        // If the user is selected on this session but has the tab in the
-        // background (or focus elsewhere), still treat as unread — they
-        // weren't "looking" when the reply landed.
-        // The session you currently have OPEN never toasts and never bumps
-        // unread — WeChat-style. The reply renders inline in the message
-        // list; a toast on top is noise. This holds even when the tab is
-        // backgrounded: coming back to a conversation you already had open
-        // shouldn't greet you with a stale toast for it (the old `&&
-        // visible` gate did exactly that, which was the complaint).
+        // A reply is already read only when its conversation is selected AND
+        // this window is visible and focused. An installed PWA can stay alive
+        // while minimized or behind another app; that case must still produce
+        // an unread badge and (with permission) an OS notification.
         const id = msg.id as string;
         const ui = useUiStore();
         // Completion notifications carry the final visible reply in `body`.
@@ -749,6 +829,16 @@ export const useLiveStore = defineStore("live", {
         const alreadyRead = timestampCovers(item?.readAt, notificationAt);
         const supersededByNewerTurn = !!notificationAt
           && isNewerTurnTimestamp(item?.lastTurnAt, notificationAt);
+        const isSelected = id === ui.selectedSessionId;
+        const isActivelyViewed = isSessionActivelyViewed(id, ui.selectedSessionId);
+        if (
+          isSelected
+          && !supersededByNewerTurn
+          && preview
+          && preview !== "Turn completed"
+        ) {
+          this.scheduleViewedTranscriptRepair(id);
+        }
         if (alreadyRead || supersededByNewerTurn) {
           // A delayed end-turn from before the user's next outbound message is
           // not a new reply. Do not overwrite the newer sidebar preview, bump
@@ -763,8 +853,7 @@ export const useLiveStore = defineStore("live", {
           const at = typeof msg.timestamp === "string" ? msg.timestamp : "";
           if (at) item.lastTurnAt = at;
         }
-        const isViewed = id === ui.selectedSessionId;
-        if (isViewed) {
+        if (isActivelyViewed) {
           earlyAssistantUnread.delete(id);
           // Clear locally in the same event turn. Waiting for our own
           // mark-read broadcast lets a wrongly-early preview badge flash (and
@@ -778,14 +867,27 @@ export const useLiveStore = defineStore("live", {
           if (at) sessions.markReadAt(id, at);
           return;
         }
+        const authoritativeUnread = Number.isSafeInteger(msg.unreadCount) && Number(msg.unreadCount) >= 0
+          ? Number(msg.unreadCount)
+          : null;
+        if (authoritativeUnread !== null) {
+          earlyAssistantUnread.delete(id);
+          sessions.setUnread(id, authoritativeUnread);
+          // The server may have processed a monotonic read watermark before a
+          // delayed completion replay reached this client. Do not resurrect an
+          // OS notification when the canonical unread count is already zero.
+          if (authoritativeUnread === 0) return;
+        }
         const prefs = usePrefsStore();
         if (!shouldNotifyForSession({
           id,
           peer: msg.peer === true || item?.peer === true,
           subagent: msg.subagent === true || item?.subagent === true,
         }, prefs)) return;
-        if (earlyAssistantUnread.has(id)) earlyAssistantUnread.delete(id);
-        else sessions.bumpUnread(id);
+        if (authoritativeUnread === null) {
+          if (earlyAssistantUnread.has(id)) earlyAssistantUnread.delete(id);
+          else sessions.bumpUnread(id);
+        }
         if (!body.trim()) return;
         const notifications = useNotificationsStore();
         notifications.push({
@@ -795,7 +897,7 @@ export const useLiveStore = defineStore("live", {
           title: msg.title as string,
           body,
         });
-        osNotify({ sessionId: id, title: msg.title as string, body });
+        void osNotify({ sessionId: id, title: msg.title as string, body });
       }
     },
     subscribeToSession(id: string, from: number, tailN = ENGAGE_TAIL_N): number {
@@ -867,11 +969,19 @@ export const useLiveStore = defineStore("live", {
     refreshSession(id: string, force = false): Promise<void> {
       return this.fetchTailIntoCache(id, ENGAGE_HTTP_TAIL_N, force, "interactive");
     },
+    // Quietly reconcile a selected turn that still looks active. Unlike the
+    // normal foreground refresh this does not flash the user-facing syncing
+    // pill; durable user/assistant/terminal records repair both the sidebar
+    // preview and a missed session-status push.
+    reconcileRunningSession(id: string): Promise<void> {
+      return this.fetchTailIntoCache(id, ENGAGE_HTTP_TAIL_N, true, "interactive", false);
+    },
     async fetchTailIntoCache(
       id: string,
       n: number,
       force = false,
       priority: SessionTailPriority = "interactive",
+      showFetching = true,
     ): Promise<void> {
       const now = Date.now();
       const existing = tailFetchWork.get(id);
@@ -894,8 +1004,10 @@ export const useLiveStore = defineStore("live", {
 
       const requestId = (tailFetchRequestIds.get(id) ?? 0) + 1;
       tailFetchRequestIds.set(id, requestId);
-      this.tailFetching[id] = true;
-      this.tailErrors[id] = undefined;
+      if (showFetching) {
+        this.tailFetching[id] = true;
+        this.tailErrors[id] = undefined;
+      }
 
       let promise!: Promise<void>;
       promise = (async () => {
@@ -927,7 +1039,7 @@ export const useLiveStore = defineStore("live", {
           // background turns. Without observing these lines, a reload could keep
           // showing the user's prompt even though the assistant reply is already
           // present in the fetched tail.
-          for (const item of items) this.observeTurnProgressLine(id, item.raw);
+          for (const item of items) this.observeTurnProgressLine(id, item.raw, item.index);
           // Same-index disagreement or a shorter physical source proves that
           // append-only merge is unsafe (rewind/fork/rewrite). The bounded tail
           // becomes the new authoritative window; older history remains marked
@@ -963,7 +1075,7 @@ export const useLiveStore = defineStore("live", {
         tailFreshAt.set(id, Date.now());
       })()
         .catch((error) => {
-          if (tailFetchRequestIds.get(id) === requestId) {
+          if (showFetching && tailFetchRequestIds.get(id) === requestId) {
             this.tailErrors[id] = error instanceof Error ? error.message : String(error);
           }
           throw error;
@@ -971,7 +1083,7 @@ export const useLiveStore = defineStore("live", {
         .finally(() => {
           if (tailFetchWork.get(id)?.requestId !== requestId) return;
           tailFetchWork.delete(id);
-          this.tailFetching[id] = false;
+          if (showFetching) this.tailFetching[id] = false;
         });
 
       tailFetchWork.set(id, { requestId, priority, startedAt: now, promise });
@@ -994,7 +1106,7 @@ export const useLiveStore = defineStore("live", {
           .map((line) => ({ index: line.index, raw: line.raw }));
         const cache = useSessionCacheStore();
         if (bridgeItems.length) {
-          for (const item of bridgeItems) this.observeTurnProgressLine(id, item.raw);
+          for (const item of bridgeItems) this.observeTurnProgressLine(id, item.raw, item.index);
           cache.appendBatch(id, bridgeItems);
         }
         // Compact reads are byte-capped and may return only a suffix. Record
@@ -1033,6 +1145,7 @@ export const useLiveStore = defineStore("live", {
       // restore store coalesces duplicates, while network warming proceeds in
       // parallel and remains independently freshness-gated below.
       for (const id of ids) void cache.restore(id);
+      if (sessions.list.length > MAX_NETWORK_PREFETCH_SESSION_COUNT) return;
       let work!: Promise<void>;
       work = (async () => {
         // Cold JSONL indexing is intentionally serialized by the backend.
@@ -1059,8 +1172,12 @@ export const useLiveStore = defineStore("live", {
         unsub();
         delete this.perSession[id];
       }
-      const t = staleStreamTimers.get(id);
-      if (t) { clearTimeout(t); staleStreamTimers.delete(id); }
+      clearStaleStreamTimer(id);
+      const repair = viewedTranscriptRepairTimers.get(id);
+      if (repair) {
+        clearTimeout(repair);
+        viewedTranscriptRepairTimers.delete(id);
+      }
     },
     async resetAndReengage(id: string) {
       this.disengage(id);
@@ -1096,11 +1213,6 @@ export const useLiveStore = defineStore("live", {
         && sessionSubscriptions.get(id)?.generation !== generation
       ) return;
       const type = msg.type as string;
-
-      // Any per-session traffic for this id proves the tail is alive —
-      // disarm the desync watchdog.
-      const t = staleStreamTimers.get(id);
-      if (t) { clearTimeout(t); staleStreamTimers.delete(id); }
 
       if (type === "stream-reset") {
         let mode: "merge" | "replace" = "replace";
@@ -1144,8 +1256,9 @@ export const useLiveStore = defineStore("live", {
       if (type === "stream-line") {
         const idx = msg.index as number;
         const data = msg.data as string;
-        if (typeof idx !== "number" || !Number.isFinite(idx)) return;
-        this.observeTurnProgressLine(id, data);
+        if (typeof idx !== "number" || !Number.isFinite(idx) || typeof data !== "string") return;
+        clearStaleStreamTimer(id);
+        this.observeTurnProgressLine(id, data, idx);
         const cache = useSessionCacheStore();
         if (stageStreamReset(id, generation, [{ index: idx, raw: data }])) return;
         else cache.appendLine(id, idx, data);
@@ -1169,7 +1282,8 @@ export const useLiveStore = defineStore("live", {
           .filter((l) => typeof l?.index === "number" && Number.isFinite(l.index) && typeof l?.data === "string")
           .map((l) => ({ index: l.index, raw: l.data }));
         if (items.length === 0) return;
-        for (const item of items) this.observeTurnProgressLine(id, item.raw);
+        clearStaleStreamTimer(id);
+        for (const item of items) this.observeTurnProgressLine(id, item.raw, item.index);
         const cache = useSessionCacheStore();
         if (stageStreamReset(id, generation, items)) return;
         else cache.appendBatch(id, items);
@@ -1207,6 +1321,8 @@ export const useLiveStore = defineStore("live", {
       for (const t of staleStreamTimers.values()) clearTimeout(t);
       staleStreamTimers.clear();
       staleStreamHttpAt.clear();
+      for (const timer of viewedTranscriptRepairTimers.values()) clearTimeout(timer);
+      viewedTranscriptRepairTimers.clear();
       for (const pending of pendingStreamResets.values()) {
         if (pending.commitTimer) clearTimeout(pending.commitTimer);
         clearTimeout(pending.fallbackTimer);

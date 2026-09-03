@@ -57,4 +57,21 @@ describe("session cache physical cursor", () => {
     expect(cache.bySession["images-a"]?.lines[4]).toContain('"type":"response_item"');
     await cache.clear("images-a");
   });
+
+  it("does not invalidate transcript content for an identical replay batch", async () => {
+    const cache = useSessionCacheStore();
+    const item = { index: 0, raw: '{"type":"user"}' };
+    cache.appendBatch("duplicate-tail", [item]);
+    const entry = cache.bySession["duplicate-tail"]!;
+    const lines = entry.lines;
+    const contentRevision = entry.contentRevision;
+    const revision = entry.revision;
+
+    cache.appendBatch("duplicate-tail", [item]);
+
+    expect(entry.lines).toBe(lines);
+    expect(entry.contentRevision).toBe(contentRevision);
+    expect(entry.revision).toBe(revision);
+    await cache.clear("duplicate-tail");
+  });
 });

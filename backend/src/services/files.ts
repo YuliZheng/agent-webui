@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import { spawn, type SpawnOptions } from "node:child_process";
 import { mkdir, readFile, realpath, stat, readdir, writeFile } from "node:fs/promises";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { isWithin } from "../util/paths.js";
 import { RpcError } from "../types.js";
 
@@ -34,6 +34,24 @@ async function resolveAgainstRoots(path: string, roots: string[]): Promise<Resol
   let actual: string;
   try { actual = await realpath(resolve(path)); } catch { throw new RpcError(404, "File not found"); }
   if (!roots.some(root => isWithin(root, actual))) throw new RpcError(403, "File is outside allowed roots");
+  const info = await stat(actual);
+  const kind = info.isFile() ? "file" : info.isDirectory() ? "directory" : null;
+  if (!kind) throw new RpcError(400, "Expected a file or directory");
+  return { path: actual, kind, size: info.size, mtimeMs: info.mtimeMs };
+}
+
+/**
+ * Resolve a path for an explicit "show in file manager" action. Unlike file
+ * reads/listing, this does not expose content to the browser, so it may point
+ * outside session roots. It still accepts only an existing absolute path and
+ * the launcher only reveals files (it never executes them).
+ */
+export async function resolveLocalPathForReveal(path: string): Promise<ResolvedLocalPath> {
+  if (path.includes("\0") || !isAbsolute(path) || /^[\\/]{2}/.test(path)) {
+    throw new RpcError(400, "Expected an absolute local path");
+  }
+  let actual: string;
+  try { actual = await realpath(resolve(path)); } catch { throw new RpcError(404, "File or folder not found"); }
   const info = await stat(actual);
   const kind = info.isFile() ? "file" : info.isDirectory() ? "directory" : null;
   if (!kind) throw new RpcError(400, "Expected a file or directory");

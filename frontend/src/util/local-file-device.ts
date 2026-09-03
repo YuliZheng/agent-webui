@@ -14,10 +14,10 @@ export function localDirectoryBehavior(): LocalDirectoryBehavior {
     const saved = localStorage.getItem(DIRECTORY_BEHAVIOR_KEY);
     if (saved === "browse" || saved === "open-on-host") return saved;
   } catch { /* storage can be disabled */ }
-  // A browser cannot reliably prove that it is physically running on the host
-  // computer (a reverse proxy can make remote traffic look local). Require one
-  // explicit per-browser choice before links are allowed to launch Explorer.
-  return "browse";
+  // Fine-pointer clients use the desktop-native expectation for folder links:
+  // open the host file manager. A user can still switch this browser to the
+  // in-app directory browser; coarse-pointer/mobile clients always browse.
+  return "open-on-host";
 }
 
 export function setLocalDirectoryBehavior(value: LocalDirectoryBehavior): void {

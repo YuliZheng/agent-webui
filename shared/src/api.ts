@@ -37,6 +37,8 @@ export interface SessionListItem {
   lastTurnAt?: string | null;
   lastBoundaryAt?: string | null;
   readAt?: string | null;
+  /** Server-authoritative unread assistant-turn count for this session. */
+  unreadCount?: number;
 }
 
 export interface IndexedRawLine {
@@ -116,6 +118,40 @@ export interface AgentCapabilities {
     permissionMode?: string | null;
     sandboxMode?: string | null;
   };
+}
+
+export interface CodexThreadUsageGroup {
+  model: string | null;
+  reasoningEffort: string | null;
+  speed: string | null;
+  inputTokens: number | null;
+  cachedInputTokens: number | null;
+  netNewInputTokens: number | null;
+  outputTokens: number | null;
+  totalTokens: number | null;
+  /** Estimated ChatGPT usage credits, expressed in millionths of one credit. */
+  estimatedUsageCreditsMicros: number;
+}
+
+export interface CodexThreadUsage {
+  threadId: string;
+  /** Estimated ChatGPT usage credits, expressed in millionths of one credit. */
+  estimatedUsageCreditsMicros: number;
+  /** Estimated API-equivalent cost, expressed in millionths of one US dollar. */
+  estimatedUsageUsdMicros: number | null;
+  groups: CodexThreadUsageGroup[];
+}
+
+export interface CodexAccountUsageDailyBucket {
+  /** UTC calendar date reported by Codex, normally YYYY-MM-DD. */
+  startDate: string;
+  tokens: number;
+}
+
+export interface CodexUsageOverview {
+  threadUsage: CodexThreadUsage | null;
+  dailyUsageBuckets: CodexAccountUsageDailyBucket[];
+  accountLifetimeTokens: number | null;
 }
 
 export interface SessionSettings {
@@ -524,7 +560,12 @@ export function isSessionListItem(value: unknown): value is SessionListItem {
     (value.previewRole === undefined || value.previewRole === null || value.previewRole === "user" || value.previewRole === "assistant") &&
     isNullableString(value.lastTurnAt) &&
     isNullableString(value.lastBoundaryAt) &&
-    isNullableString(value.readAt)
+    isNullableString(value.readAt) &&
+    (value.unreadCount === undefined || (
+      typeof value.unreadCount === "number"
+      && Number.isSafeInteger(value.unreadCount)
+      && value.unreadCount >= 0
+    ))
   );
 }
 

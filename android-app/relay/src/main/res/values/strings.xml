@@ -2,4 +2,6 @@
     <string name="app_name">Tailnet Relay</string>
     <string name="notification_channel_name">Tailnet relay</string>
     <string name="notification_title">Tailnet relay active</string>
+    <string name="keep_alive_accessibility_label">Tailnet Relay watchdog</string>
+    <string name="keep_alive_accessibility_description">Checks only the local Tailnet Relay health endpoint and reopens the work-profile copy after system process cleanup. This service does not read screen content, take screenshots, or perform gestures.</string>
 </resources>

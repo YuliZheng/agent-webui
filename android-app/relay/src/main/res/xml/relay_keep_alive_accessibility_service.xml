@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:accessibilityEventTypes="typeWindowStateChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:canPerformGestures="false"
+    android:canRetrieveWindowContent="false"
+    android:canTakeScreenshot="false"
+    android:description="@string/keep_alive_accessibility_description"
+    android:isAccessibilityTool="false"
+    android:notificationTimeout="1000"
+    android:packageNames="com.lggram.tailnetrelay"
+    tools:targetApi="s" />

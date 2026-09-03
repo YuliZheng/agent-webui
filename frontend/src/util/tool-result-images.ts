@@ -59,6 +59,19 @@ export function extractToolResultImages(value: unknown): ToolResultImage[] {
   return out;
 }
 
+export function extractToolRunImages(values: readonly unknown[]): ToolResultImage[] {
+  const out: ToolResultImage[] = [];
+  const seen = new Set<string>();
+  for (const value of values) {
+    for (const image of extractToolResultImages(value)) {
+      if (seen.has(image.url)) continue;
+      seen.add(image.url);
+      out.push(image);
+    }
+  }
+  return out;
+}
+
 export function toolResultImageUrl(value: unknown): string | null {
   return imageUrl(value);
 }

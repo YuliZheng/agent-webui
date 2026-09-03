@@ -144,6 +144,70 @@ describe("Codex full context usage accumulator", () => {
     expect(result.tokens).toBe(475_000);
     expect(result.reportedTokens).toBe(475_000);
     expect(result.limit).toBe(450_000);
+    expect(result.cumulativeTokens).toBeUndefined();
+  });
+
+  it("keeps the provider's cumulative thread total across compaction", () => {
+    const accumulator = new CodexContextUsageAccumulator();
+    accumulator.pushRawLine(message("user", "first request ".repeat(400)));
+    accumulator.pushRawLine(line("event_msg", {
+      type: "token_count",
+      info: {
+        last_token_usage: { input_tokens: 9_900, output_tokens: 100, total_tokens: 10_000 },
+        total_token_usage: { input_tokens: 99_000, output_tokens: 1_000, total_tokens: 100_000 },
+        model_context_window: 258_400,
+      },
+    }));
+    accumulator.pushRawLine(JSON.stringify({ type: "event_msg", payload: { type: "context_compacted" } }));
+    accumulator.pushRawLine(message("assistant", "new answer ".repeat(300)));
+    accumulator.pushRawLine(line("event_msg", {
+      type: "token_count",
+      info: {
+        last_token_usage: { input_tokens: 4_900, output_tokens: 100, total_tokens: 5_000 },
+        total_token_usage: { input_tokens: 124_000, output_tokens: 1_000, total_tokens: 125_000 },
+        model_context_window: 258_400,
+      },
+    }));
+
+    const result = accumulator.result();
+    expect(result).toMatchObject({
+      tokens: 5_000,
+      cumulativeTokens: 125_000,
+      compactionCount: 1,
+    });
+    expect(result.cumulativeContributors?.find((item) => item.source === "user")?.tokens).toBeGreaterThan(0);
+    expect(result.cumulativeContributors?.find((item) => item.source === "assistant")?.tokens).toBeGreaterThan(0);
+    expect(result.cumulativeContributors?.reduce((sum, item) => sum + item.tokens, 0)).toBe(125_000);
+    expect(result.cumulativeContributors?.reduce((sum, item) => sum + item.percent, 0)).toBe(100);
+  });
+
+  it("does not attribute a full-window failure sentinel as cumulative usage", () => {
+    const accumulator = new CodexContextUsageAccumulator();
+    accumulator.pushRawLine(message("user", "valid request ".repeat(200)));
+    accumulator.pushRawLine(line("event_msg", {
+      type: "token_count",
+      info: {
+        last_token_usage: { input_tokens: 9_900, output_tokens: 100, total_tokens: 10_000 },
+        total_token_usage: { input_tokens: 99_000, output_tokens: 1_000, total_tokens: 100_000 },
+        model_context_window: 258_400,
+      },
+    }));
+    const before = accumulator.result().cumulativeContributors;
+
+    accumulator.pushRawLine(line("event_msg", {
+      type: "token_count",
+      info: {
+        last_token_usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+        total_token_usage: { input_tokens: 0, output_tokens: 0, total_tokens: 258_400 },
+        model_context_window: 258_400,
+      },
+    }));
+
+    const result = accumulator.result();
+    expect(result.tokens).toBe(258_400);
+    expect(result.cumulativeTokens).toBe(100_000);
+    expect(result.cumulativeContributors).toEqual(before);
+    expect(result.cumulativeContributors?.reduce((sum, item) => sum + item.tokens, 0)).toBe(100_000);
   });
 
   it("calibrates the stable hidden Codex base separately from the changing estimate gap", () => {

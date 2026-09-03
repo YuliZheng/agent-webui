@@ -16,6 +16,7 @@ export type BlockKind =
   | "AwaySummaryBlock"
   | "LocalCommandBlock"
   | "ApiErrorBlock"
+  | "EmptyCompletionBlock"
   | "CompactBoundaryBlock";
 
 function asLoose(rec: unknown): Record<string, unknown> | null | undefined {
@@ -125,6 +126,7 @@ export function pickBlock(rec: unknown): BlockKind | null {
       case "away_summary": return "AwaySummaryBlock";
       case "local_command": return "LocalCommandBlock";
       case "api_error": return "ApiErrorBlock";
+      case "empty_completion": return "EmptyCompletionBlock";
       case "compact_boundary": return "CompactBoundaryBlock";
       default: return null;
     }

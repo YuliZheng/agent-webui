@@ -255,7 +255,7 @@ describe("JSONL indexing and tails", () => {
     expect(jsonlIndexCacheSize()).toBe(MAX_LINE_INDEX_CACHE_ENTRIES);
     expect(jsonlIndexCachePaths()).toContain(touched);
     expect(jsonlIndexCachePaths()).not.toContain(paths[3]);
-  });
+  }, 20_000);
 
   it("uses sparse anchors for a 100k-line transcript", async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-webui-index-sparse-"));

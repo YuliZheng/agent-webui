@@ -16,4 +16,29 @@ describe("Codex inline visualization directives", () => {
     const text = '::codex-inline-vis{file="../secret.html"}';
     expect(splitInlineVisualizations(text)).toEqual([{ kind: "text", text }]);
   });
+
+  it("does not render a directive shown as inline code or prose", () => {
+    const inline = 'Example: `::codex-inline-vis{file="example.html"}`';
+    const prose = 'Use ::codex-inline-vis{file="example.html"} to embed it.';
+    expect(splitInlineVisualizations(inline)).toEqual([{ kind: "text", text: inline }]);
+    expect(splitInlineVisualizations(prose)).toEqual([{ kind: "text", text: prose }]);
+  });
+
+  it("does not render directive examples inside fenced code", () => {
+    const text = [
+      "```text",
+      '::codex-inline-vis{file="example.html"}',
+      "```",
+      "",
+      "~~~",
+      '::codex-inline-vis{file="other.html"}',
+      "~~~",
+    ].join("\n");
+    expect(splitInlineVisualizations(text)).toEqual([{ kind: "text", text }]);
+  });
+
+  it("requires the directive to occupy its own unindented line", () => {
+    const indented = '    ::codex-inline-vis{file="example.html"}';
+    expect(splitInlineVisualizations(indented)).toEqual([{ kind: "text", text: indented }]);
+  });
 });

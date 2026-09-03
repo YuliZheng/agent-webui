@@ -3,6 +3,10 @@ import { join } from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import { useSessionsStore } from "../src/stores/sessions.js";
+import {
+  flagEmojiAssetKey,
+  sessionTitleEmojiForDisplay,
+} from "../src/util/session-title-emoji.js";
 
 const sessionRow = readFileSync(
   join(process.cwd(), "src/components/SessionRow.vue"),
@@ -10,6 +14,10 @@ const sessionRow = readFileSync(
 );
 const mainPane = readFileSync(
   join(process.cwd(), "src/components/MainPane.vue"),
+  "utf8",
+);
+const emojiGlyph = readFileSync(
+  join(process.cwd(), "src/components/EmojiGlyph.vue"),
   "utf8",
 );
 
@@ -50,10 +58,24 @@ describe("session title emoji presentation", () => {
   it("uses the emoji as the row avatar but keeps it in non-sidebar titles", () => {
     expect(sessionRow).toContain("titleEmoji.value || avatarText");
     expect(sessionRow).toContain("avatarIsEmoji");
+    expect(sessionRow).toContain("<EmojiGlyph");
     expect(sessionRow).toContain("{{ title }}");
     expect(mainPane).toContain("const displayTitle = computed");
-    expect(mainPane).toContain("item.value?.titleEmoji");
-    expect(mainPane).toContain("{{ displayTitle }}");
-    expect(mainPane).toContain('[s.title, s.titleEmoji].filter(Boolean).join(" ")');
+    expect(mainPane).toContain("<SessionTitleText");
+    expect(emojiGlyph).toContain("@twemoji/svg/1f1*.svg");
+    expect(emojiGlyph).toContain("cw-emoji-glyph inline-flex");
+    expect(emojiGlyph).toContain("cw-emoji-glyph-system");
+    expect(emojiGlyph).not.toContain("transform: translate(");
+  });
+
+  it("renders country flags from Twemoji assets instead of Windows letter fallbacks", () => {
+    expect(flagEmojiAssetKey("🇨🇭")).toBe("1f1e8-1f1ed");
+    expect(flagEmojiAssetKey("🏔️")).toBeNull();
+  });
+
+  it("fills missing emoji only for auto-managed titles", () => {
+    expect(sessionTitleEmojiForDisplay("瑞士行程与交通", null, "auto")).toBe("✈️");
+    expect(sessionTitleEmojiForDisplay("修复页面错误", "✨", "auto")).toBe("✨");
+    expect(sessionTitleEmojiForDisplay("手动标题", null, "manual")).toBeNull();
   });
 });

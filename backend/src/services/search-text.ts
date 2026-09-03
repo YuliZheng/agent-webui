@@ -1,4 +1,8 @@
 import { asRecord, asString } from "../types.js";
+import {
+  codexVisibleMessage,
+  isCodexInjectedContextText,
+} from "@agent-webui/shared/codex";
 
 export interface SearchableRecord {
   haystack: string;
@@ -19,28 +23,6 @@ function contentText(value: unknown): string {
       ? [part.text]
       : [];
   }).join("\n");
-}
-
-function codexEventText(value: unknown): string {
-  if (typeof value === "string") return value;
-  if (Array.isArray(value)) return value.map(codexEventText).filter(Boolean).join("\n");
-  const record = asRecord(value);
-  if (!record) return "";
-  if (typeof record.text === "string") return record.text;
-  if (typeof record.message === "string") return record.message;
-  return record.content === undefined ? "" : codexEventText(record.content);
-}
-
-function isCodexInjectedContext(text: string): boolean {
-  const value = text.trimStart();
-  return value.startsWith("# AGENTS.md instructions\n\n<INSTRUCTIONS>")
-    || value.startsWith("<codex_internal_context")
-    || value.startsWith("<permissions instructions>")
-    || value.startsWith("<collaboration_mode>")
-    || value.startsWith("<skills_instructions>")
-    || value.startsWith("<apps_instructions>")
-    || value.startsWith("<plugins_instructions>")
-    || value.startsWith("<environment_context>");
 }
 
 function normalizedResult(text: string, uuid?: string): SearchableRecord | null {
@@ -64,19 +46,13 @@ function claudeSearchText(record: Record<string, unknown>): SearchableRecord | n
 }
 
 function codexSearchText(record: Record<string, unknown>): SearchableRecord | null {
-  // The Codex renderer deliberately uses event_msg for the clean user and
-  // assistant bubbles. response_item/message records are transport duplicates
-  // and may contain injected instructions or local image envelopes.
-  if (record.type !== "event_msg") return null;
-  const payload = asRecord(record.payload);
-  if (!payload) return null;
-  const kind = asString(payload.type) ?? asString(payload.kind);
-  if (kind !== "user_message" && kind !== "agent_message") {
-    return null;
-  }
-  const text = codexEventText(payload.message ?? payload.text ?? payload.content);
-  if (kind === "user_message" && isCodexInjectedContext(text)) return null;
-  return normalizedResult(text, asString(payload.id));
+  // Search only clean event forms. response_item/message can carry injected
+  // instructions and local image envelopes; legacy and item_completed events
+  // are the user-visible transcript representations.
+  const message = codexVisibleMessage(record);
+  if (!message || message.transport === "response") return null;
+  if (message.role === "user" && isCodexInjectedContextText(message.text)) return null;
+  return normalizedResult(message.text, message.id);
 }
 
 /**
@@ -86,7 +62,9 @@ function codexSearchText(record: Record<string, unknown>): SearchableRecord | nu
  * records before collecting their raw gram signature.
  */
 export function searchableRecordPrefix(prefix: string): boolean {
-  const types = [...prefix.matchAll(/"(?:type|kind)"\s*:\s*"([^"]+)"/gu)].map(match => match[1]);
+  const types = [...prefix.matchAll(/"(?:type|kind)"\s*:\s*"([^"]+)"/gu)]
+    .map(match => match[1])
+    .filter((type): type is string => typeof type === "string");
   const topLevelType = types[0];
   if (topLevelType === "user" || topLevelType === "assistant") {
     return !/"(?:isMeta|isSidechain|isCompactSummary)"\s*:\s*true/gu.test(prefix)
@@ -95,8 +73,12 @@ export function searchableRecordPrefix(prefix: string): boolean {
       && !/<local-command-/u.test(prefix);
   }
   if (topLevelType !== "event_msg") return false;
-  return types.slice(1).some(type => type === "user_message" || type === "agent_message")
-    && !isCodexInjectedContext(prefix.slice(prefix.indexOf("\"message\"") + 9));
+  const nested = types.slice(1);
+  const legacyMessage = nested.some(type => type === "user_message" || type === "agent_message");
+  const completedMessage = nested.includes("item_completed")
+    && nested.some(type => /^(?:User|Agent|Assistant)Message$/u.test(type));
+  return (legacyMessage || completedMessage)
+    && !/(?:# AGENTS\.md instructions|<codex_internal_context|<permissions instructions>|<skills_instructions>|<environment_context>)/u.test(prefix);
 }
 
 export function searchableRecordText(raw: string): SearchableRecord | null {

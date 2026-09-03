@@ -37,6 +37,22 @@
                 android:value="Persistent work-profile loopback network relay" />
         </service>
 
+        <service
+            android:name=".RelayKeepAliveAccessibilityService"
+            android:description="@string/keep_alive_accessibility_description"
+            android:directBootAware="true"
+            android:exported="true"
+            android:label="@string/keep_alive_accessibility_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+            android:stopWithTask="false">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/relay_keep_alive_accessibility_service" />
+        </service>
+
         <receiver
             android:name=".BootReceiver"
             android:directBootAware="true"

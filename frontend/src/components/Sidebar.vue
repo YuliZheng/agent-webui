@@ -5,6 +5,7 @@ import { usePromptPendingStore } from "../stores/prompt-pending.js";
 import { usePrefsStore } from "../stores/prefs.js";
 import { useUiStore } from "../stores/ui.js";
 import { useDraftsStore } from "../stores/drafts.js";
+import { useSessionCacheStore } from "../stores/session-cache.js";
 import { searchContent, refreshBackend } from "../api/sessions.js";
 import { useScrollTargetStore } from "../stores/scroll-target.js";
 import { useSearchHighlightStore } from "../stores/search-highlight.js";
@@ -14,10 +15,20 @@ import { isOrdinarySidebarSessionVisible } from "../util/session-visibility.js";
 import { effectiveSessionActivityMs } from "../util/session-recency.js";
 import { shouldRunContentSearch } from "../util/search-query.js";
 import { withoutPinnedSessions } from "../util/sidebar-pinning.js";
+import {
+  orderSessionForkRows,
+  type OrderedSessionRow,
+} from "../util/session-fork-tree.js";
 import { APP_BACK_PRIORITY, registerAppBackHandler } from "../util/app-back.js";
 import { setPwaLayerActive } from "../util/pwa-history.js";
+import {
+  hasOpenSessionNavBlockingSurface,
+  shouldPreserveSessionArrowKey,
+} from "../util/session-keyboard-nav.js";
 import { useNotificationsStore } from "../stores/notifications.js";
+import { primeMessageTimeline } from "../util/message-timeline-cache.js";
 import SessionRow from "./SessionRow.vue";
+import HomeConnectionStatus from "./HomeConnectionStatus.vue";
 import NewSessionModal from "./modals/NewSessionModal.vue";
 import SettingsModal from "./modals/SettingsModal.vue";
 
@@ -26,6 +37,8 @@ const SIDEBAR_WIDTH_KEY = "cw:sidebar-width";
 const MIN_WIDTH = 200;
 const MAX_WIDTH = 720;
 const DEFAULT_WIDTH = 288; // matches w-72
+const SESSION_WINDOW_STEP = 150;
+const visibleSessionLimit = ref(SESSION_WINDOW_STEP);
 
 // "flat" = collapse the per-cwd groups into a single recency-ranked list,
 // with each row showing its own cwd. Active / Pinned / manual groups still
@@ -236,6 +249,7 @@ const prefs = usePrefsStore();
 const drafts = useDraftsStore();
 const scrollTarget = useScrollTargetStore();
 const searchHighlight = useSearchHighlightStore();
+const sessionCache = useSessionCacheStore();
 
 // Click handler for search results: if this row matched on content (uuid
 // returned by backend), arm a scroll target so MessageList lands on that
@@ -556,13 +570,31 @@ const rankedResults = computed<RankedRow[]>(() => {
   return out.slice(0, MAX_RANKED_RESULTS);
 });
 
-const visibleIds = computed(() =>
+const eligibleVisibleIds = computed(() =>
   allIds.value.filter(
     (id) =>
       isOrdinarySidebarSessionVisible(sessions.byId[id], prefs, ui.selectedSessionId) &&
       matchesSearch(id),
   ),
 );
+const visibleIds = computed(() => {
+  if (searchActive.value) return eligibleVisibleIds.value;
+  const windowed = eligibleVisibleIds.value.slice(0, visibleSessionLimit.value);
+  // Keep a deep-linked/searched older chat anchored in the desktop sidebar
+  // even when it falls outside the default recent window.
+  const selected = ui.selectedSessionId;
+  if (selected && eligibleVisibleIds.value.includes(selected) && !windowed.includes(selected)) {
+    windowed.unshift(selected);
+  }
+  return windowed;
+});
+const hiddenVisibleSessionCount = computed(() => Math.max(
+  0,
+  eligibleVisibleIds.value.length - visibleIds.value.length,
+));
+function showOlderSessions(): void {
+  visibleSessionLimit.value += SESSION_WINDOW_STEP;
+}
 const totalVisibleUnread = computed(() =>
   visibleIds.value.reduce((total, id) => total + (sessions.unreadBySession[id] ?? 0), 0),
 );
@@ -576,7 +608,7 @@ const mobileUnreadLabel = computed(() =>
 // what the eye sees: forks stay under their parent, collapsed groups are
 // skipped (their rows aren't visible), and search mode follows the ranked
 // results. Keep this in sync with the template render order below.
-function navOrder(): string[] {
+function buildNavigationSessionIds(): string[] {
   if (searchActive.value) {
     const ranked = rankedResults.value.map((r) => r.id);
     return idMatch.value ? [idMatch.value, ...ranked] : ranked;
@@ -604,7 +636,7 @@ function navOrder(): string[] {
 // it marks-read + pushes browser history like a normal click, then scrolls the
 // newly-selected row into view so the sidebar follows the selection.
 function switchSession(dir: 1 | -1) {
-  const ids = navOrder();
+  const ids = navigationSessionIds.value;
   if (ids.length === 0) return;
   const idx = ui.selectedSessionId ? ids.indexOf(ui.selectedSessionId) : -1;
   const next = idx === -1
@@ -612,6 +644,7 @@ function switchSession(dir: 1 | -1) {
     : Math.min(Math.max(idx + dir, 0), ids.length - 1);
   const id = ids[next];
   if (!id) return;
+  preferredWarmDirection = dir;
   ui.select(id);
   void nextTick(() => {
     document
@@ -670,11 +703,10 @@ function isSingleVisualLine(textarea: HTMLTextAreaElement): boolean {
 }
 
 // Keep the established Tab / Shift+Tab navigation everywhere. In the WeChat
-// skin, also mirror current desktop WeChat: ArrowUp/ArrowDown switch chats
-// while the composer is visually one line, but return to normal caret
-// navigation as soon as explicit newlines or wrapping make it multiline.
-// A closer control may consume a key first (e.g. slash-menu Up/Down); input,
-// rename, settings, IME, and modified-arrow behavior remain untouched.
+// skin, ArrowUp/ArrowDown are page-level chat navigation: clicking ordinary
+// content or a button must not silently disable them. Editing controls and
+// composite widgets keep their native arrows; the one-line composer retains
+// the established WeChat shortcut and returns to caret movement when it wraps.
 function onSessionNavKey(e: KeyboardEvent) {
   if (e.defaultPrevented || e.isComposing) return;
   if (e.key === "Escape" && mobileHeaderMenuOpen.value) {
@@ -684,13 +716,14 @@ function onSessionNavKey(e: KeyboardEvent) {
   }
   if (e.ctrlKey || e.metaKey || e.altKey) return;
 
-  if (
-    (e.key === "ArrowUp" || e.key === "ArrowDown")
-    && !e.shiftKey
-    && prefs.messageDisplayStyle === "wechat"
-    && isComposerTextarea(e.target)
-    && isSingleVisualLine(e.target)
-  ) {
+  const isSessionArrow = e.key === "ArrowUp" || e.key === "ArrowDown";
+  if (isSessionArrow && !e.shiftKey && prefs.messageDisplayStyle === "wechat") {
+    if (mobileHeaderMenuOpen.value || hasOpenSessionNavBlockingSurface()) return;
+    if (isComposerTextarea(e.target)) {
+      if (!isSingleVisualLine(e.target)) return;
+    } else if (shouldPreserveSessionArrowKey(e.target)) {
+      return;
+    }
     e.preventDefault();
     switchSession(e.key === "ArrowUp" ? -1 : 1);
     return;
@@ -773,73 +806,20 @@ function idsInGroup(name: string): string[] {
   );
 }
 
-interface OrderedRow { id: string; depth: number }
-interface CwdGroup { key: string; label: string; rows: OrderedRow[]; latestMtime: number }
+interface CwdGroup { key: string; label: string; rows: OrderedSessionRow[]; latestMtime: number }
 
-// Reorder a flat list of sessionIds into a parent-then-indented-children tree.
-// A session is treated as a child if its parentSessionId is also in `ids`;
-// otherwise it's rendered at the top level (an "orphan" fork is shown flat).
-// Children inherit the order they had in `ids` (mtime-desc), which means the
-// most-recently-touched fork appears first under its parent.
-//
-// Cycle-safe: a `visited` set guards against infinite recursion if the
-// underlying parent map has a cycle (which can happen with corrupted
-// forks.json from older detector versions). After the normal root-first
-// pass, any session not yet visited is rendered at depth 0. This guarantees
-// every session in `ids` shows up exactly once, no matter the data.
-function orderWithForks(ids: string[]): OrderedRow[] {
-  const idSet = new Set(ids);
-  const childrenOf = new Map<string, string[]>();
-  for (const id of ids) {
-    const parent = sessions.byId[id]?.parentSessionId ?? null;
-    if (parent && parent !== id && idSet.has(parent)) {
-      const arr = childrenOf.get(parent) ?? [];
-      arr.push(id);
-      childrenOf.set(parent, arr);
-    }
-  }
-  // Rank each root/fork by the FRESHEST activity anywhere in its fork tree
-  // (subtree-max effectiveMtime), not just its own. Without this a parent
-  // whose last turn is old sinks to the bottom even when one of its forks
-  // was just active — dragging the recently-used fork down with it. Memoized;
-  // cycle-guarded so corrupted forks.json can't infinite-loop.
-  const subMax = new Map<string, number>();
-  const computing = new Set<string>();
-  function subtreeMax(id: string): number {
-    const cached = subMax.get(id);
-    if (cached !== undefined) return cached;
-    if (computing.has(id)) return effectiveMtime(id);
-    computing.add(id);
-    let m = effectiveMtime(id);
-    for (const k of childrenOf.get(id) ?? []) m = Math.max(m, subtreeMax(k));
-    computing.delete(id);
-    subMax.set(id, m);
-    return m;
-  }
-  const bySubtreeDesc = (a: string, b: string) => subtreeMax(b) - subtreeMax(a);
-  const out: OrderedRow[] = [];
-  const visited = new Set<string>();
-  function visit(id: string, depth: number) {
-    if (visited.has(id)) return;
-    visited.add(id);
-    out.push({ id, depth });
-    const kids = childrenOf.get(id);
-    if (!kids) return;
-    // Siblings ordered by their own subtree freshness (newest fork first).
-    for (const k of [...kids].sort(bySubtreeDesc)) visit(k, depth + 1);
-  }
-  // Pass 1: traditional roots — no parent or parent not in this list —
-  // ordered by their subtree's freshest activity so a tree with a recently
-  // used fork floats up as a unit.
-  const roots = ids.filter((id) => {
-    const parent = sessions.byId[id]?.parentSessionId ?? null;
-    return !parent || !idSet.has(parent);
+// Render sections independently while deriving indentation from the complete
+// visible hierarchy. A child therefore stays recognizable as a fork even when
+// Active, Pinned, or a manual group omits its parent.
+function orderWithForks(ids: string[]): OrderedSessionRow[] {
+  return orderSessionForkRows(ids, {
+    parentOf: (id) => sessions.byId[id]?.parentSessionId,
+    hierarchyIds: eligibleVisibleIds.value,
   });
-  for (const id of [...roots].sort(bySubtreeDesc)) visit(id, 0);
-  // Pass 2: anything still unvisited (cycle members) gets surfaced at depth 0
-  // so the user never loses a session.
-  for (const id of ids) visit(id, 0);
-  return out;
+}
+
+function rowsInGroup(name: string): OrderedSessionRow[] {
+  return orderWithForks(idsInGroup(name));
 }
 
 // Auto-group ungrouped (and unpinned) sessions by their cwd. Group label is
@@ -867,6 +847,73 @@ const cwdGroups = computed<CwdGroup[]>(() => {
     groups.push({ key: g.key, label: g.label, rows: orderWithForks(g.ids), latestMtime: g.latestMtime });
   }
   return groups.sort((a, b) => b.latestMtime - a.latestMtime);
+});
+
+// The visible navigation order can be moderately expensive to assemble when
+// the sidebar has many groups/forks. Cache it until one of its actual inputs
+// changes instead of rebuilding it synchronously on every key press.
+const navigationSessionIds = computed(buildNavigationSessionIds);
+
+type IdleWindow = Window & {
+  requestIdleCallback?: (callback: IdleRequestCallback, options?: IdleRequestOptions) => number;
+  cancelIdleCallback?: (handle: number) => void;
+};
+let neighborWarmGeneration = 0;
+let cancelNeighborWarm: (() => void) | null = null;
+let preferredWarmDirection: 1 | -1 | null = null;
+
+function scheduleNeighborWarm(ids: string[], selectedId: string | null): void {
+  neighborWarmGeneration++;
+  cancelNeighborWarm?.();
+  cancelNeighborWarm = null;
+  if (!selectedId) return;
+  const selectedIndex = ids.indexOf(selectedId);
+  if (selectedIndex < 0) return;
+
+  const direction = preferredWarmDirection ?? 1;
+  preferredWarmDirection = null;
+  const candidates = [ids[selectedIndex + direction], ids[selectedIndex - direction]]
+    .filter((id): id is string => !!id && !sessions.isPending(id));
+  if (candidates.length === 0) return;
+
+  const generation = neighborWarmGeneration;
+  const run = () => {
+    cancelNeighborWarm = null;
+    void (async () => {
+      for (const id of candidates) {
+        await sessionCache.restore(id);
+        if (generation !== neighborWarmGeneration) return;
+        const entry = sessionCache.bySession[id];
+        if (!entry) continue;
+        primeMessageTimeline({
+          sessionId: id,
+          contentRevision: entry.contentRevision,
+          lines: entry.lines,
+          isCodex: sessions.byId[id]?.agent === "codex",
+          suppressLatestEmptyCompletion: sessions.capacityRetryBySession[id] != null,
+        });
+      }
+    })();
+  };
+
+  const idleWindow = window as IdleWindow;
+  if (idleWindow.requestIdleCallback && idleWindow.cancelIdleCallback) {
+    const handle = idleWindow.requestIdleCallback(run, { timeout: 700 });
+    cancelNeighborWarm = () => idleWindow.cancelIdleCallback?.(handle);
+  } else {
+    const handle = window.setTimeout(run, 160);
+    cancelNeighborWarm = () => window.clearTimeout(handle);
+  }
+}
+
+watch(
+  [navigationSessionIds, () => ui.selectedSessionId],
+  ([ids, selectedId]) => scheduleNeighborWarm(ids, selectedId),
+  { immediate: true, flush: "post" },
+);
+onBeforeUnmount(() => {
+  neighborWarmGeneration++;
+  cancelNeighborWarm?.();
 });
 
 const caret = (key: string) => (collapsed[key] ? "▸" : "▾");
@@ -1145,6 +1192,7 @@ function runningInIds(ids: string[]): boolean {
         </button>
       </div>
     </header>
+    <HomeConnectionStatus v-if="!searchOpen" class="md:hidden" />
     <!-- Chat list. Hidden when the WeChat-style search page is open; the
          search view above renders its own focused results list. -->
     <div
@@ -1190,7 +1238,13 @@ function runningInIds(ids: string[]): boolean {
             >{{ unreadInIds(activeSessionIds) > 99 ? '99+' : unreadInIds(activeSessionIds) }}</span>
           </div>
           <template v-if="!collapsed['__active__']">
-            <SessionRow v-for="id in activeSessionIds" :key="'a-' + id" :id="id" :hide-cwd="!flatMode" />
+            <SessionRow
+              v-for="row in orderWithForks(activeSessionIds)"
+              :key="'a-' + row.id"
+              :id="row.id"
+              :depth="row.depth"
+              :hide-cwd="!flatMode"
+            />
           </template>
         </div>
         <div v-if="pinnedSessionIds.length" class="border-b border-[var(--cw-border)]  pb-1.5 mb-1.5">
@@ -1214,7 +1268,13 @@ function runningInIds(ids: string[]): boolean {
             >{{ unreadInIds(pinnedSessionIds) > 99 ? '99+' : unreadInIds(pinnedSessionIds) }}</span>
           </div>
           <template v-if="!collapsed['__pinned__']">
-            <SessionRow v-for="id in pinnedSessionIds" :key="'p-' + id" :id="id" :hide-cwd="!flatMode" />
+            <SessionRow
+              v-for="row in orderWithForks(pinnedSessionIds)"
+              :key="'p-' + row.id"
+              :id="row.id"
+              :depth="row.depth"
+              :hide-cwd="!flatMode"
+            />
           </template>
         </div>
         <div v-for="(_group, name) in prefs.groups" :key="name" class="border-b border-[var(--cw-border)]  pb-1.5 mb-1.5">
@@ -1238,7 +1298,13 @@ function runningInIds(ids: string[]): boolean {
             >{{ unreadInIds(idsInGroup(name as unknown as string)) > 99 ? '99+' : unreadInIds(idsInGroup(name as unknown as string)) }}</span>
           </div>
           <template v-if="!collapsed[name as unknown as string]">
-            <SessionRow v-for="id in idsInGroup(name as unknown as string)" :key="'g-' + name + '-' + id" :id="id" :hide-cwd="!flatMode" />
+            <SessionRow
+              v-for="row in rowsInGroup(name as unknown as string)"
+              :key="'g-' + name + '-' + row.id"
+              :id="row.id"
+              :depth="row.depth"
+              :hide-cwd="!flatMode"
+            />
           </template>
         </div>
         <!-- Flat mode: collapse all the cwd buckets into one recency-ranked
@@ -1309,6 +1375,14 @@ function runningInIds(ids: string[]): boolean {
           </template>
         </div>
         </template>
+        <button
+          v-if="!searchActive && hiddenVisibleSessionCount > 0"
+          type="button"
+          class="mx-3 my-3 w-[calc(100%-1.5rem)] rounded-lg border border-[var(--cw-border)] px-3 py-2 text-xs font-medium opacity-70 hover:opacity-100 hover:bg-[var(--cw-panel-2)] transition"
+          @click="showOlderSessions"
+        >
+          Show older conversations · {{ hiddenVisibleSessionCount }} remaining
+        </button>
     </div>
     <!-- Drag-resize handle only on desktop — mobile sidebar is full-width
          and isn't horizontally resizable. -->

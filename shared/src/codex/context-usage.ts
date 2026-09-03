@@ -26,8 +26,15 @@ export interface CodexContextUsageSummary {
   tokens: number;
   limit: number | null;
   compactionCount: number;
+  /** Provider-reported token total accumulated across the entire thread. */
+  cumulativeTokens?: number;
   reportedTokens?: number;
   contributors?: readonly CodexContextContributor[];
+  /**
+   * Estimated source attribution for the provider-reported cumulative total.
+   * Unlike `contributors`, this survives context compaction.
+   */
+  cumulativeContributors?: readonly CodexContextContributor[];
 }
 
 const CONTRIBUTOR_LABELS: Record<CodexContextContributorSource, string> = {
@@ -296,6 +303,33 @@ function reconcile(
     .sort((a, b) => b.tokens - a.tokens);
 }
 
+function allocateProportionally(
+  rawTotals: ReadonlyMap<CodexContextContributorSource, number>,
+  authoritativeTotal: number,
+): ReadonlyMap<CodexContextContributorSource, number> {
+  const target = Number.isFinite(authoritativeTotal)
+    ? Math.max(0, Math.floor(authoritativeTotal))
+    : 0;
+  if (!target) return new Map();
+
+  const entries = [...rawTotals.entries()].filter(([, tokens]) => Number.isFinite(tokens) && tokens > 0);
+  const rawTotal = entries.reduce((sum, [, tokens]) => sum + tokens, 0);
+  if (!rawTotal) return new Map([["other", target]]);
+
+  const scaled = entries.map(([source, tokens], index) => {
+    const exact = (tokens * target) / rawTotal;
+    const floor = Math.floor(exact);
+    return { source, tokens: floor, remainder: exact - floor, index };
+  });
+  let remaining = target - scaled.reduce((sum, item) => sum + item.tokens, 0);
+  for (const item of [...scaled].sort((a, b) => b.remainder - a.remainder || a.index - b.index)) {
+    if (remaining <= 0) break;
+    item.tokens++;
+    remaining--;
+  }
+  return new Map(scaled.filter((item) => item.tokens > 0).map((item) => [item.source, item.tokens]));
+}
+
 function jsonStringFields(prefix: string, key: string): string[] {
   const values: string[] = [];
   const pattern = new RegExp(`"${key}"\\s*:\\s*("(?:\\\\.|[^"\\\\])*")`, "g");
@@ -316,11 +350,14 @@ function jsonStringField(prefix: string, key: string): string {
 
 export class CodexContextUsageAccumulator {
   private readonly totals = new Map<CodexContextContributorSource, number>();
+  private readonly cumulativeTotals = new Map<CodexContextContributorSource, number>();
   private readonly tools = new Map<string, { name: string; source: CodexContextContributorSource }>();
   private latest: CodexContextUsageSummary = { tokens: 0, limit: null, compactionCount: 0 };
   private latestWindow: number | null = null;
   private compactionCount = 0;
   private detailedCompactionAtMs: number | null = null;
+  private cumulativeTokens: number | null = null;
+  private lastAttributedCumulativeTokens: number | null = null;
   // Codex includes a stable hidden floor (base prompt + tool schemas) in every
   // authoritative token_count, but does not persist those bytes as rollout
   // rows. Calibrate that floor from the first complete pre-compaction usage
@@ -358,6 +395,8 @@ export class CodexContextUsageAccumulator {
         tokens: 0,
         limit: compactLimit(this.latestWindow, this.configuredAutoCompactLimit),
         compactionCount: this.compactionCount,
+        ...(this.cumulativeTokens !== null ? { cumulativeTokens: this.cumulativeTokens } : {}),
+        ...this.cumulativeContributorSummary(),
       };
       return;
     }
@@ -415,6 +454,12 @@ export class CodexContextUsageAccumulator {
   private resetSegment(): void {
     this.totals.clear();
     this.tools.clear();
+  }
+
+  private cumulativeContributorSummary(): Pick<CodexContextUsageSummary, "cumulativeContributors"> {
+    if (this.cumulativeTokens === null || this.cumulativeTokens <= 0) return {};
+    const cumulativeContributors = reconcile(this.cumulativeTotals, this.cumulativeTokens);
+    return cumulativeContributors.length ? { cumulativeContributors } : {};
   }
 
   private addCompactionContext(record: JsonRecord): void {
@@ -505,6 +550,7 @@ export class CodexContextUsageAccumulator {
   private captureUsage(record: JsonRecord): void {
     let reported = Number.NaN;
     let failureTotal = Number.NaN;
+    let cumulative = Number.NaN;
     let window = Number.NaN;
     if (record.type === "event_msg") {
       const payload = recordValue(record.payload);
@@ -516,14 +562,17 @@ export class CodexContextUsageAccumulator {
         Number(usage?.input_tokens ?? 0) + Number(usage?.output_tokens ?? 0)
       ));
       failureTotal = Number(totalUsage?.total_tokens);
+      cumulative = failureTotal;
       window = Number(info?.model_context_window ?? 0);
     } else if (record.method === "thread/tokenUsage/updated") {
       const params = recordValue(record.params);
       const tokenUsage = recordValue(params?.tokenUsage);
       const usage = recordValue(tokenUsage?.last);
+      const totalUsage = recordValue(tokenUsage?.total);
       reported = Number(usage?.totalTokens ?? (
         Number(usage?.inputTokens ?? 0) + Number(usage?.outputTokens ?? 0)
       ));
+      cumulative = Number(totalUsage?.totalTokens ?? totalUsage?.total_tokens);
       window = Number(tokenUsage?.modelContextWindow ?? 0);
     } else {
       return;
@@ -534,12 +583,13 @@ export class CodexContextUsageAccumulator {
     // with an empty `last_token_usage` and a non-cumulative sentinel in
     // `total_token_usage.total_tokens`. Preserve the authoritative full-window
     // value instead of making a failed, full thread appear empty.
-    if (
+    const isFailureSentinel = (
       tokens === 0
       && Number.isFinite(window)
       && window > 0
       && failureTotal === window
-    ) {
+    );
+    if (isFailureSentinel) {
       tokens = window;
     }
     if (Number.isFinite(window) && window > 0) this.latestWindow = window;
@@ -552,12 +602,30 @@ export class CodexContextUsageAccumulator {
     const baseTokens = Math.min(this.baseContextTokens ?? 0, residual);
     if (baseTokens > 0) attributionTotals.set("base", baseTokens);
     const contributors = reconcile(attributionTotals, tokens);
+    if (Number.isFinite(cumulative) && cumulative >= 0 && !isFailureSentinel) {
+      const previous = this.lastAttributedCumulativeTokens;
+      if (previous === null || cumulative >= previous) {
+        const delta = previous === null ? cumulative : cumulative - previous;
+        if (delta > 0) {
+          const currentTotals = new Map(contributors.map((item) => [item.source, item.tokens]));
+          for (const [source, allocated] of allocateProportionally(currentTotals, delta)) {
+            addTokens(this.cumulativeTotals, source, allocated);
+          }
+        }
+        this.lastAttributedCumulativeTokens = cumulative;
+        this.cumulativeTokens = this.cumulativeTokens === null
+          ? cumulative
+          : Math.max(this.cumulativeTokens, cumulative);
+      }
+    }
     this.latest = {
       tokens,
       limit: compactLimit(this.latestWindow, this.configuredAutoCompactLimit),
       compactionCount: this.compactionCount,
+      ...(this.cumulativeTokens !== null ? { cumulativeTokens: this.cumulativeTokens } : {}),
       reportedTokens: tokens,
       ...(contributors.length ? { contributors } : {}),
+      ...this.cumulativeContributorSummary(),
     };
   }
 }

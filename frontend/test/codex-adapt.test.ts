@@ -2,8 +2,10 @@ import { describe, it, expect } from "vitest";
 import { codexRolloutToClaudeLines, codexToClaudeLines } from "../src/parser/codex-adapt.js";
 import { groupTimeline } from "../src/parser/group.js";
 
-// Rollout records (what the codex tail forwards): { type, payload }.
-function ev(type: string, payload: object) { return JSON.stringify({ type, payload }); }
+// Rollout records (what the codex tail forwards): { timestamp, type, payload }.
+function ev(type: string, payload: object, timestamp?: string) {
+  return JSON.stringify({ ...(timestamp ? { timestamp } : {}), type, payload });
+}
 const userMsg = (text: string) => ev("event_msg", { type: "user_message", message: text });
 const agentMsg = (text: string) => ev("event_msg", { type: "agent_message", message: text });
 const fnCall = (callId: string, cmd: string) =>
@@ -31,6 +33,53 @@ describe("codexToClaudeLines (rollout shape) + groupTimeline", () => {
     expect(t[0]!.block).toBe("UserPromptBlock");
     expect(t[0]!.record.uuid).toBe("codex-line-0");
     expect(render([agentMsg("done")])[0]!.block).toBe("AssistantBlock");
+  });
+
+  it("preserves rollout timestamps on adapted chat records", () => {
+    const userAt = "2026-08-29T09:00:00.000Z";
+    const assistantAt = "2026-08-29T09:06:00.000Z";
+    const timeline = render([
+      ev("event_msg", { type: "user_message", message: "hello" }, userAt),
+      ev("event_msg", { type: "agent_message", message: "done" }, assistantAt),
+    ]);
+    expect(timeline.map(node => node.record.timestamp)).toEqual([userAt, assistantAt]);
+  });
+
+  it("renders newer item_completed user and agent messages from CLI rollouts", () => {
+    const t = render([
+      ev("event_msg", {
+        type: "item_completed",
+        item: { type: "UserMessage", id: "user-item", content: [{ type: "text", text: "hello from CLI" }] },
+      }),
+      ev("event_msg", {
+        type: "item_completed",
+        item: { type: "AgentMessage", id: "agent-item", phase: "final_answer", content: [{ type: "Text", text: "CLI done" }] },
+      }),
+    ]);
+
+    expect(t.map(node => node.block)).toEqual(["UserPromptBlock", "AssistantBlock"]);
+    expect(t.map(node => node.record.uuid)).toEqual(["user-item", "agent-item"]);
+    expect(t[0]!.record.message).toEqual({ role: "user", content: "hello from CLI" });
+    expect(t[1]!.record.message).toEqual(expect.objectContaining({
+      content: [expect.objectContaining({ type: "text", text: "CLI done" })],
+    }));
+  });
+
+  it("deduplicates mixed legacy and item_completed message events", () => {
+    const t = render([
+      userMsg("same user prompt"),
+      ev("event_msg", {
+        type: "item_completed",
+        item: { type: "UserMessage", id: "duplicate-user", content: [{ type: "text", text: "same user prompt" }] },
+      }),
+      ev("event_msg", {
+        type: "item_completed",
+        item: { type: "AgentMessage", id: "agent-item", content: [{ type: "Text", text: "same answer" }] },
+      }),
+      agentMsg("same answer"),
+    ]);
+
+    expect(t.map(node => node.block)).toEqual(["UserPromptBlock", "AssistantBlock"]);
   });
 
   it("preserves physical rollout indexes after non-rendered records are filtered", () => {
@@ -91,6 +140,45 @@ describe("codexToClaudeLines (rollout shape) + groupTimeline", () => {
         },
         { type: "text", text: "caption" },
       ],
+    });
+  });
+
+  it("renders an image-only prompt anchored by a local_image item_completed event", () => {
+    const t = render([
+      ev("response_item", {
+        type: "message",
+        role: "user",
+        content: [
+          { type: "input_text", text: '<image path="C:\\tmp\\shot.png">' },
+          { type: "input_image", image_url: "data:image/png;base64,aGVsbG8=" },
+          { type: "input_text", text: "</image>" },
+        ],
+      }),
+      ev("event_msg", {
+        type: "item_completed",
+        item: {
+          type: "UserMessage",
+          id: "image-only-user",
+          content: [{ type: "local_image", path: "C:\\tmp\\shot.png" }],
+        },
+      }),
+    ]);
+
+    expect(t).toHaveLength(1);
+    expect(t[0]!.block).toBe("UserPromptBlock");
+    expect(t[0]!.record.uuid).toBe("image-only-user");
+    expect(t[0]!.record.message).toEqual({
+      role: "user",
+      content: [{
+        type: "image",
+        source: {
+          type: "agent-webui-transcript",
+          lineIndex: 0,
+          imageIndex: 0,
+          media_type: "image/png",
+        },
+        name: "image-1.png",
+      }],
     });
   });
 
@@ -219,18 +307,34 @@ describe("codexToClaudeLines (rollout shape) + groupTimeline", () => {
       fnOut("c1", "Output:\nworking\n"),
       ev("event_msg", { type: "task_complete", turn_id: "t1", last_agent_message: null }),
     ]);
-    expect(t.map((n) => n.block)).toEqual(["UserPromptBlock", "AssistantBlock", "AssistantBlock"]);
-    expect(t[2]!.record.message).toEqual(expect.objectContaining({
-      content: [expect.objectContaining({
-        type: "text",
-        text: "Turn ended without a final response. Send another message to retry or continue.",
-      })],
+    expect(t.map((n) => n.block)).toEqual(["UserPromptBlock", "AssistantBlock", "EmptyCompletionBlock"]);
+    expect(t[2]!.record).toEqual(expect.objectContaining({
+      type: "system",
+      subtype: "empty_completion",
     }));
     expect(codexToClaudeLines(ev("event_msg", {
       type: "task_complete",
       turn_id: "t2",
       last_agent_message: "Done",
     }))).toEqual([]);
+  });
+
+  it("does not mistake a completed compaction for an empty assistant turn", () => {
+    const t = render([
+      userMsg("compact this conversation"),
+      ev("event_msg", { type: "task_started", turn_id: "compact-turn" }),
+      JSON.stringify({
+        type: "compacted",
+        payload: { message: "Earlier context summarized." },
+      }),
+      ev("event_msg", {
+        type: "task_complete",
+        turn_id: "compact-turn",
+        last_agent_message: null,
+      }),
+    ]);
+
+    expect(t.map((node) => node.block)).toEqual(["UserPromptBlock", "CompactBoundaryBlock"]);
   });
 
   it("suppresses only the latest empty-completion marker while capacity retry is pending", () => {
@@ -247,11 +351,7 @@ describe("codexToClaudeLines (rollout shape) + groupTimeline", () => {
     expect(retrying.map((node) => node.block)).toEqual(["UserPromptBlock", "AssistantBlock"]);
 
     const exhausted = render(raw);
-    expect(exhausted.at(-1)?.record.message).toEqual(expect.objectContaining({
-      content: [expect.objectContaining({
-        text: "Turn ended without a final response. Send another message to retry or continue.",
-      })],
-    }));
+    expect(exhausted.at(-1)?.block).toBe("EmptyCompletionBlock");
   });
 
   it("replaces an empty-completion marker when a retry attempt starts", () => {
@@ -266,6 +366,31 @@ describe("codexToClaudeLines (rollout shape) + groupTimeline", () => {
     expect(t[1]!.record.message).toEqual(expect.objectContaining({
       content: [expect.objectContaining({ type: "text", text: "Completed on retry." })],
     }));
+  });
+
+  it("renders one expandable boundary from the persisted Codex compaction summary", () => {
+    const t = render([
+      JSON.stringify({
+        type: "compacted",
+        payload: { message: "Earlier goals, decisions, and completed work." },
+      }),
+      ev("event_msg", { type: "context_compacted" }),
+    ]);
+
+    expect(t.map((node) => node.block)).toEqual(["CompactBoundaryBlock"]);
+    expect(t[0]!.record).toEqual(expect.objectContaining({
+      compactSummary: "Earlier goals, decisions, and completed work.",
+    }));
+  });
+
+  it("prefers a later readable compaction record over an event-only boundary", () => {
+    const t = render([
+      ev("event_msg", { type: "context_compacted" }),
+      JSON.stringify({ type: "compacted", payload: { summary: "Readable summary" } }),
+    ]);
+
+    expect(t).toHaveLength(1);
+    expect(t[0]!.record.compactSummary).toBe("Readable summary");
   });
 
   it("honors rollback markers when rendering append-only rollout logs", () => {

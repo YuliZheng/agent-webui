@@ -5,7 +5,7 @@ import { ContentSearchIndex } from "../backend/dist/services/content-search-inde
 import { searchSessions } from "../backend/dist/actions/sessions.js";
 
 const home = homedir();
-const databasePath = process.argv[2] || join(home, ".agent-webui", "content-search-v5.sqlite");
+const databasePath = process.argv[2] || join(home, ".agent-webui", "content-search-v7.sqlite");
 const query = process.argv[3] || "";
 const verify = process.argv.includes("--verify");
 const sessions = new SessionIndex({

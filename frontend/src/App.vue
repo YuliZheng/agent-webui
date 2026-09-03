@@ -1,7 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from "vue";
+import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import Sidebar from "./components/Sidebar.vue";
-import MainPane from "./components/MainPane.vue";
 import ToastStack from "./components/ToastStack.vue";
 import Lightbox from "./components/Lightbox.vue";
 import { useSessionsStore } from "./stores/sessions.js";
@@ -23,8 +22,42 @@ const live = useLiveStore();
 const ui = useUiStore();
 const cache = useSessionCacheStore();
 
+// The chat surface pulls in MessageList, Markdown/KaTeX, the composer and the
+// preview stack. CSS `display: none` still downloaded and parsed that entire
+// graph on the mobile home screen, even though only the session list is
+// visible there. Keep desktop's two-pane layout, but defer the chat graph on a
+// narrow viewport until the user actually opens a conversation.
+const MainPane = defineAsyncComponent(() => import("./components/MainPane.vue"));
+const desktopViewport = ref(
+  typeof window === "undefined"
+  || typeof window.matchMedia !== "function"
+  || window.matchMedia("(min-width: 768px)").matches,
+);
+const shouldMountMainPane = computed(() => desktopViewport.value || Boolean(ui.selectedSessionId));
+let desktopViewportQuery: MediaQueryList | null = null;
+
+function syncDesktopViewport(e: MediaQueryList | MediaQueryListEvent) {
+  desktopViewport.value = e.matches;
+}
+
+onMounted(() => {
+  if (typeof window.matchMedia !== "function") return;
+  desktopViewportQuery = window.matchMedia("(min-width: 768px)");
+  syncDesktopViewport(desktopViewportQuery);
+  desktopViewportQuery.addEventListener?.("change", syncDesktopViewport);
+});
+
+onBeforeUnmount(() => {
+  desktopViewportQuery?.removeEventListener?.("change", syncDesktopViewport);
+});
+
 const fatalError = ref<string | null>(null);
+const fatalAuthError = computed(() => /(?:unauthori[sz]ed|forbidden|\b401\b|\b403\b|token)/i.test(fatalError.value ?? ""));
 const appShellClass = computed(() => `cw-app-shell cw-shell-${prefs.messageDisplayStyle}`);
+
+function reloadApp() {
+  window.location.reload();
+}
 
 // Taskbar/dock unread badge for the installed PWA. The Badging API paints
 // navigator.setAppBadge(n) onto the app icon (a number on Windows, a dot on
@@ -97,6 +130,28 @@ function onPopState(e: PopStateEvent) {
   ui.selectFromHistory(id ?? null);
 }
 
+function onServiceWorkerMessage(event: MessageEvent) {
+  const data = event.data as { kind?: unknown; sessionId?: unknown } | null;
+  if (data?.kind !== "open-session" || typeof data.sessionId !== "string" || !data.sessionId) return;
+  ui.select(data.sessionId);
+  // `select()` intentionally no-ops when this conversation was already
+  // selected. A notification click still means the background unread is now
+  // seen, so settle it explicitly in that case too.
+  sessions.markRead(data.sessionId);
+}
+
+onMounted(() => {
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.addEventListener("message", onServiceWorkerMessage);
+  }
+});
+
+onBeforeUnmount(() => {
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.removeEventListener("message", onServiceWorkerMessage);
+  }
+});
+
 onMounted(async () => {
   try {
     applyTheme(ui.theme);
@@ -111,6 +166,7 @@ onMounted(async () => {
     const tasks: Promise<unknown>[] = [];
     let me: { home: string };
     if (boot.sessions) sessions.hydrateList(boot.sessions);
+    else if (sessions.loaded) void sessions.fetchAll();
     else tasks.push(sessions.fetchAll());
     if (boot.prefs) prefs.hydrate(adaptBackendPrefs(boot.prefs));
     else tasks.push(prefs.load());
@@ -162,7 +218,11 @@ onMounted(async () => {
     const RESUME_RETRY_DELAYS_MS = [0, 500, 1_500, 5_000, 15_000] as const;
     // Global WebSocket pushes keep the list current. This is only a quiet
     // fallback for missed pushes, not a second real-time transport.
-    const HOME_SYNC_INTERVAL_MS = 30_000;
+    // Global WS pushes already keep an open home list current. A full list for
+    // a large archive is hundreds of KiB, so use this only as a quiet missed-
+    // event safety net instead of downloading it twice per minute.
+    const ACTIVE_SYNC_INTERVAL_MS = 8_000;
+    const HOME_SYNC_INTERVAL_MS = 120_000;
     let hiddenAt: number | null = null;
     let lastResumeSweepAt = Date.now();
     let lastForceResumeAt = 0;
@@ -312,9 +372,30 @@ onMounted(async () => {
       // open, live.refreshEngaged/resumeVisible owns the active transcript.
       if (ui.selectedSessionId) return;
       const now = Date.now();
-      if (!force && now - lastHomeSyncAt < HOME_SYNC_INTERVAL_MS) return;
+      const hasLocallyRunningSession = Object.values(sessions.statusBySession)
+        .some(status => status === "running")
+        || Object.values(sessions.compactingBySession).some(Boolean);
+      const minGap = hasLocallyRunningSession ? ACTIVE_SYNC_INTERVAL_MS : HOME_SYNC_INTERVAL_MS;
+      if (!force && now - lastHomeSyncAt < minGap) return;
       lastHomeSyncAt = now;
       resyncSessions(true);
+    }
+
+    function reconcileVisibleActivity() {
+      if (document.visibilityState === "hidden") return;
+      const sid = ui.selectedSessionId;
+      if (!sid) {
+        syncHomeIfVisible();
+        return;
+      }
+      if (
+        sessions.statusBySession[sid] !== "running"
+        && sessions.compactingBySession[sid] !== true
+      ) return;
+      if (sessions.isPending(sid)) return;
+      void live.reconcileRunningSession(sid).catch(error => {
+        console.warn(`[live] running-session reconciliation failed for ${sid}: ${(error as Error).message}`);
+      });
     }
 
     // Network came back (iOS toggles this on cell↔wifi, lock-screen wake on a
@@ -336,7 +417,7 @@ onMounted(async () => {
     window.addEventListener("pagehide", () => { hiddenAt = Date.now(); });
     window.addEventListener("pointerdown", maybeResumeFromUserGesture, { capture: true, passive: true });
     window.addEventListener("touchstart", maybeResumeFromUserGesture, { capture: true, passive: true });
-    window.setInterval(() => syncHomeIfVisible(), HOME_SYNC_INTERVAL_MS);
+    window.setInterval(reconcileVisibleActivity, ACTIVE_SYNC_INTERVAL_MS);
   } catch (err) {
     fatalError.value = (err as Error).message;
   }
@@ -344,8 +425,26 @@ onMounted(async () => {
 </script>
 
 <template>
-  <div v-if="fatalError" class="m-6 text-[var(--cw-danger)]">
-    {{ fatalError }} — append <code>?token=&lt;your-token&gt;</code> to the URL and reload.
+  <div v-if="fatalError" class="flex h-full items-start justify-center bg-[var(--cw-shell-bg)] px-5 pt-[18vh] text-[var(--cw-text)]" role="alert">
+    <div class="w-full max-w-sm rounded-xl bg-[var(--cw-panel-bg)] p-5 shadow-lg">
+      <h1 class="text-lg font-semibold">暂时无法打开 Agent WebUI</h1>
+      <p class="mt-2 text-sm leading-6 text-[var(--cw-muted)]">
+        {{ fatalAuthError
+          ? "当前地址的访问凭据无效，请重新打开正确的入口。"
+          : "请检查工作资料里的 Tailscale 和 Tailnet Relay，然后再试一次。" }}
+      </p>
+      <button
+        type="button"
+        class="mt-4 min-h-11 w-full rounded-lg bg-[var(--cw-accent)] px-4 text-sm font-medium text-[var(--cw-accent-text)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--cw-accent)]"
+        @click="reloadApp"
+      >
+        重新加载
+      </button>
+      <details class="mt-3 text-xs text-[var(--cw-muted)]">
+        <summary class="cursor-pointer py-1">查看错误详情</summary>
+        <pre class="mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-[var(--cw-panel-2)] p-3">{{ fatalError }}</pre>
+      </details>
+    </div>
   </div>
   <!-- IM-style mobile layout: chat list IS the home view. The sidebar takes
        the whole viewport when no session is selected; once a session opens
@@ -359,6 +458,7 @@ onMounted(async () => {
         : 'flex flex-col flex-1 md:flex-none md:w-72 md:shrink-0'"
     />
     <MainPane
+      v-if="shouldMountMainPane"
       :class="ui.selectedSessionId
         ? 'flex-1 flex flex-col min-w-0'
         : 'hidden md:flex md:flex-col md:flex-1 md:min-w-0'"

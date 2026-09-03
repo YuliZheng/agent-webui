@@ -19,6 +19,7 @@ export interface SessionListItem {
   lastTurnAt?: string | null;
   lastBoundaryAt?: string | null;
   readAt?: string | null;
+  unreadCount?: number;
 }
 
 export interface IndexedRawLine { index: number; raw: string }

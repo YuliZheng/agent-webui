@@ -52,6 +52,35 @@ describe("session mutations/search/export", () => {
     expect(await readFile(path, "utf8")).not.toContain("second prompt");
   });
 
+  it("exports newer Codex messages once without injected context", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-webui-codex-export-"));
+    const claudeRoot = join(root, "claude");
+    const codexRoot = join(root, "codex");
+    await mkdir(claudeRoot);
+    await mkdir(codexRoot);
+    await writeFile(join(codexRoot, "rollout-export.jsonl"), [
+      JSON.stringify({ timestamp: "2026-08-28T00:00:00Z", type: "session_meta", payload: { id: "codex-export", cwd: root } }),
+      JSON.stringify({ timestamp: "2026-08-28T00:00:01Z", type: "response_item", payload: { type: "message", role: "developer", content: [{ type: "input_text", text: "hidden developer text" }] } }),
+      JSON.stringify({ timestamp: "2026-08-28T00:00:02Z", type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "<permissions instructions>hidden</permissions instructions>" }] } }),
+      JSON.stringify({ timestamp: "2026-08-28T00:00:03Z", type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "visible prompt" }] } }),
+      JSON.stringify({ timestamp: "2026-08-28T00:00:04Z", type: "event_msg", payload: { type: "item_completed", item: { type: "UserMessage", id: "u1", content: [{ type: "text", text: "visible prompt" }] } } }),
+      JSON.stringify({ timestamp: "2026-08-28T00:00:05Z", type: "event_msg", payload: { type: "item_completed", item: { type: "AgentMessage", id: "a1", content: [{ type: "Text", text: "visible answer" }] } } }),
+      JSON.stringify({ timestamp: "2026-08-28T00:00:06Z", type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "visible answer" }] } }),
+      JSON.stringify({ timestamp: "2026-08-28T00:00:07Z", type: "event_msg", payload: { type: "agent_message", message: "visible answer" } }),
+      "",
+    ].join("\n"));
+    const index = new SessionIndex({ claudeRoot, codexRoot });
+    await index.scan();
+
+    const markdown = await markdownExport(index, "codex-export");
+    expect(markdown.match(/^## User$/gm)).toHaveLength(1);
+    expect(markdown.match(/^## Assistant$/gm)).toHaveLength(1);
+    expect(markdown).toContain("visible prompt");
+    expect(markdown).toContain("visible answer");
+    expect(markdown).not.toContain("hidden developer text");
+    expect(markdown).not.toContain("permissions instructions");
+  });
+
   it("streams past oversized bookkeeping records for export, fork, and rewind", async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-webui-large-mutate-"));
     const claudeRoot = join(root, "claude");

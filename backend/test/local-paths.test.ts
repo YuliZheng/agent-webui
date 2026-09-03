@@ -7,6 +7,7 @@ import {
   listLocalDirectory,
   localPathOpenCommand,
   resolveLocalPath,
+  resolveLocalPathForReveal,
 } from "../src/services/files.js";
 
 describe("local path system opening", () => {
@@ -53,6 +54,10 @@ describe("local path system opening", () => {
     });
     await expect(resolveLocalPath(outside, [allowed])).rejects.toMatchObject({
       code: 403,
+    });
+    await expect(resolveLocalPathForReveal(outside)).resolves.toMatchObject({
+      path: outside,
+      kind: "file",
     });
   });
 

@@ -1,10 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import { EventEmitter } from "node:events";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import {
+  CODEX_THREAD_RESUME_TIMEOUT_MS,
   CODEX_REASONING_EFFORTS,
   CodexDriver,
   DEFAULT_CODEX_APP_SERVER_MAX_RECORD_BYTES,
@@ -132,6 +133,38 @@ describe("Codex steer semantics", () => {
     }));
   });
 
+  it("reports the official contextCompaction item lifecycle as a live compacting state", async () => {
+    const state = new AppState(await mkdtemp(join(tmpdir(), "agent-webui-codex-compacting-")));
+    const driver = new CodexDriver("codex", state) as any;
+    driver.threads.set("thread", { active: true, turnId: "turn", steers: [] });
+    const statuses: unknown[] = [];
+    driver.on("status", (event: unknown) => statuses.push(event));
+
+    driver.notification("item/started", {
+      threadId: "thread",
+      turnId: "turn",
+      item: { id: "compact-1", type: "contextCompaction" },
+    });
+    expect(driver.threads.get("thread").compacting).toBe(true);
+    expect(statuses.at(-1)).toEqual(expect.objectContaining({
+      id: "thread",
+      status: "running",
+      compacting: true,
+    }));
+
+    driver.notification("item/completed", {
+      threadId: "thread",
+      turnId: "turn",
+      item: { id: "compact-1", type: "contextCompaction" },
+    });
+    expect(driver.threads.get("thread").compacting).toBe(false);
+    expect(statuses.at(-1)).toEqual(expect.objectContaining({
+      id: "thread",
+      status: "running",
+      compacting: false,
+    }));
+  });
+
   it("discards a child whose initialize RPC fails and cleanly starts another", async () => {
     const state = new AppState(await mkdtemp(join(tmpdir(), "agent-webui-codex-init-error-")));
     const firstChild = fakeCodexChild();
@@ -160,6 +193,48 @@ describe("Codex steer semantics", () => {
     firstChild.emit("exit", 1, null);
     expect(driver.child).toBe(secondChild);
     expect(driver.initializedChild).toBe(secondChild);
+  });
+
+  it("uses a thin local proxy for a persistent Codex runtime", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-webui-codex-persistent-"));
+    const state = new AppState(root);
+    const child = fakeCodexChild();
+    const spawnProcess = vi.fn(() => child);
+    const runtime = {
+      proxyPath: join(root, "codex-app-server-proxy.js"),
+      endpoint: "ws://127.0.0.1:3458/",
+      tokenPath: join(root, "runtime.token"),
+      logPath: join(root, "runtime.log"),
+      pidPath: join(root, "runtime.pid"),
+    };
+    const driver = new CodexDriver(
+      "codex",
+      state,
+      spawnProcess as any,
+      DEFAULT_CODEX_APP_SERVER_MAX_RECORD_BYTES,
+      join(root, "visualizations"),
+      runtime,
+    ) as any;
+    driver.resolvedBinary = Promise.resolve("C:\\Codex\\codex.exe");
+
+    const initializing = driver.ensure();
+    await vi.waitFor(() => expect(spawnProcess).toHaveBeenCalledTimes(1));
+    const initializeId = [...driver.pending.keys()][0];
+    driver.message({ id: initializeId, result: {} });
+    await initializing;
+
+    expect(spawnProcess).toHaveBeenCalledWith(
+      process.execPath,
+      [
+        runtime.proxyPath,
+        "--binary", "C:\\Codex\\codex.exe",
+        "--endpoint", runtime.endpoint,
+        "--token-file", runtime.tokenPath,
+        "--log-file", runtime.logPath,
+        "--pid-file", runtime.pidPath,
+      ],
+      expect.objectContaining({ shell: false, stdio: ["pipe", "pipe", "pipe"], windowsHide: true }),
+    );
   });
 
   it("invalidates and terminates a child when initialize times out", async () => {
@@ -222,11 +297,70 @@ describe("Codex steer semantics", () => {
     const promptResume = driver.resume("thread");
     await Promise.resolve();
     expect(request).toHaveBeenCalledTimes(1);
-    expect(request).toHaveBeenCalledWith("thread/resume", { threadId: "thread" });
+    expect(request).toHaveBeenCalledWith("thread/resume", {
+      threadId: "thread",
+      excludeTurns: true,
+      initialTurnsPage: { limit: 1, itemsView: "notLoaded" },
+    });
 
     release({ thread: { cwd: "C:\\work" } });
     await Promise.all([prewarm, promptResume]);
     expect(driver.threads.get("thread")).toMatchObject({ attached: true, cwd: "C:\\work" });
+  });
+
+  it("rehydrates an in-progress turn from the itemless initial resume page", async () => {
+    const state = new AppState(await mkdtemp(join(tmpdir(), "agent-webui-codex-rehydrate-")));
+    const driver = new CodexDriver("codex", state) as any;
+    driver.request = vi.fn(async () => ({
+      thread: {
+        cwd: "C:\\work",
+        status: { type: "active", activeFlags: [] },
+      },
+      initialTurnsPage: {
+        data: [{ id: "turn-live", status: "inProgress", items: [] }],
+      },
+    }));
+    const statuses = vi.fn();
+    driver.on("status", statuses);
+
+    await driver.resume("thread");
+
+    expect(driver.threads.get("thread")).toMatchObject({
+      attached: true,
+      active: true,
+      turnId: "turn-live",
+      cwd: "C:\\work",
+    });
+    expect(statuses).toHaveBeenLastCalledWith(expect.objectContaining({
+      id: "thread",
+      status: "running",
+      webuiAlive: true,
+    }));
+  });
+
+  it("gives thread resume a longer RPC deadline without changing ordinary requests", async () => {
+    const state = new AppState(await mkdtemp(join(tmpdir(), "agent-webui-codex-resume-timeout-")));
+    const child = fakeCodexChild();
+    const driver = new CodexDriver("codex", state) as any;
+    driver.child = child;
+    driver.initializedChild = child;
+    driver.rawRequest = vi.fn(async () => ({}));
+
+    await driver.request("thread/resume", { threadId: "thread" });
+    await driver.request("turn/start", { threadId: "thread", input: [] });
+
+    expect(driver.rawRequest).toHaveBeenNthCalledWith(
+      1,
+      "thread/resume",
+      { threadId: "thread" },
+      CODEX_THREAD_RESUME_TIMEOUT_MS,
+    );
+    expect(driver.rawRequest).toHaveBeenNthCalledWith(
+      2,
+      "turn/start",
+      { threadId: "thread", input: [] },
+      20_000,
+    );
   });
 
   it("steers an active turn and resends only after interrupted completion", async () => {
@@ -317,6 +451,48 @@ describe("Codex steer semantics", () => {
       cwd: "C:\\work",
       serviceTier: null,
     }));
+  });
+  it("binds every turn to an authoritative thread-scoped visualization directory", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 7, 28, 12, 0, 0));
+    try {
+      const root = await mkdtemp(join(tmpdir(), "agent-webui-codex-visualization-"));
+      const visualizationsRoot = join(root, "visualizations");
+      const state = new AppState(join(root, "state"));
+      const driver = new CodexDriver(
+        "codex",
+        state,
+        undefined,
+        undefined,
+        visualizationsRoot,
+      ) as any;
+      driver.threads.set("thread", { active: false, attached: true, steers: [], cwd: "C:\\work" });
+      const request = vi.fn(async () => ({ turn: { id: "turn" } }));
+      driver.request = request;
+
+      await driver.prompt("thread", "make a chart", {
+        cwd: "C:\\work",
+        sandboxMode: "workspace-write",
+      });
+
+      const directory = join(visualizationsRoot, "2026", "08", "28", "thread");
+      expect((await stat(directory)).isDirectory()).toBe(true);
+      expect(request).toHaveBeenCalledWith("turn/start", expect.objectContaining({
+        threadId: "thread",
+        additionalContext: expect.objectContaining({
+          "agent-webui.inline-visualization": expect.objectContaining({
+            kind: "application",
+            value: expect.stringContaining(directory),
+          }),
+        }),
+        sandboxPolicy: expect.objectContaining({
+          type: "workspaceWrite",
+          writableRoots: ["C:\\work", directory],
+        }),
+      }));
+    } finally {
+      vi.useRealTimers();
+    }
   });
   it("routes new DeepSeek sessions through the DeepSeek provider", async () => {
     const state = new AppState(await mkdtemp(join(tmpdir(), "agent-webui-codex-deepseek-")));
@@ -597,12 +773,12 @@ describe("Codex steer semantics", () => {
         expect.objectContaining({
           threadId: "thread",
           input: [],
-          additionalContext: {
+          additionalContext: expect.objectContaining({
             "agent-webui.capacity-retry": expect.objectContaining({
               kind: "application",
               value: expect.stringContaining("partial progress"),
             }),
-          },
+          }),
         }),
       ]);
       expect(errors).not.toHaveBeenCalled();
@@ -798,5 +974,82 @@ describe("Codex steer semantics", () => {
       secondary: { usedPercent: 8, windowDurationMins: 10_080, resetsAt: 1_900_500_000 },
     });
     expect(request).toHaveBeenCalledWith("account/rateLimits/read", undefined);
+  });
+  it("reads and normalizes the thread plus daily account usage overview", async () => {
+    const state = new AppState(await mkdtemp(join(tmpdir(), "agent-webui-codex-usage-")));
+    const driver = new CodexDriver("codex", state) as any;
+    const request = vi.fn(async () => ({
+      summary: { lifetimeTokens: 900_000_000 },
+      daily_usage_buckets: [
+        { start_date: "2026-08-27", tokens: 8_000_000 },
+        { start_date: "invalid-without-tokens" },
+      ],
+      thread_usage: {
+        thread_id: "thread-1",
+        estimated_usage_credits_micros: 12_500_000,
+        estimated_usage_usd_micros: null,
+        groups: [{
+          model: "gpt-5.6-sol",
+          reasoning_effort: "high",
+          speed: "standard",
+          input_tokens: 120_000,
+          cached_input_tokens: 80_000,
+          net_new_input_tokens: 40_000,
+          output_tokens: 5_000,
+          total_tokens: 125_000,
+          estimated_usage_credits_micros: 12_500_000,
+        }],
+      },
+    }));
+    driver.request = request;
+
+    await expect(driver.usageOverview("thread-1")).resolves.toEqual({
+      threadUsage: {
+        threadId: "thread-1",
+        estimatedUsageCreditsMicros: 12_500_000,
+        estimatedUsageUsdMicros: null,
+        groups: [{
+          model: "gpt-5.6-sol",
+          reasoningEffort: "high",
+          speed: "standard",
+          inputTokens: 120_000,
+          cachedInputTokens: 80_000,
+          netNewInputTokens: 40_000,
+          outputTokens: 5_000,
+          totalTokens: 125_000,
+          estimatedUsageCreditsMicros: 12_500_000,
+        }],
+      },
+      dailyUsageBuckets: [{ startDate: "2026-08-27", tokens: 8_000_000 }],
+      accountLifetimeTokens: 900_000_000,
+    });
+    expect(request).toHaveBeenCalledWith("account/usage/read", undefined);
+  });
+
+  it("keeps account daily buckets when the optional thread-scoped lookup returns null fields", async () => {
+    const state = new AppState(await mkdtemp(join(tmpdir(), "agent-webui-codex-usage-account-")));
+    const driver = new CodexDriver("codex", state) as any;
+    const request = vi.fn(async (_method: string, params: unknown) => params === undefined
+      ? {
+          summary: { lifetimeTokens: 12_700_000_000 },
+          dailyUsageBuckets: [{ startDate: "2026-08-29", tokens: 152_000_000 }],
+          threadUsage: null,
+        }
+      : {
+          summary: { lifetimeTokens: null },
+          dailyUsageBuckets: null,
+          threadUsage: null,
+        });
+    driver.request = request;
+
+    await expect(driver.usageOverview("thread-1")).resolves.toEqual({
+      threadUsage: null,
+      dailyUsageBuckets: [{ startDate: "2026-08-29", tokens: 152_000_000 }],
+      accountLifetimeTokens: 12_700_000_000,
+    });
+    expect(request.mock.calls).toEqual([
+      ["account/usage/read", undefined],
+      ["account/usage/read", { threadId: "thread-1" }],
+    ]);
   });
 });

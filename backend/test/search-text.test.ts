@@ -40,6 +40,20 @@ describe("visible transcript search text", () => {
       payload: { type: "agent_message", message: "Visible answer" },
     }))).toEqual({ haystack: "visible answer", uuid: null });
     expect(searchableRecordText(JSON.stringify({
+      type: "event_msg",
+      payload: {
+        type: "item_completed",
+        item: { type: "UserMessage", id: "u2", content: [{ type: "text", text: "New visible prompt" }] },
+      },
+    }))).toEqual({ haystack: "new visible prompt", uuid: "u2" });
+    expect(searchableRecordText(JSON.stringify({
+      type: "event_msg",
+      payload: {
+        type: "item_completed",
+        item: { type: "AgentMessage", id: "a2", content: [{ type: "Text", text: "New visible answer" }] },
+      },
+    }))).toEqual({ haystack: "new visible answer", uuid: "a2" });
+    expect(searchableRecordText(JSON.stringify({
       type: "response_item",
       payload: {
         type: "function_call_output",
@@ -69,6 +83,13 @@ describe("visible transcript search text", () => {
     expect(searchableRecordPrefix(JSON.stringify({
       type: "event_msg",
       payload: { type: "agent_message", message: "visible" },
+    }))).toBe(true);
+    expect(searchableRecordPrefix(JSON.stringify({
+      type: "event_msg",
+      payload: {
+        type: "item_completed",
+        item: { type: "AgentMessage", content: [{ type: "Text", text: "visible" }] },
+      },
     }))).toBe(true);
   });
 });

@@ -6,11 +6,34 @@ import { useUiStore } from "../src/stores/ui.js";
 import { promotePendingDraft } from "../src/stores/live.js";
 
 const KEY = "cw:pendingDrafts:v1";
+const SESSION_LIST_KEY = "cw:sessions:v1";
 
 describe("pending drafts persistence", () => {
   beforeEach(() => {
+    window.dispatchEvent(new Event("pagehide"));
     localStorage.clear();
     setActivePinia(createPinia());
+  });
+
+  it("restores recent session metadata immediately without stale process status", () => {
+    localStorage.setItem(SESSION_LIST_KEY, JSON.stringify([{
+      id: "cached-session",
+      cwd: "/home/cached",
+      mtime: "2026-08-19T00:00:00.000Z",
+      size: 42,
+      agent: "codex",
+      status: "running",
+      preview: "cached preview",
+    }]));
+    setActivePinia(createPinia());
+
+    const sessions = useSessionsStore();
+    expect(sessions.loaded).toBe(true);
+    expect(sessions.byId["cached-session"]).toMatchObject({
+      cwd: "/home/cached",
+      preview: "cached preview",
+    });
+    expect(sessions.byId["cached-session"]?.status).toBeUndefined();
   });
 
   it("createPending writes the draft to localStorage", () => {

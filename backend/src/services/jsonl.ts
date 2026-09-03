@@ -61,8 +61,13 @@ interface PersistedLineIndexCache {
   entries: PersistedLineIndex[];
 }
 
-export const MAX_LINE_INDEX_CACHE_ENTRIES = 12;
-export const MAX_LINE_INDEX_CACHE_BYTES = 4 * 1024 * 1024;
+// A large personal archive can easily have hundreds of threads. Twelve index
+// entries meant that switching among a modest set of chats repeatedly evicted
+// their line counts and forced another full JSONL scan. Indexes contain only
+// offsets/signatures (not transcript bodies), so retaining a larger recent
+// working set is inexpensive and removes the repeat-open stall.
+export const MAX_LINE_INDEX_CACHE_ENTRIES = 64;
+export const MAX_LINE_INDEX_CACHE_BYTES = 16 * 1024 * 1024;
 export const LINE_INDEX_READ_CHUNK_BYTES = 1024 * 1024;
 // A cold exact index must inspect the selected source file once to recover
 // stable physical line indexes. Keep that one reader deliberately below full

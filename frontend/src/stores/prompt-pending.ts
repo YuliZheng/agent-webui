@@ -46,6 +46,22 @@ export interface PendingPrompt {
   phase: "sending" | "dispatched" | "accepted";
 }
 
+/**
+ * True while a normal prompt has left the browser but its durable user record
+ * has not reconciled yet. Keep `accepted` in this bridge: the prompt RPC can
+ * resolve before the backend's running push or rollout append reaches this
+ * client. Mid-turn Codex steers are excluded because they intentionally have
+ * no durable user record and could otherwise leave a permanent thinking state.
+ */
+export function hasPendingTurnStart(
+  entries: readonly Pick<PendingPrompt, "phase" | "steered">[],
+): boolean {
+  return entries.some(entry => (
+    entry.steered !== true
+    && (entry.phase === "dispatched" || entry.phase === "accepted")
+  ));
+}
+
 interface State {
   bySession: Record<string, PendingPrompt[]>;
 }
@@ -150,6 +166,40 @@ export const usePromptPendingStore = defineStore("promptPending", {
       if (!entry) return;
       entry.phase = "accepted";
       this.persist();
+    },
+    // A persisted `dispatched` phase means the browser sent the RPC but was
+    // suspended/reloaded before its acknowledgement arrived. Once a durable
+    // terminal record exists, that optimistic liveness signal must no longer
+    // keep the transcript/footer and sidebar looking active. Keep the entry
+    // itself (Codex steers may never echo into the rollout), but downgrade it
+    // to accepted so normal preview reconciliation can release it.
+    settleDispatched(
+      sessionId: string,
+      terminal: { sourceIndex?: number; timestamp?: string } = {},
+    ) {
+      const entries = this.bySession[sessionId];
+      if (!entries?.length) return;
+      const terminalLineCount = typeof terminal.sourceIndex === "number"
+        && Number.isFinite(terminal.sourceIndex)
+        ? Math.max(0, Math.floor(terminal.sourceIndex)) + 1
+        : null;
+      const terminalMs = terminal.timestamp ? Date.parse(terminal.timestamp) : NaN;
+      let changed = false;
+      for (const entry of entries) {
+        if (entry.phase !== "dispatched") continue;
+        // A tail replay can include an older turn's terminal after the user
+        // has already sent a newer prompt. Prefer the physical source boundary
+        // when available; timestamp is the compatibility fallback.
+        if (terminalLineCount !== null && entry.startedAtLineCount >= terminalLineCount) continue;
+        if (
+          terminalLineCount === null
+          && Number.isFinite(terminalMs)
+          && entry.startedAt > terminalMs + 2_000
+        ) continue;
+        entry.phase = "accepted";
+        changed = true;
+      }
+      if (changed) this.persist();
     },
     remove(sessionId: string, id: string) {
       const list = this.bySession[sessionId];

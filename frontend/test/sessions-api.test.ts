@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const requestMock = vi.hoisted(() => vi.fn(async () => ({})));
 
 vi.mock("../src/api/ws.js", () => ({
+  connected: { __v_isRef: true, value: false },
   request: requestMock,
   WsError: class WsError extends Error {},
 }));
@@ -13,10 +14,13 @@ import {
   getAgentCapabilities,
   getSessionGoal,
   listSessions,
+  flushPendingReadMarks,
+  markReadRemote,
   newSession,
   readFullCodexContextUsage,
   readSessionRange,
   readSessionTail,
+  refreshBackend,
   sendPrompt,
   setSessionGoal,
   setSessionServiceTier,
@@ -33,7 +37,7 @@ describe("sessions API slash command escaping", () => {
     expect(requestMock).toHaveBeenCalledWith(
       "prompt",
       { sessionId: "s1", prompt: " /not-a-command", images: [] },
-      { timeoutMs: 90_000 },
+      { timeoutMs: 200_000 },
     );
   });
 
@@ -42,7 +46,7 @@ describe("sessions API slash command escaping", () => {
     expect(requestMock).toHaveBeenCalledWith(
       "prompt",
       { sessionId: "s1", prompt: "/compact", images: [] },
-      { timeoutMs: 90_000 },
+      { timeoutMs: 200_000 },
     );
   });
 
@@ -51,7 +55,7 @@ describe("sessions API slash command escaping", () => {
     expect(requestMock).toHaveBeenCalledWith(
       "prompt",
       { sessionId: "s1", prompt: "/init", images: [] },
-      { timeoutMs: 90_000 },
+      { timeoutMs: 200_000 },
     );
   });
 
@@ -61,8 +65,24 @@ describe("sessions API slash command escaping", () => {
     expect(requestMock).toHaveBeenCalledWith(
       "prompt",
       { sessionId: "s1", prompt: "hello", images: [], clientUuid: "client-1" },
-      { timeoutMs: 90_000, onSent: onDispatched, retryOnReconnect: true },
+      { timeoutMs: 200_000, onSent: onDispatched, retryOnReconnect: true },
     );
+  });
+
+  it("queues monotonic read watermarks as reconnect-safe mutations", async () => {
+    vi.useFakeTimers();
+    try {
+      markReadRemote("s-read", "2026-08-29T10:00:00.000Z");
+      markReadRemote("s-read", "2026-08-29T10:00:01.000Z");
+      await flushPendingReadMarks();
+      expect(requestMock).toHaveBeenCalledWith(
+        "mark-read",
+        { sessionId: "s-read", at: "2026-08-29T10:00:01.000Z" },
+        { retryOnReconnect: true },
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("sends Fast as the priority service tier instead of a reasoning effort", async () => {
@@ -134,7 +154,78 @@ describe("sessions API HTTP reads", () => {
     expect(fetchMock).toHaveBeenCalledWith("/api/sessions", {
       credentials: "include",
       cache: "no-store",
+      signal: expect.any(AbortSignal),
     });
+  });
+
+  it("aborts a wedged session list instead of leaving home sync pending forever", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = vi.fn((_url: RequestInfo | URL, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+      })) as unknown as typeof fetch;
+      vi.stubGlobal("fetch", fetchMock);
+
+      const result = expect(listSessions()).rejects.toThrow("连接超时");
+      await vi.advanceTimersByTimeAsync(10_000);
+      await result;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("times out when session-list headers arrive but the response body stalls", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = vi.fn(async () => ({
+        ok: true,
+        json: () => new Promise<never>(() => undefined),
+      })) as unknown as typeof fetch;
+      vi.stubGlobal("fetch", fetchMock);
+
+      const result = expect(listSessions()).rejects.toThrow("连接超时");
+      await vi.advanceTimersByTimeAsync(10_000);
+      await result;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("aborts a wedged pull refresh and leaves it retryable", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = vi.fn((_url: RequestInfo | URL, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+      })) as unknown as typeof fetch;
+      vi.stubGlobal("fetch", fetchMock);
+
+      const result = expect(refreshBackend()).rejects.toThrow("刷新超时");
+      await vi.advanceTimersByTimeAsync(10_000);
+      await result;
+      expect(fetchMock).toHaveBeenCalledWith("/api/refresh", expect.objectContaining({
+        method: "POST",
+        signal: expect.any(AbortSignal),
+      }));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("times out when pull-refresh headers arrive but the response body stalls", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = vi.fn(async () => ({
+        ok: true,
+        json: () => new Promise<never>(() => undefined),
+      })) as unknown as typeof fetch;
+      vi.stubGlobal("fetch", fetchMock);
+
+      const result = expect(refreshBackend()).rejects.toThrow("刷新超时");
+      await vi.advanceTimersByTimeAsync(10_000);
+      await result;
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("reads session tail and ranges over HTTP for fast mobile first paint", async () => {
@@ -183,7 +274,7 @@ describe("sessions API HTTP reads", () => {
       vi.stubGlobal("fetch", fetchMock);
 
       const result = expect(readSessionTail("slow", 60)).rejects.toThrow("tail aborted");
-      await vi.advanceTimersByTimeAsync(8_000);
+      await vi.advanceTimersByTimeAsync(20_000);
       await result;
     } finally {
       vi.useRealTimers();
@@ -199,7 +290,7 @@ describe("sessions API HTTP reads", () => {
       vi.stubGlobal("fetch", fetchMock);
 
       const result = expect(readSessionRange("slow", 0, 200)).rejects.toThrow("range aborted");
-      await vi.advanceTimersByTimeAsync(8_000);
+      await vi.advanceTimersByTimeAsync(20_000);
       await result;
     } finally {
       vi.useRealTimers();

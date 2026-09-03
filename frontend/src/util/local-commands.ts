@@ -12,6 +12,12 @@ import type {
 } from "@claude-webui/shared/api";
 import { CLI_INFO_TOPICS } from "@claude-webui/shared/api";
 import {
+  codexVisibleMessage,
+  codexVisibleMessagePriority,
+  sameCodexVisibleMessage,
+  type CodexVisibleMessage,
+} from "@agent-webui/shared/codex";
+import {
   MODEL_CHOICES,
   CODEX_APPROVAL_PRESETS,
   CODEX_MODEL_CHOICES,
@@ -150,6 +156,11 @@ export interface SessionStatusRow {
 
 export interface SessionStatusSummary {
   rows: SessionStatusRow[];
+  /** ChatGPT plan identifier reported by Codex app-server. */
+  planType: string | null;
+  /** Account-level weekly allowance progress; not attributable to one session. */
+  weeklyUsagePercent: number | null;
+  weeklyUsageWindow: CodexRateLimitWindow | null;
 }
 
 function fmtK(n: number): string {
@@ -157,18 +168,22 @@ function fmtK(n: number): string {
 }
 
 // Extract assistant reply texts (newest last) from raw session lines. Handles
-// both claude jsonl (type=assistant, content blocks) and codex rollout
-// (event_msg/agent_message) shapes.
-function assistantTexts(lines: readonly string[]): string[] {
+// Claude records plus response, legacy-event, and item_completed Codex shapes.
+export function assistantTexts(lines: readonly string[]): string[] {
   const out: string[] = [];
-  for (const line of lines) {
-    if (!line || (line.indexOf('"assistant"') < 0 && line.indexOf('"agent_message"') < 0)) continue;
+  let previousCodex: {
+    message: CodexVisibleMessage;
+    lastSourceIndex: number;
+    outputIndex: number;
+  } | null = null;
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+    const line = lines[lineIndex];
+    if (!line) continue;
     try {
-      const rec = JSON.parse(line) as {
+      const rec = JSON.parse(line) as Record<string, unknown> & {
         type?: string;
         isSidechain?: boolean;
         message?: { content?: unknown; model?: unknown };
-        payload?: { type?: string; message?: unknown };
       };
       if (rec.type === "assistant" && !rec.isSidechain && rec.message?.model !== "<synthetic>") {
         const content = rec.message?.content;
@@ -180,8 +195,25 @@ function assistantTexts(lines: readonly string[]): string[] {
             .join("\n");
           if (text.trim()) out.push(text);
         }
-      } else if (rec.type === "event_msg" && rec.payload?.type === "agent_message" && typeof rec.payload.message === "string") {
-        if (rec.payload.message.trim()) out.push(rec.payload.message);
+        previousCodex = null;
+        continue;
+      }
+      const message = codexVisibleMessage(rec);
+      if (!message || message.role !== "assistant") continue;
+      const previous = previousCodex;
+      const isCompanion = previous !== null
+        && lineIndex - previous.lastSourceIndex <= 4
+        && previous.message.transport !== message.transport
+        && sameCodexVisibleMessage(previous.message, message);
+      if (isCompanion && previous) {
+        previous.lastSourceIndex = lineIndex;
+        if (codexVisibleMessagePriority(message) > codexVisibleMessagePriority(previous.message)) {
+          previous.message = message;
+          out[previous.outputIndex] = message.text;
+        }
+      } else {
+        out.push(message.text);
+        previousCodex = { message, lastSourceIndex: lineIndex, outputIndex: out.length - 1 };
       }
     } catch { /* skip malformed line */ }
   }
@@ -256,18 +288,13 @@ function rateLimitValue(window: CodexRateLimitWindow): string {
   return `${percent(used)}% used · ${percent(100 - used)}% left${reset ? ` · resets ${reset}` : ""}`;
 }
 
-function codexRateLimitRows(limits: CodexRateLimits | null): SessionStatusRow[] {
-  if (!limits) {
-    return [
-      { label: "5-hour usage", value: "unavailable" },
-      { label: "Weekly usage", value: "unavailable" },
-    ];
-  }
+function uniqueRateLimitWindows(limits: CodexRateLimits | null): CodexRateLimitWindow[] {
+  if (!limits) return [];
   const reportedWindows = [limits.primary, limits.secondary].filter(
     (window): window is CodexRateLimitWindow => window !== null,
   );
   const seenWindows = new Set<string>();
-  const windows = reportedWindows.filter((window) => {
+  return reportedWindows.filter((window) => {
     const key = [
       window.windowDurationMins ?? "",
       window.usedPercent,
@@ -277,9 +304,27 @@ function codexRateLimitRows(limits: CodexRateLimits | null): SessionStatusRow[] 
     seenWindows.add(key);
     return true;
   });
+}
+
+function weeklyRateLimitWindow(
+  limits: CodexRateLimits | null,
+  windows = uniqueRateLimitWindows(limits),
+): CodexRateLimitWindow | null {
+  return windows.find((window) => (window.windowDurationMins ?? 0) >= 6 * 24 * 60)
+    ?? limits?.secondary
+    ?? null;
+}
+
+function codexRateLimitRows(limits: CodexRateLimits | null): SessionStatusRow[] {
+  if (!limits) {
+    return [
+      { label: "5-hour usage", value: "unavailable" },
+      { label: "Weekly usage", value: "unavailable" },
+    ];
+  }
+  const windows = uniqueRateLimitWindows(limits);
   const weekly =
-    windows.find((window) => (window.windowDurationMins ?? 0) >= 6 * 24 * 60) ??
-    limits.secondary;
+    weeklyRateLimitWindow(limits, windows);
   const short = windows.find((window) => window !== weekly) ?? null;
   const shortHours = short?.windowDurationMins
     ? short.windowDurationMins / 60
@@ -323,6 +368,7 @@ export async function buildSessionStatusSummary(ctx: LocalCommandCtx): Promise<S
     ? "compacting"
     : sessions.statusBySession[ctx.sessionId] ?? "idle";
   const state = rawState === "exited" ? "idle" : rawState;
+  const weeklyWindow = weeklyRateLimitWindow(rateLimits);
   return {
     rows: [
       { label: "Agent", value: ctx.isCodex ? "Codex" : "Claude" },
@@ -345,6 +391,11 @@ export async function buildSessionStatusSummary(ctx: LocalCommandCtx): Promise<S
       { label: "Working directory", value: session?.cwd || "(unknown)" },
       { label: "Session", value: ctx.sessionId },
     ],
+    planType: rateLimits?.planType ?? null,
+    weeklyUsagePercent: weeklyWindow
+      ? Math.max(0, Math.min(100, weeklyWindow.usedPercent))
+      : null,
+    weeklyUsageWindow: weeklyWindow,
   };
 }
 
@@ -665,9 +716,13 @@ export async function runLocalCommand(cmd: LocalCommand, ctx: LocalCommandCtx): 
 export interface ContextUsage {
   tokens: number;
   limit: number | null;
+  /** Provider-reported token total accumulated across the entire session. */
+  cumulativeTokens?: number | undefined;
   reportedTokens?: number | undefined;
   estimatedTokens?: number | undefined;
   contributors?: readonly ContextContributor[] | undefined;
+  /** Estimated source attribution reconciled to the cumulative thread total. */
+  cumulativeContributors?: readonly ContextContributor[] | undefined;
 }
 
 export interface ContextContributor {
@@ -1218,6 +1273,10 @@ export function latestCodexContextUsage(
               outputTokens?: unknown;
               totalTokens?: unknown;
             };
+            total?: {
+              totalTokens?: unknown;
+              total_tokens?: unknown;
+            };
             modelContextWindow?: unknown;
           };
         };
@@ -1243,14 +1302,18 @@ export function latestCodexContextUsage(
         // uses for `/status`'s "tokens in context". Never add a second local
         // estimate to it; any source uncertainty belongs in the breakdown.
         let tokens = Number.isFinite(reported) ? Math.max(0, reported) : 0;
-        if (
+        const isFailureSentinel = (
           tokens === 0
           && Number.isFinite(window)
           && window > 0
           && failureTotal === window
-        ) {
+        );
+        if (isFailureSentinel) {
           tokens = window;
         }
+        const cumulativeTokens = Number.isFinite(failureTotal) && failureTotal >= 0 && !isFailureSentinel
+          ? failureTotal
+          : undefined;
         const contributors = localHistoryContributors(
           lines,
           segmentStart,
@@ -1264,6 +1327,7 @@ export function latestCodexContextUsage(
             Number.isFinite(window) && window > 0 ? window : null,
             configuredAutoCompactLimit,
           ),
+          cumulativeTokens,
           reportedTokens: tokens,
           contributors: contributors.length ? contributors : undefined,
         };
@@ -1274,6 +1338,10 @@ export function latestCodexContextUsage(
           Number(usage?.inputTokens ?? 0) + Number(usage?.outputTokens ?? 0)
         ));
         const window = Number(rec.params?.tokenUsage?.modelContextWindow ?? 0);
+        const cumulative = Number(
+          rec.params?.tokenUsage?.total?.totalTokens
+          ?? rec.params?.tokenUsage?.total?.total_tokens,
+        );
         let segmentStart = 0;
         let compactionRecord: Record<string, unknown> | null = null;
         for (let j = i - 1; j >= 0; j--) {
@@ -1298,6 +1366,7 @@ export function latestCodexContextUsage(
             Number.isFinite(window) && window > 0 ? window : null,
             configuredAutoCompactLimit,
           ),
+          cumulativeTokens: Number.isFinite(cumulative) && cumulative >= 0 ? cumulative : undefined,
           reportedTokens: tokens,
           contributors: contributors.length ? contributors : undefined,
         };
