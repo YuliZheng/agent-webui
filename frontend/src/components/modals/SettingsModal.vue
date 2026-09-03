@@ -9,7 +9,6 @@ import { MODEL_CHOICES, PERMISSION_MODES, CODEX_MODEL_CHOICES, CODEX_APPROVAL_PR
 import { applyTheme } from "../../util/theme.js";
 import { displayCwd } from "../../util/cwd-display.js";
 import { deleteSessions, retitleAll } from "../../api/sessions.js";
-import { requestNotifyPermission } from "../../util/os-notify.js";
 import { CODEX_REASONING_EFFORTS } from "../../util/codex-efforts.js";
 import {
   pwaInstallStatus,
@@ -66,18 +65,6 @@ function unhideAllVisible() {
 
 const notifications = useNotificationsStore();
 const purgeInflight = ref(false);
-const notifyPermission = ref<NotificationPermission | "unsupported">(
-  typeof Notification === "undefined" ? "unsupported" : Notification.permission,
-);
-
-async function enableOsNotifications() {
-  notifyPermission.value = await requestNotifyPermission();
-  if (notifyPermission.value === "granted") {
-    notifications.pushInfo("Background reply notifications are enabled.", { title: "Notifications enabled" });
-  } else if (notifyPermission.value === "denied") {
-    notifications.pushError("Notifications are blocked in this browser's site settings.", { title: "Notifications blocked" });
-  }
-}
 
 const appInstallDescription = computed(() => {
   const descriptions: Record<PwaInstallStatus, string> = {
@@ -226,27 +213,6 @@ async function doRetitleAll() {
             </label>
             <p class="text-xs opacity-60 mt-1">{{ messageDisplayDescription }}</p>
           </div>
-        </section>
-
-        <section class="mb-5">
-          <div class="text-xs uppercase tracking-wider opacity-70 mb-1">Notifications</div>
-          <p class="text-xs opacity-60 mb-2">
-            Show a system notification when a reply finishes in the background. Supported phone launchers also show an app-icon dot or count while that notification is unread.
-          </p>
-          <button
-            type="button"
-            class="text-sm px-3 py-1.5 rounded border border-[var(--cw-border)] hover:bg-[var(--cw-panel-2)] disabled:opacity-50"
-            :disabled="notifyPermission === 'granted' || notifyPermission === 'unsupported'"
-            @click="enableOsNotifications"
-          >
-            {{ notifyPermission === "granted"
-              ? "Enabled"
-              : notifyPermission === "denied"
-                ? "Blocked by browser"
-                : notifyPermission === "unsupported"
-                  ? "Not supported"
-                  : "Enable notifications" }}
-          </button>
         </section>
 
         <section class="mb-5">

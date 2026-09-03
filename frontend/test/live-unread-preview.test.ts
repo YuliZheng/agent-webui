@@ -4,6 +4,7 @@ import { useLiveStore } from "../src/stores/live.js";
 import { useSessionsStore } from "../src/stores/sessions.js";
 import { usePromptPendingStore } from "../src/stores/prompt-pending.js";
 import { useUiStore } from "../src/stores/ui.js";
+import { useNotificationsStore } from "../src/stores/notifications.js";
 
 describe("live assistant preview unread", () => {
   beforeEach(() => setActivePinia(createPinia()));
@@ -63,7 +64,7 @@ describe("live assistant preview unread", () => {
     expect(sessions.unreadBySession[id]).toBeUndefined();
   });
 
-  it("marks the selected session unread and notifies when the app is unfocused", async () => {
+  it("marks the selected session unread without showing a reply popup when the app is unfocused", () => {
     const id = `selected-background-${Math.random()}`;
     const sessions = useSessionsStore();
     useUiStore().selectFromHistory(id);
@@ -73,13 +74,15 @@ describe("live assistant preview unread", () => {
     });
     vi.spyOn(document, "hasFocus").mockReturnValue(false);
 
-    const close = vi.fn();
-    const NotificationMock = vi.fn(function (this: { onclick: (() => void) | null; close: () => void }) {
-      this.onclick = null;
-      this.close = close;
-    });
+    const NotificationMock = vi.fn();
     Object.assign(NotificationMock, { permission: "granted" });
     vi.stubGlobal("Notification", NotificationMock);
+    const showNotification = vi.fn();
+    vi.stubGlobal("navigator", {
+      serviceWorker: {
+        getRegistration: vi.fn().mockResolvedValue({ showNotification }),
+      },
+    });
 
     useLiveStore().onGlobal({
       kind: "notification", id, body: "finished answer", title: "Agent WebUI",
@@ -87,7 +90,9 @@ describe("live assistant preview unread", () => {
     });
 
     expect(sessions.unreadBySession[id]).toBe(1);
-    await vi.waitFor(() => expect(NotificationMock).toHaveBeenCalledTimes(1));
+    expect(useNotificationsStore().items).toEqual([]);
+    expect(showNotification).not.toHaveBeenCalled();
+    expect(NotificationMock).not.toHaveBeenCalled();
   });
 
   it("does not treat a repeated old assistant preview after send as a new reply", () => {

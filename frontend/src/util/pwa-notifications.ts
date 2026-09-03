@@ -1,6 +1,6 @@
 const SESSION_NOTIFICATION_TAG_PREFIX = "agent-webui-session:";
 
-export function sessionNotificationTag(sessionId: string): string {
+function sessionNotificationTag(sessionId: string): string {
   return `${SESSION_NOTIFICATION_TAG_PREFIX}${sessionId}`;
 }
 
@@ -13,36 +13,9 @@ async function currentRegistration(): Promise<ServiceWorkerRegistration | undefi
   }
 }
 
-// Mobile browsers generally reject `new Notification()`. A persistent
-// notification created by the service worker is the portable path and, on
-// Android, is also what lets the launcher show an unread dot/count.
-export async function showSessionNotification(input: {
-  sessionId: string;
-  title: string;
-  body: string;
-}): Promise<boolean> {
-  const registration = await currentRegistration();
-  if (!registration) return false;
-  try {
-    // `renotify` is implemented by Chromium for persistent notifications but
-    // is still missing from some TypeScript DOM-lib releases.
-    const options: NotificationOptions & { renotify: boolean } = {
-      body: input.body.slice(0, 200),
-      tag: sessionNotificationTag(input.sessionId),
-      renotify: true,
-      icon: "/assets/icon-192.png",
-      data: { kind: "session", sessionId: input.sessionId },
-    };
-    await registration.showNotification(input.title || "Agent WebUI", options);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-// Reading a conversation must settle both representations of unread state:
-// the in-app count and any persistent OS notification that keeps an Android
-// launcher badge alive.
+// Reply popups are currently disabled. Keep the cleanup path so reading a
+// conversation, or loading the updated app, also removes persistent
+// notifications created by an older frontend bundle.
 export async function dismissSessionNotification(sessionId: string): Promise<void> {
   const registration = await currentRegistration();
   if (!registration) return;
@@ -51,5 +24,16 @@ export async function dismissSessionNotification(sessionId: string): Promise<voi
       tag: sessionNotificationTag(sessionId),
     });
     for (const notification of notifications) notification.close();
+  } catch { /* unsupported or unavailable */ }
+}
+
+export async function dismissAllSessionNotifications(): Promise<void> {
+  const registration = await currentRegistration();
+  if (!registration) return;
+  try {
+    const notifications = await registration.getNotifications();
+    for (const notification of notifications) {
+      if (notification.tag.startsWith(SESSION_NOTIFICATION_TAG_PREFIX)) notification.close();
+    }
   } catch { /* unsupported or unavailable */ }
 }

@@ -3,6 +3,7 @@ import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref, watch 
 import Sidebar from "./components/Sidebar.vue";
 import ToastStack from "./components/ToastStack.vue";
 import Lightbox from "./components/Lightbox.vue";
+import { dismissAllSessionNotifications } from "./util/pwa-notifications.js";
 import { useSessionsStore } from "./stores/sessions.js";
 import { usePrefsStore } from "./stores/prefs.js";
 import { useLiveStore } from "./stores/live.js";
@@ -143,6 +144,7 @@ function onServiceWorkerMessage(event: MessageEvent) {
 onMounted(() => {
   if ("serviceWorker" in navigator) {
     navigator.serviceWorker.addEventListener("message", onServiceWorkerMessage);
+    void dismissAllSessionNotifications();
   }
 });
 

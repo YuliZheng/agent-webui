@@ -96,8 +96,9 @@ describe("PWA install state", () => {
       main.indexOf('mount("#app")'),
     );
     expect(settings.indexOf("App installation")).toBeGreaterThan(
-      settings.indexOf("Notifications"),
+      settings.indexOf("Appearance"),
     );
+    expect(settings).not.toContain("Enable notifications");
     expect(settings).toContain(
       "WebAPK generation requires Google WebAPK/Play services and network access",
     );

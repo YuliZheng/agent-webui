@@ -19,7 +19,6 @@ import { usePendingInteractionsStore } from "./pending-interactions.js";
 import { useSessionSettingsStore } from "./session-settings.js";
 import { useBackgroundTasksStore } from "./background-tasks.js";
 import type { BackgroundTask } from "@claude-webui/shared/api";
-import { osNotify } from "../util/os-notify.js";
 import type { InteractionAdded, InteractionRemoved } from "@claude-webui/shared/api";
 import { shouldNotifyForSession } from "../util/session-visibility.js";
 import { codexRuntimeProgressEvent } from "../util/codex-runtime-progress.js";
@@ -888,16 +887,9 @@ export const useLiveStore = defineStore("live", {
           if (earlyAssistantUnread.has(id)) earlyAssistantUnread.delete(id);
           else sessions.bumpUnread(id);
         }
-        if (!body.trim()) return;
-        const notifications = useNotificationsStore();
-        notifications.push({
-          uuid: msg.uuid as string,
-          sessionId: id,
-          cwd: msg.cwd as string,
-          title: msg.title as string,
-          body,
-        });
-        void osNotify({ sessionId: id, title: msg.title as string, body });
+        // Unread state remains visible in the sidebar and synchronized through
+        // the server watermark. Reply-completion popups are intentionally
+        // disabled on every device.
       }
     },
     subscribeToSession(id: string, from: number, tailN = ENGAGE_TAIL_N): number {

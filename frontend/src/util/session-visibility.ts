@@ -12,7 +12,7 @@ export interface SessionNotificationSource {
   subagent?: boolean;
 }
 
-/** Completion toasts follow the same hidden-session preferences as the sidebar. */
+/** Background unread surfacing follows the same visibility prefs as the sidebar. */
 export function shouldNotifyForSession(
   source: SessionNotificationSource,
   prefs: OrdinarySessionVisibilityPrefs,
