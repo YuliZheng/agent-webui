@@ -6,6 +6,7 @@ const mainPane = readFileSync(join(process.cwd(), "src/components/MainPane.vue")
 const mobileGoalPopover = readFileSync(join(process.cwd(), "src/components/MobileGoalPopover.vue"), "utf8");
 const statusPage = readFileSync(join(process.cwd(), "src/components/SessionStatusPage.vue"), "utf8");
 const assistantBlock = readFileSync(join(process.cwd(), "src/components/blocks/AssistantBlock.vue"), "utf8");
+const contextFooter = readFileSync(join(process.cwd(), "src/components/blocks/ContextFooter.vue"), "utf8");
 const localCommands = readFileSync(join(process.cwd(), "src/util/local-commands.ts"), "utf8");
 const css = readFileSync(join(process.cwd(), "src/styles/tailwind.css"), "utf8");
 
@@ -89,7 +90,11 @@ describe("mobile WeChat-style session header", () => {
     expect(assistantBlock).not.toContain("ContextFooter");
     expect(assistantBlock).not.toContain("loadCodexUsageBreakdown");
     expect(statusPage).toContain("ContextFooter");
-    expect(statusPage).toContain("上下文用量");
+    expect(statusPage).toContain("Token 用量");
+    expect(contextFooter).toContain("会话累计");
+    expect(contextFooter).toContain("账户周额度");
+    expect(contextFooter).toContain("按账户本周约");
+    expect(contextFooter).toContain("模型、推理、工具、检索、缓存与速度");
     expect(statusPage).toContain('rows.value.filter(row => row.label !== "Context")');
     expect(statusPage).toContain("readFullCodexContextUsage");
     expect(statusPage).toContain("void loadCodexUsageBreakdown()");

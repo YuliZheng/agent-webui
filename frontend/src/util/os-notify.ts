@@ -1,11 +1,10 @@
-// Foreground OS notifications via the Web Notification API. For the installed
-// PWA these surface as Windows toast notifications (clearable from the Action
-// Center) on top of the taskbar badge. Everything here is a no-op when the
-// API is missing or permission isn't granted, so plain browser tabs are
-// unaffected. This is foreground-only — no service worker / push — so it fires
-// while the app is running (incl. minimized / behind another window), not when
-// fully closed.
+// OS notifications for replies received while the installed app is alive in
+// the background. The service-worker path works on mobile and lets Android
+// launchers derive their notification dot/count; the constructor remains a
+// desktop fallback. This is not Web Push, so a fully closed app is still quiet.
 import { useUiStore } from "../stores/ui.js";
+import { useSessionsStore } from "../stores/sessions.js";
+import { sessionNotificationTag, showSessionNotification } from "./pwa-notifications.js";
 
 // Startup must not call requestPermission(): Chromium and Safari increasingly
 // require a user gesture and may silently suppress an eager prompt. Keep this
@@ -24,21 +23,22 @@ export async function requestNotifyPermission(): Promise<NotificationPermission 
   }
 }
 
-// Fire a toast for a new assistant reply. Skipped when the window is focused
-// AND visible — the in-app toast already covers that case, and an OS toast on
-// top would be redundant noise. The point of this is the background /
-// minimized case, which is exactly when Windows shows + collects the toast.
-export function osNotify(input: { sessionId: string; title: string; body: string }) {
+// Fire a system notification for a new assistant reply. Skipped when the
+// window is focused and visible because the inline reply is already in view.
+export async function osNotify(input: { sessionId: string; title: string; body: string }) {
   if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
   if (typeof document !== "undefined" && document.visibilityState === "visible" && document.hasFocus()) return;
+  if (await showSessionNotification(input)) return;
   try {
-    const n = new Notification(input.title || "claude-webui", {
+    const n = new Notification(input.title || "Agent WebUI", {
       body: input.body.slice(0, 200),
-      tag: input.sessionId, // collapse repeats from the same session
+      tag: sessionNotificationTag(input.sessionId),
+      icon: "/assets/icon-192.png",
     });
     n.onclick = () => {
       try { window.focus(); } catch { /* ignore */ }
       useUiStore().select(input.sessionId);
+      useSessionsStore().markRead(input.sessionId);
       n.close();
     };
   } catch { /* ignore */ }

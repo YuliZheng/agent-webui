@@ -6,7 +6,7 @@ import { usePrefsStore } from "../stores/prefs.js";
 import { useNotificationsStore } from "../stores/notifications.js";
 import { useDraftsStore } from "../stores/drafts.js";
 import { useImageDraftsStore } from "../stores/image-drafts.js";
-import { usePromptPendingStore } from "../stores/prompt-pending.js";
+import { hasPendingTurnStart, usePromptPendingStore } from "../stores/prompt-pending.js";
 import { useBackgroundTasksStore } from "../stores/background-tasks.js";
 import { useLiveStore } from "../stores/live.js";
 import { displayCwd } from "../util/cwd-display.js";
@@ -20,6 +20,8 @@ import { latestSidebarPendingPrompt } from "../util/pending-prompt-reconciliatio
 import { APP_BACK_PRIORITY, registerAppBackHandler } from "../util/app-back.js";
 import { setPwaLayerActive } from "../util/pwa-history.js";
 import { retitleSession, setSessionTitle } from "../api/sessions.js";
+import EmojiGlyph from "./EmojiGlyph.vue";
+import { sessionTitleEmojiForDisplay } from "../util/session-title-emoji.js";
 
 // Module-scoped — only one row across the whole sidebar can be in the
 // swiped-open state at a time. Opening a different row collapses any
@@ -54,6 +56,7 @@ const bgRunning = computed(() => currentTurnBackgroundTasks(
 
 const status = computed(() => sessions.statusBySession[props.id] ?? null);
 const capacityRetry = computed(() => sessions.capacityRetryBySession[props.id] ?? null);
+const optimisticallyStarting = computed(() => hasPendingTurnStart(promptPending.pending(props.id)));
 const capacityRetryWaitSeconds = computed(() => {
   if (!capacityRetry.value) return 0;
   return Math.max(0, Math.ceil(
@@ -94,7 +97,11 @@ const pathTint = computed(() => {
 // to evoke the topic and is far more distinctive at a glance than a first
 // letter). Falls back to the existing first-letter-of-title scheme for
 // rows without an emoji (manual-only renames, brand-new untitled rows).
-const titleEmoji = computed(() => item.value?.titleEmoji ?? null);
+const titleEmoji = computed(() => sessionTitleEmojiForDisplay(
+  title.value,
+  item.value?.titleEmoji,
+  item.value?.titleSource,
+));
 const avatarIsEmoji = computed(() => !!titleEmoji.value);
 const avatarChar = computed(() => titleEmoji.value || avatarText({
   title: title.value,
@@ -169,10 +176,10 @@ const livePreview = computed<LivePreview>(() => {
     // /compact runs silently (no jsonl writes) — without its own label the
     // row says "thinking" for minutes with nothing visibly happening.
     const verb = sessions.compactingBySession[props.id]
-      ? "🗜 Compacting context…"
+      ? "正在整理上下文…"
       : (item.value?.previewRole === "assistant" ? preview.value : "")
         || live.turnProgress[props.id]
-        || `${item.value?.agent === "codex" ? "Codex is starting work…" : "Claude is thinking…"}`;
+        || `${item.value?.agent === "codex" ? "Codex is working…" : "Claude is thinking…"}`;
     return {
       text: elapsed ? `${verb} ${elapsed}` : verb,
       kind: "thinking",
@@ -185,6 +192,7 @@ const livePreview = computed<LivePreview>(() => {
 });
 const isRunning = computed(() =>
   status.value === "running" ||
+  optimisticallyStarting.value ||
   // Match MainPane's dot (isWorking || isCompacting): during a /compact the
   // jsonl is silent and the parser drives status via markCompacting. Normally
   // markResponding(true) already holds status==="running", so this only adds
@@ -798,7 +806,13 @@ function onTitleKey(e: KeyboardEvent) {
       :class="avatarIsEmoji ? 'text-[26px] leading-none' : 'text-white font-semibold text-[17px]'"
       :style="{ background: avatarBg }"
       :title="cwd"
-    >{{ avatarChar }}
+    >
+      <EmojiGlyph
+        v-if="titleEmoji"
+        :emoji="titleEmoji"
+        class="h-[26px] w-[26px]"
+      />
+      <template v-else>{{ avatarChar }}</template>
     </div>
 
     <!-- Middle column: takes the full remaining width.

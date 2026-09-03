@@ -2,7 +2,11 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch, nextTick } from "vue";
 import { useSessionCacheStore } from "../stores/session-cache.js";
 import { useSessionsStore } from "../stores/sessions.js";
-import { usePromptPendingStore, type PendingPrompt } from "../stores/prompt-pending.js";
+import {
+  hasPendingTurnStart,
+  usePromptPendingStore,
+  type PendingPrompt,
+} from "../stores/prompt-pending.js";
 import { useDraftsStore } from "../stores/drafts.js";
 import { useScrollTargetStore } from "../stores/scroll-target.js";
 import { useSearchHighlightStore } from "../stores/search-highlight.js";
@@ -16,7 +20,7 @@ import { basenameFromPath, codexImageUrl, localFileFromHref } from "../util/loca
 import { copyText } from "../util/clipboard.js";
 import { extractAttachedImages } from "../util/extract-images.js";
 import { standaloneExternalNavigationHref } from "../util/pwa-history.js";
-import { currentTurnProgress } from "../util/turn-progress.js";
+import { formatMessageTime, parseMessageTimestamp, shouldShowMessageTime } from "../util/message-time.js";
 import { localDirectoryBehavior } from "../util/local-file-device.js";
 import {
   captureViewportAnchor,
@@ -25,14 +29,15 @@ import {
   type ViewportAnchorSnapshot,
 } from "../util/scroll-anchor.js";
 import {
+  isCodexDurableUserMessage,
   matchedCodexPendingPromptIds,
   pendingPromptProbeRange,
 } from "../util/pending-prompt-reconciliation.js";
 import { interleavePendingPrompts } from "../util/pending-prompt-order.js";
 import { useNotificationsStore } from "../stores/notifications.js";
-import { groupTimeline, type TimelineNode, type ToolPair } from "../parser/group.js";
+import type { TimelineNode, ToolPair } from "../parser/group.js";
 import { toolSummary } from "../parser/tool-summaries.js";
-import { codexRolloutToClaudeLines } from "../parser/codex-adapt.js";
+import { messageTimeline } from "../util/message-timeline-cache.js";
 import { isTaskNotificationContent, parseTaskNotification, type TaskNotificationInfo } from "../parser/task-notification.js";
 import { isQueueOperation } from "@claude-webui/shared/discriminate";
 import { readSessionRange, sendPrompt, stopSession } from "../api/sessions.js";
@@ -49,6 +54,7 @@ import AwaySummaryBlock from "./blocks/system/AwaySummaryBlock.vue";
 import LocalCommandBlock from "./blocks/system/LocalCommandBlock.vue";
 import ApiErrorBlock from "./blocks/system/ApiErrorBlock.vue";
 import CompactBoundaryBlock from "./blocks/system/CompactBoundaryBlock.vue";
+import EmptyCompletionBlock from "./blocks/system/EmptyCompletionBlock.vue";
 import ToolRunBlock, { type ToolRunItem } from "./blocks/tool/ToolRunBlock.vue";
 import AgentBadge from "./AgentBadge.vue";
 import UserAvatar from "./UserAvatar.vue";
@@ -56,10 +62,12 @@ import AvatarEditorModal from "./AvatarEditorModal.vue";
 
 interface Usage { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number }
 type DecoratedEntry = { node: TimelineNode; usage: Usage | null };
-type RenderRow =
+type ContentRow =
   | { kind: "entry"; entry: DecoratedEntry }
   | { kind: "pending"; prompt: PendingPrompt }
   | { kind: "toolRun"; key: string; items: ToolRunItem[] };
+type TimeRow = { kind: "time"; key: string; timestamp: number; datetime: string; label: string };
+type RenderRow = ContentRow | TimeRow;
 type ToolRunRow = Extract<RenderRow, { kind: "toolRun" }>;
 
 const props = defineProps<{ sessionId: string }>();
@@ -182,27 +190,26 @@ const running = computed(() => sessions.statusBySession[props.sessionId] === "ru
 const compacting = computed(() => !!sessions.compactingBySession[props.sessionId]);
 
 const lines = computed(() => cache.bySession[props.sessionId]?.lines ?? []);
+const contentRevision = computed(() => cache.bySession[props.sessionId]?.contentRevision ?? 0);
 // Codex sessions stream app-server events; adapt them to claude-shaped records
 // so the existing timeline/blocks render them. claude sessions pass through.
 const isCodex = computed(() => sessions.byId[props.sessionId]?.agent === "codex");
 const agent = computed(() => sessions.byId[props.sessionId]?.agent ?? "claude");
 const capacityRetry = computed(() => sessions.capacityRetryBySession[props.sessionId] ?? null);
-const renderLines = computed(() => isCodex.value
-  ? codexRolloutToClaudeLines(lines.value, {
-      suppressLatestEmptyCompletion: capacityRetry.value !== null,
-    })
-  : lines.value);
-const timeline = computed<TimelineNode[]>(() => groupTimeline(renderLines.value));
+const timeline = computed<TimelineNode[]>(() => messageTimeline({
+  sessionId: props.sessionId,
+  contentRevision: contentRevision.value,
+  lines: lines.value,
+  isCodex: isCodex.value,
+  suppressLatestEmptyCompletion: capacityRetry.value !== null,
+}));
 const pendingPrompts = computed(() => promptPending.pending(props.sessionId));
 const pendingProbeAttempted = new Set<string>();
 // Do not wait for Codex's potentially slow thread/resume before acknowledging
-// activity. Once WebSocket.send succeeds, show the local thinking indicator
-// immediately; the authoritative backend running push takes over before the
-// prompt RPC resolves. Accepted steers are excluded because they can remain as
-// durable local chips after the active turn has ended.
-const optimisticallyStarting = computed(() =>
-  pendingPrompts.value.some(prompt => prompt.phase === "dispatched"),
-);
+// activity. Keep the indicator through RPC acceptance: the backend running
+// push and durable user record can both arrive after that acknowledgement.
+// The shared helper excludes persistent mid-turn steers.
+const optimisticallyStarting = computed(() => hasPendingTurnStart(pendingPrompts.value));
 // Backend-queue chips. Walks the jsonl tail backwards from EOF until it
 // hits a clearing event (`assistant`, queue-op remove/dequeue), collecting
 // queue-op enqueue records along the way. `assistant` as a clearing event
@@ -307,14 +314,12 @@ function reconcilePendingPrompts() {
 // assistant/tool/system lines would grow lines.length and prematurely clear
 // the bubble before the real record lands. So clear only on a genuine user
 // landing:
-//   - codex: rollout `event_msg/user_message`
+//   - codex: response, legacy-event, or item_completed user message
 //   - claude: a real `type:"user"` text record (not tool_result/meta/sidechain),
 //     or a mid-turn `queue-operation` enqueue (queued behind a live turn).
 function isUserLandingLine(ln: string | undefined): boolean {
   if (!ln) return false;
-  if (ln.indexOf('"user_message"') >= 0) {
-    try { const r = JSON.parse(ln) as { payload?: { type?: unknown } }; if (r?.payload?.type === "user_message") return true; } catch { /* fall through */ }
-  }
+  if (isCodexDurableUserMessage(ln)) return true;
   if (ln.indexOf('"queue-operation"') >= 0) {
     try { const r = JSON.parse(ln); if (isQueueOperation(r as Record<string, unknown>) && (r as { operation?: string }).operation === "enqueue") return true; } catch { /* fall through */ }
   }
@@ -368,9 +373,10 @@ async function openLocalLink(local: NonNullable<ReturnType<typeof localFileFromH
     lightbox.open(codexImageUrl(local.path), basenameFromPath(local.path));
     return;
   }
+  const openFoldersOnHost = localDirectoryBehavior() === "open-on-host";
   try {
     const info = await inspectLocalPath(local.path);
-    if (info.kind === "directory" && localDirectoryBehavior() === "open-on-host") {
+    if (info.kind === "directory" && openFoldersOnHost) {
       try {
         await revealLocalPath(info.path);
         notificationsStore.pushInfo("Opened on the host computer", { title: info.name });
@@ -382,7 +388,17 @@ async function openLocalLink(local: NonNullable<ReturnType<typeof localFileFromH
         );
       }
     }
-  } catch { /* the viewer renders the authoritative path error */ }
+  } catch {
+    if (openFoldersOnHost) {
+      // Content reads remain restricted to session roots, but an explicit
+      // desktop click may still reveal an existing path in Explorer/Finder.
+      try {
+        const opened = await revealLocalPath(local.path);
+        notificationsStore.pushInfo("Opened on the host computer", { title: basenameFromPath(opened.path) });
+        return;
+      } catch { /* the viewer renders the authoritative path error */ }
+    }
+  }
   localFileViewer.show(props.sessionId, local.path, local.line);
 }
 
@@ -408,15 +424,15 @@ function onContentClick(e: MouseEvent) {
     return;
   }
 
-  // Android/Chrome standalone PWAs do not reliably surface target=_blank
-  // navigations. Use an in-context navigation for out-of-scope web URLs; the
-  // browser then hands the external page off while preserving the installed
-  // app. Ordinary browser tabs keep the Markdown renderer's new-tab behavior.
+  // Standalone PWAs need an explicit browser-context open: navigating this
+  // window replaces the installed WebUI and makes the active session appear
+  // lost. Ordinary browser tabs keep the Markdown renderer's target=_blank;
+  // this direct click handler gives installed apps the same new-tab contract.
   const external = standaloneExternalNavigationHref(href, window.location.href);
   if (!external) return;
   e.preventDefault();
   e.stopPropagation();
-  window.location.assign(external);
+  window.open(external, "_blank", "noopener,noreferrer");
 }
 
 // ─── Stall detection ───
@@ -457,122 +473,6 @@ onBeforeUnmount(() => {
   if (stallTimer) { clearInterval(stallTimer); stallTimer = null; }
 });
 
-// ─── Pull-to-refresh ───────────────────────────────────────────────────────
-// WeChat-style: when the scroller is at the very top, pulling down past
-// PULL_THRESHOLD then releasing kicks a refresh that wakes the WS,
-// re-pulls the sessions list, and resets+re-engages this conversation.
-// Avoids the "reload the whole page through the proxy" pain when sidebar
-// previews / message stream feel stale after a long suspend.
-//
-// touchmove must be NON-passive so we can preventDefault and suppress the
-// native overscroll bounce while we own the gesture. Vue's @touchmove is
-// passive by default in v3, so we attach via addEventListener manually.
-type PullState = "idle" | "pulling" | "refreshing";
-const pullState = ref<PullState>("idle");
-const pullDistance = ref(0);
-const PULL_THRESHOLD = 60;
-const PULL_MAX = 90;
-const PULL_REFRESH_HOLD = 50;
-const PULL_START_SLOP = 8;
-let pullStartY = 0;
-let pullActive = false;
-
-function onPullTouchStart(e: TouchEvent) {
-  if (pullState.value === "refreshing") return;
-  const el = scroller.value;
-  if (!el) return;
-  if (el.scrollTop > 0) return;
-  if (e.touches.length !== 1) return;
-  pullStartY = e.touches[0]?.clientY ?? 0;
-  pullActive = true;
-}
-
-function onPullTouchMove(e: TouchEvent) {
-  if (!pullActive || pullState.value === "refreshing") return;
-  const el = scroller.value;
-  if (!el) return;
-  // Bail if user scrolled off the top mid-gesture (e.g. native scroll
-  // happened before our handler took over) — leave the rest to native.
-  if (el.scrollTop > 0) {
-    pullActive = false;
-    pullDistance.value = 0;
-    pullState.value = "idle";
-    return;
-  }
-  const y = e.touches[0]?.clientY ?? pullStartY;
-  const dy = y - pullStartY;
-  if (dy <= PULL_START_SLOP) {
-    pullDistance.value = 0;
-    pullState.value = "idle";
-    return;
-  }
-  // Resistance curve: half the actual delta, capped at PULL_MAX. Feels
-  // like rubber-band tension instead of 1:1 finger-following.
-  pullDistance.value = Math.min((dy - PULL_START_SLOP) * 0.5, PULL_MAX);
-  pullState.value = "pulling";
-  e.preventDefault();
-}
-
-async function onPullTouchEnd() {
-  if (!pullActive) return;
-  pullActive = false;
-  if (pullState.value !== "pulling") return;
-  if (pullDistance.value >= PULL_THRESHOLD) {
-    await runPullRefresh();
-  } else {
-    pullDistance.value = 0;
-    pullState.value = "idle";
-  }
-}
-
-async function runPullRefresh() {
-  pullState.value = "refreshing";
-  pullDistance.value = PULL_REFRESH_HOLD;
-  try {
-    const [, sessionsOk] = await Promise.all([
-      // HTTP is independent of a stale/zombie mobile WebSocket, so completion
-      // here means this conversation really did check the backend tail.
-      live.refreshSession(props.sessionId, true),
-      sessions.fetchAll(),
-      new Promise((resolve) => setTimeout(resolve, 280)),
-    ]);
-    if (!sessionsOk) throw new Error("会话列表刷新失败");
-    notificationsStore.pushInfo("已更新到最新消息");
-  } catch (err) {
-    notificationsStore.pushError(
-      err instanceof Error ? err.message : String(err),
-      { title: "刷新失败，请重试" },
-    );
-  } finally {
-    pullDistance.value = 0;
-    pullState.value = "idle";
-  }
-}
-
-onMounted(() => {
-  const el = scroller.value;
-  if (!el) return;
-  el.addEventListener("touchstart", onPullTouchStart, { passive: true });
-  el.addEventListener("touchmove", onPullTouchMove, { passive: false });
-  el.addEventListener("touchend", onPullTouchEnd, { passive: true });
-  el.addEventListener("touchcancel", onPullTouchEnd, { passive: true });
-});
-onBeforeUnmount(() => {
-  const el = scroller.value;
-  if (!el) return;
-  el.removeEventListener("touchstart", onPullTouchStart);
-  el.removeEventListener("touchmove", onPullTouchMove);
-  el.removeEventListener("touchend", onPullTouchEnd);
-  el.removeEventListener("touchcancel", onPullTouchEnd);
-});
-
-const pullIndicatorLabel = computed(() => {
-  if (pullState.value === "refreshing") return "刷新中…";
-  if (pullDistance.value >= PULL_THRESHOLD) return "松开刷新";
-  if (pullDistance.value > 0) return "下拉刷新";
-  return "";
-});
-
 // A tool is still executing when the most-recent tool-bearing timeline node
 // has a pair with no result yet. Scanning from the end (not the whole history)
 // keeps an old interrupted/never-resolved tool_use from suppressing the alarm
@@ -609,10 +509,6 @@ const runningToolLabel = computed<string>(() => {
     .some((it) => it.toolUseId === open.pair.use.id);
   return waiting ? `⏸ Waiting for approval · ${label}` : `⚙ ${label}`;
 });
-// Once a tool finishes, retain a truthful sense of momentum instead of
-// falling back to the opaque "Codex is thinking…" label. Progress is derived
-// only from transcript-visible commentary and completed tool calls.
-const codexTurnProgress = computed(() => currentTurnProgress(timeline.value));
 const capacityRetryLabel = computed(() => {
   const retry = capacityRetry.value;
   if (!retry) return "";
@@ -623,9 +519,8 @@ const capacityRetryLabel = computed(() => {
 const workingLabel = computed(() => {
   if (!isCodex.value) return "Claude is thinking…";
   return capacityRetryLabel.value
-    || codexTurnProgress.value.label
     || live.turnProgress[props.sessionId]
-    || "Codex is starting work…";
+    || "Codex is working…";
 });
 const stallThresholdMs = computed(() => (toolInProgress.value ? TOOL_STALL_MS : STALL_MS));
 const isStalled = computed(() =>
@@ -728,7 +623,7 @@ const pendingLandingSignal = computed(() => {
     const line = lines.value[index];
     if (!line) continue;
     if (
-      line.includes('"user_message"') ||
+      isCodexDurableUserMessage(line) ||
       line.includes('"queue-operation"') ||
       line.includes('"type":"user"')
     ) {
@@ -865,8 +760,63 @@ function sourceLineIndexForEntry(entry: DecoratedEntry): number | null {
   return typeof index === "number" && Number.isSafeInteger(index) && index >= 0 ? index : null;
 }
 
+function conversationTimestampForEntry(entry: DecoratedEntry): number | null {
+  const node = entry.node;
+  if (node.kind !== "event") return null;
+  if (node.block === "UserPromptBlock") {
+    return parseMessageTimestamp(node.record.timestamp);
+  }
+  if (node.block !== "AssistantBlock") return null;
+  const message = node.record.message as { content?: unknown; stop_reason?: unknown } | undefined;
+  const content = message?.content;
+  const hasVisibleMessage = message?.stop_reason === "refusal" || (Array.isArray(content) && content.some((raw) => {
+    const block = raw as { type?: unknown; text?: unknown };
+    return (block.type === "text" && typeof block.text === "string" && block.text.trim().length > 0)
+      || block.type === "image"
+      || block.type === "image_url";
+  }));
+  return hasVisibleMessage ? parseMessageTimestamp(node.record.timestamp) : null;
+}
+
+function conversationTimestampForRow(row: ContentRow): number | null {
+  if (row.kind === "entry") return conversationTimestampForEntry(row.entry);
+  if (row.kind === "pending") return parseMessageTimestamp(row.prompt.startedAt);
+  return null;
+}
+
+function previousConversationTimestamp(start: number): number | null {
+  let previous: number | null = null;
+  for (let i = 0; i < start; i++) {
+    const timestamp = conversationTimestampForEntry(decorated.value[i]!);
+    if (timestamp !== null && (previous === null || timestamp > previous)) previous = timestamp;
+  }
+  return previous;
+}
+
+function withMessageTimeRows(rows: ContentRow[], previousTimestamp: number | null): RenderRow[] {
+  const result: RenderRow[] = [];
+  let previous = previousTimestamp;
+  for (const row of rows) {
+    const timestamp = conversationTimestampForRow(row);
+    if (timestamp !== null) {
+      if (shouldShowMessageTime(previous, timestamp)) {
+        result.push({
+          kind: "time",
+          key: `time:${keyForRow(row)}`,
+          timestamp,
+          datetime: new Date(timestamp).toISOString(),
+          label: formatMessageTime(timestamp),
+        });
+      }
+      if (previous === null || timestamp > previous) previous = timestamp;
+    }
+    result.push(row);
+  }
+  return result;
+}
+
 const renderedRows = computed<RenderRow[]>(() => {
-  const rows: RenderRow[] = [];
+  const rows: ContentRow[] = [];
   // Drop truly-empty assistant records first (no text / tool_use / non-empty
   // thinking): they render nothing but a blank avatar-height gap, and removing
   // them lets the tool records they sat between collapse into one run.
@@ -908,7 +858,7 @@ const renderedRows = computed<RenderRow[]>(() => {
       for (const entry of runEntries) rows.push({ kind: "entry", entry });
     }
   }
-  return rows;
+  return withMessageTimeRows(rows, previousConversationTimestamp(renderedSlice.value.start));
 });
 
 // Tool runs can grow at either edge as history is prepended or a live turn
@@ -1057,7 +1007,7 @@ const blockMap = {
   TaskNotificationBlock,
   AssistantBlock, AssistantApiErrorBlock,
   TurnDurationBlock, AwaySummaryBlock, LocalCommandBlock,
-  ApiErrorBlock, CompactBoundaryBlock,
+  ApiErrorBlock, EmptyCompletionBlock, CompactBoundaryBlock,
 } as const;
 
 function comp(kind: string | null) {
@@ -1065,12 +1015,14 @@ function comp(kind: string | null) {
 }
 
 function keyForRow(row: RenderRow): string {
+  if (row.kind === "time") return row.key;
   if (row.kind === "toolRun") return row.key;
   if (row.kind === "pending") return `pending:${row.prompt.id}`;
   return keyFor(row.entry);
 }
 
 function scrollKeyForRow(row: RenderRow): string {
+  if (row.kind === "time") return row.key;
   if (row.kind === "entry") return keyFor(row.entry);
   if (row.kind === "pending") return `pending:${row.prompt.id}`;
   // A run at the head of the render window can absorb older calls when the
@@ -1687,6 +1639,9 @@ function propsFor(entry: { node: TimelineNode; usage: Usage | null }): Record<st
   if (entry.node.block === "AssistantBlock") {
     return { node: entry.node };
   }
+  if (entry.node.block === "EmptyCompletionBlock") {
+    return { node: entry.node, sessionId: props.sessionId };
+  }
   return { node: entry.node };
 }
 
@@ -1817,25 +1772,6 @@ onBeforeUnmount(() => document.removeEventListener("click", closeBubbleMenu));
            prepended, this flexible space collapses first, so the existing
            messages do not move before the transcript becomes scrollable. -->
       <div class="cw-message-top-spacer" aria-hidden="true" />
-      <!-- Pull-to-refresh indicator. Sits above all content and grows in
-           height as the user drags down, pushing the rest of the chat
-           content with it. transition-none while actively pulling so the
-           bar tracks the finger 1:1; CSS transition kicks in on release/
-           refresh-end so the snap-back animates. -->
-      <div
-        class="overflow-hidden flex items-end justify-center text-[12px] opacity-70 select-none pointer-events-none"
-        :class="pullState === 'pulling' ? '' : 'transition-[height]  ease-out'"
-        :style="{ height: pullDistance + 'px' }"
-      >
-        <div class="flex items-center gap-1.5 pb-2">
-          <span
-            v-if="pullState === 'refreshing'"
-            class="inline-block w-3 h-3 border-2 border-current border-t-transparent rounded-full animate-spin"
-          />
-          <span v-else>{{ pullDistance >= PULL_THRESHOLD ? '↑' : '↓' }}</span>
-          <span>{{ pullIndicatorLabel }}</span>
-        </div>
-      </div>
       <div ref="historyEl" class="cw-message-history">
         <button
           v-if="showLoadEarlierButton"
@@ -1845,7 +1781,13 @@ onBeforeUnmount(() => document.removeEventListener("click", closeBubbleMenu));
           @click="loadEarlier('chunk', true)"
         >{{ loadEarlierInflight ? "正在加载更早记录…" : (loadEarlierError || "加载更早记录") }}</button>
         <template v-for="row in renderedRows" :key="keyForRow(row)">
-          <template v-if="row.kind === 'entry'">
+          <div
+            v-if="row.kind === 'time'"
+            class="cw-message-time"
+          >
+            <time :datetime="row.datetime">{{ row.label }}</time>
+          </div>
+          <template v-else-if="row.kind === 'entry'">
             <div
               v-if="row.entry.node.kind === 'event' && row.entry.node.block === 'UserPromptBlock'"
               class="cw-user-prompt-anchor h-px"
@@ -1955,8 +1897,8 @@ onBeforeUnmount(() => document.removeEventListener("click", closeBubbleMenu));
         <span class="thinking-dot bg-current" style="animation-delay: 0.3s" />
         <span
           class="ml-1 min-w-0 truncate"
-          :title="compacting ? 'Compacting context' : capacityRetry ? capacityRetryLabel : toolInProgress ? runningToolLabel : workingLabel"
-        >{{ compacting ? "🗜 Compacting context…" : capacityRetry ? capacityRetryLabel : toolInProgress ? (runningToolLabel || "⚙ Running a command…") : workingLabel }}</span>
+          :title="compacting ? '正在整理上下文' : capacityRetry ? capacityRetryLabel : toolInProgress ? runningToolLabel : workingLabel"
+        >{{ compacting ? "正在整理上下文…" : capacityRetry ? capacityRetryLabel : toolInProgress ? (runningToolLabel || "⚙ Running a command…") : workingLabel }}</span>
         <span v-if="spinnerElapsed" class="ml-1 shrink-0 opacity-70 tabular-nums">{{ spinnerElapsed }}</span>
       </div>
       <!-- Server-confirmed queue chips: jsonl `queue-operation enqueue`

@@ -23,7 +23,9 @@ import android.widget.TextView;
 public final class RelayActivity extends Activity {
     private final Handler handler = new Handler(Looper.getMainLooper());
     private TextView statusView;
+    private Button keepAliveButton;
     private boolean managedProfile;
+    private boolean watchdogRecoveryLaunch;
 
     private final Runnable refreshStatus = new Runnable() {
         @Override
@@ -37,6 +39,7 @@ public final class RelayActivity extends Activity {
     protected void onCreate(Bundle state) {
         super.onCreate(state);
         managedProfile = ProfileMode.isManagedProfile(this);
+        watchdogRecoveryLaunch = managedProfile && isWatchdogRecoveryLaunch();
 
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
@@ -56,6 +59,10 @@ public final class RelayActivity extends Activity {
                         + RelayTarget.WINDOWS.bridgePort + "\n"
                         + "MacBook bridge: " + BridgePolicy.LISTEN_HOST + ":"
                         + RelayTarget.MACBOOK.bridgePort + "\n"
+                        + "Windows RDP bridge: " + RdpBridgePolicy.LISTEN_HOST + ":"
+                        + RdpBridgePolicy.LISTEN_PORT + " -> "
+                        + RdpBridgePolicy.UPSTREAM_HOST + ":"
+                        + RdpBridgePolicy.UPSTREAM_PORT + "\n"
                         + "SOCKS compatibility: " + RelayPolicy.LISTEN_HOST + ":"
                         + RelayPolicy.LISTEN_PORT + "\n"
                         + "Tailnet targets: Windows + MacBook\n\n"
@@ -71,7 +78,9 @@ public final class RelayActivity extends Activity {
                         + RelayTarget.MACBOOK.launchOrigin()
                         + RelayTarget.MACBOOK.launchPath + " (agent-macbook)\n\n"
                         + "This uses no personal VPN slot and can run together "
-                        + "with personal-profile FlClash.");
+                        + "with personal-profile FlClash. The optional accessibility "
+                        + "watchdog below only checks the local Relay health endpoint "
+                        + "and reopens the work-profile copy after system cleanup.");
         explanation.setTextSize(16);
         explanation.setPadding(0, dp(20), 0, dp(24));
         root.addView(explanation, matchWrap());
@@ -91,6 +100,13 @@ public final class RelayActivity extends Activity {
             }
         });
         root.addView(start, matchWrap());
+
+        keepAliveButton = new Button(this);
+        keepAliveButton.setOnClickListener(view -> openKeepAliveSettings());
+        if (managedProfile) {
+            keepAliveButton.setVisibility(View.GONE);
+        }
+        root.addView(keepAliveButton, matchWrap());
 
         Button openMacbook = new Button(this);
         openMacbook.setText("Install / open agent-macbook in Chrome");
@@ -112,6 +128,12 @@ public final class RelayActivity extends Activity {
         if (managedProfile) {
             requestNotificationPermissionIfNeeded();
             startRelay();
+            if (watchdogRecoveryLaunch) {
+                // CrossProfileApps must launch a visible MAIN activity, but the
+                // recovery itself should stay out of the user's way and out of
+                // Recents once the foreground service has been requested.
+                handler.postDelayed(this::finishAndRemoveTask, 800);
+            }
         }
     }
 
@@ -142,6 +164,20 @@ public final class RelayActivity extends Activity {
                     new String[] { Manifest.permission.POST_NOTIFICATIONS },
                     7302);
         }
+    }
+
+    private void openKeepAliveSettings() {
+        if (managedProfile) return;
+        try {
+            startActivity(RelayKeepAliveAccessibilityService.settingsIntent(this));
+        } catch (ActivityNotFoundException error) {
+            startActivity(new Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS));
+        }
+    }
+
+    private boolean isWatchdogRecoveryLaunch() {
+        Uri referrer = getReferrer();
+        return referrer != null && getPackageName().equals(referrer.getAuthority());
     }
 
     private void stopRelay() {
@@ -185,9 +221,15 @@ public final class RelayActivity extends Activity {
 
     private void updateStatus() {
         if (!managedProfile) {
+            boolean keepAliveEnabled = RelayKeepAliveAccessibilityService.isEnabled(this);
             statusView.setText(
                     "Personal background service: not required\n"
-                            + "Required: work Tailnet Relay + work Tailscale");
+                            + "Required: work Tailnet Relay + work Tailscale\n"
+                            + "Accessibility watchdog: "
+                            + (keepAliveEnabled ? "enabled" : "disabled"));
+            keepAliveButton.setText(keepAliveEnabled
+                    ? "Accessibility watchdog enabled"
+                    : "Enable accessibility watchdog");
             return;
         }
 
@@ -195,7 +237,7 @@ public final class RelayActivity extends Activity {
         status.append(SocksRelayService.isRunning()
                 ? "Status: running"
                 : "Status: starting or stopped");
-        status.append("\nMode: work SOCKS + two Web bridges");
+        status.append("\nMode: work SOCKS + two Web bridges + RDP bridge");
         status.append("\nRecovery: listener self-heal + 15 min watchdog");
         status.append("\nActive connections: ")
                 .append(SocksRelayService.activeConnections());

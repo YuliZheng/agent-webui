@@ -10,7 +10,9 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@agent-webui/shared": "0.1.0",
     "@claude-webui/shared": "*",
+    "@twemoji/svg": "^15.0.0",
     "idb": "^8.0.0",
     "katex": "^0.16.47",
     "markdown-it": "^14.0.0",

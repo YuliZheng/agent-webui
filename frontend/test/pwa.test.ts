@@ -47,13 +47,14 @@ describe("PWA install support", () => {
     expect(mainTs).toContain('.register("/sw.js", { scope: "/", updateViaCache: "none" })');
   });
 
-  it("checks the network shell on foreground and reloads only after transient state is safe", () => {
+  it("checks the network shell on foreground and reloads only after transient local state is safe", () => {
     expect(mainTs).toContain("watchForFrontendUpdates(registration, canReloadForFrontendUpdate)");
     expect(mainTs).toContain("drafts.inflightBySession");
     expect(mainTs).toContain("imageDrafts.bySession");
     expect(mainTs).toContain("focusedComposerHasDraft");
     expect(mainTs).toContain("drafts.text(selectedId).length > 0");
-    expect(mainTs).toContain('sessions.statusBySession[selectedId] === "running"');
+    expect(mainTs).not.toContain("statusBySession[selectedId]");
+    expect(mainTs).toContain("A running agent turn is durable backend work");
     expect(frontendUpdate).toContain('fetch("/", {');
     expect(frontendUpdate).toContain('cache: "no-store"');
     expect(frontendUpdate).toContain('registration.update()');
@@ -69,8 +70,14 @@ describe("PWA install support", () => {
     expect(serviceWorker).not.toContain("/attachments/");
   });
 
+  it("routes persistent mobile notification taps back to their session", () => {
+    expect(serviceWorker).toContain('addEventListener("notificationclick"');
+    expect(serviceWorker).toContain('postMessage({ kind: "open-session", sessionId })');
+    expect(serviceWorker).toContain('target.searchParams.set("session", sessionId)');
+  });
+
   it("bounds navigation freshness waits and reuses immutable hashed assets", () => {
-    expect(serviceWorker).toContain('CACHE_NAME = `${CACHE_PREFIX}v2`');
+    expect(serviceWorker).toContain('CACHE_NAME = `${CACHE_PREFIX}v3`');
     expect(serviceWorker).toContain("NAVIGATION_NETWORK_BUDGET_MS = 750");
     expect(serviceWorker).toContain("Promise.race([networkResponse, cachedAfterBudget])");
     expect(serviceWorker).toContain("event.waitUntil(networkResponse");

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { extractToolResultImages } from "../src/util/tool-result-images.js";
+import { extractToolResultImages, extractToolRunImages } from "../src/util/tool-result-images.js";
 
 describe("tool-result image bubbles", () => {
   it("extracts Claude, MCP, URL, and serialized Codex image blocks", () => {
@@ -23,5 +23,18 @@ describe("tool-result image bubbles", () => {
     expect(extractToolResultImages(JSON.stringify({
       content: [{ type: "input_image", image_url: "data:image/png;base64,aA==" }],
     }))).toEqual([{ url: "data:image/png;base64,aA==" }]);
+  });
+
+  it("promotes and deduplicates images from a collapsed run of tool results", () => {
+    expect(extractToolRunImages([
+      [{ type: "image_url", image_url: "/api/sessions/s1/transcript-image/10/0?v=a" }],
+      [
+        { type: "image_url", image_url: "/api/sessions/s1/transcript-image/10/0?v=a" },
+        { type: "input_image", image_url: "data:image/jpeg;base64,aA==" },
+      ],
+    ])).toEqual([
+      { url: "/api/sessions/s1/transcript-image/10/0?v=a" },
+      { url: "data:image/jpeg;base64,aA==" },
+    ]);
   });
 });

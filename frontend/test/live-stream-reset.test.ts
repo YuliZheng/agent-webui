@@ -13,6 +13,8 @@ vi.mock("../src/api/sessions.js", async (importOriginal) => ({
 import { useLiveStore } from "../src/stores/live.js";
 import { useSessionCacheStore } from "../src/stores/session-cache.js";
 import { useSessionsStore } from "../src/stores/sessions.js";
+import { usePromptPendingStore } from "../src/stores/prompt-pending.js";
+import { useUiStore } from "../src/stores/ui.js";
 
 describe("live stream reset handoff", () => {
   beforeEach(() => {
@@ -23,6 +25,136 @@ describe("live stream reset handoff", () => {
     tailApi.readSessionTail.mockResolvedValue({ totalLines: 0, fromIndex: 0, lines: [] });
   });
   afterEach(() => vi.useRealTimers());
+
+  it("repairs preview and running status from a durable Codex tail", () => {
+    const id = "durable-terminal-repair";
+    const sessions = useSessionsStore();
+    const live = useLiveStore();
+    sessions.addOrTouch({
+      id,
+      cwd: "C:\\repo",
+      mtime: "2026-08-29T18:24:58.000Z",
+      size: 1,
+      agent: "codex",
+      preview: "stale prompt",
+      previewRole: "user",
+    });
+    sessions.setStatus(id, "running", true, true);
+    live.turnProgress[id] = "stale tool";
+    const pending = usePromptPendingStore();
+    pending.add(id, {
+      text: "the completed prompt",
+      imageCount: 0,
+      startedAtLineCount: 10,
+      startedAtSessionSize: 1,
+      agent: "codex",
+      phase: "dispatched",
+    });
+
+    live.observeTurnProgressLine(id, JSON.stringify({
+      type: "event_msg",
+      timestamp: "2026-08-29T18:25:09.186Z",
+      payload: { type: "agent_message", message: "Latest durable answer" },
+    }));
+    expect(sessions.byId[id]?.preview).toBe("Latest durable answer");
+    expect(sessions.byId[id]?.previewRole).toBe("assistant");
+    expect(sessions.statusBySession[id]).toBe("running");
+
+    live.observeTurnProgressLine(id, JSON.stringify({
+      type: "event_msg",
+      timestamp: "2026-08-29T18:25:10.339Z",
+      payload: {
+        type: "task_complete",
+        turn_id: "turn-1",
+        last_agent_message: "Latest durable answer",
+      },
+    }), 20);
+    expect(sessions.statusBySession[id]).toBe("exited");
+    expect(sessions.compactingBySession[id]).toBeUndefined();
+    expect(sessions.byId[id]?.lastBoundaryAt).toBe("2026-08-29T18:25:10.339Z");
+    expect(live.turnProgress[id]).toBeUndefined();
+    expect(pending.pending(id)[0]?.phase).toBe("accepted");
+  });
+
+  it("uses a durable user message as the current turn boundary", () => {
+    const id = "durable-turn-boundary";
+    const sessions = useSessionsStore();
+    const live = useLiveStore();
+    sessions.addOrTouch({
+      id,
+      cwd: "C:\\repo",
+      mtime: "2026-08-29T10:00:00.000Z",
+      size: 1,
+      agent: "codex",
+      lastBoundaryAt: "2026-08-29T10:00:00.000Z",
+    });
+    sessions.setStatus(id, "running", true, true);
+
+    live.observeTurnProgressLine(id, JSON.stringify({
+      type: "event_msg",
+      timestamp: "2026-08-29T18:25:09.186Z",
+      payload: { type: "user_message", message: "Continue the current turn" },
+    }));
+
+    expect(sessions.byId[id]?.lastBoundaryAt).toBe("2026-08-29T18:25:09.186Z");
+    expect(sessions.byId[id]?.lastTurnAt).toBe("2026-08-29T18:25:09.186Z");
+    expect(sessions.statusBySession[id]).toBe("running");
+    expect(sessions.compactingBySession[id]).toBeUndefined();
+  });
+
+  it("clears stale compaction from a durable completion while keeping the turn running", () => {
+    const id = "durable-compaction-complete";
+    const sessions = useSessionsStore();
+    const live = useLiveStore();
+    sessions.addOrTouch({
+      id,
+      cwd: "C:\\repo",
+      mtime: "2026-08-29T18:24:58.000Z",
+      size: 1,
+      agent: "codex",
+    });
+    sessions.setStatus(id, "running", true, true);
+    live.turnProgress[id] = "Codex is working…";
+
+    live.observeTurnProgressLine(id, JSON.stringify({
+      type: "event_msg",
+      timestamp: "2026-08-29T18:25:09.186Z",
+      payload: { type: "context_compacted" },
+    }));
+
+    expect(sessions.statusBySession[id]).toBe("running");
+    expect(sessions.webuiAliveBySession[id]).toBe(true);
+    expect(sessions.compactingBySession[id]).toBeUndefined();
+    expect(live.turnProgress[id]).toBe("Codex is working…");
+  });
+
+  it("returns to a running label after a tool completes instead of sticking on Completed", () => {
+    const live = useLiveStore();
+    const id = "tool-complete-progress";
+
+    live.observeTurnProgressLine(id, JSON.stringify({
+      type: "response_item",
+      payload: {
+        type: "custom_tool_call",
+        call_id: "call-1",
+        name: "exec",
+        input: "check status",
+      },
+    }));
+    expect(live.turnProgress[id]).toContain("exec");
+
+    live.observeTurnProgressLine(id, JSON.stringify({
+      type: "response_item",
+      payload: {
+        type: "custom_tool_call_output",
+        call_id: "call-1",
+        output: "done",
+      },
+    }));
+
+    expect(live.turnProgress[id]).toBe("Codex is working…");
+    expect(live.turnProgress[id]).not.toContain("Completed");
+  });
 
   it("keeps the rendered snapshot until the authoritative replay can replace it atomically", async () => {
     const cache = useSessionCacheStore();
@@ -237,6 +369,116 @@ describe("live stream reset handoff", () => {
     live.closeAll();
   });
 
+  it("does not let stream control frames cancel a pending transcript watchdog", async () => {
+    const live = useLiveStore();
+    live.perSession["watchdog-control"] = () => undefined;
+
+    live.onGlobal({ kind: "session-touched", id: "watchdog-control" });
+    live.onSessionMsg("watchdog-control", { type: "stream-reset" });
+    live.onSessionMsg("watchdog-control", { type: "stream-cursor", nextIndex: 12 });
+
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(tailApi.readSessionTail).toHaveBeenCalledTimes(1);
+    live.closeAll();
+  });
+
+  it("repairs the viewed transcript when an assistant preview arrives first", async () => {
+    const id = "preview-ahead-of-transcript";
+    const live = useLiveStore();
+    const cache = useSessionCacheStore();
+    const sessions = useSessionsStore();
+    sessions.addOrTouch({
+      id,
+      cwd: "C:\\repo",
+      mtime: "2026-08-23T12:16:43.700Z",
+      size: 1,
+      agent: "codex",
+      preview: "user question",
+      previewRole: "user",
+      lastTurnAt: "2026-08-23T12:16:43.700Z",
+    });
+    useUiStore().selectFromHistory(id);
+    live.perSession[id] = () => undefined;
+    tailApi.readSessionTail.mockResolvedValueOnce({
+      totalLines: 2,
+      fromIndex: 0,
+      lines: [
+        { index: 0, raw: "user-line" },
+        { index: 1, raw: "assistant-line" },
+      ],
+    });
+
+    live.onGlobal({
+      kind: "session-touched",
+      id,
+      mtime: "2026-08-23T12:17:05.239Z",
+      size: 2,
+      preview: "assistant answer",
+      previewRole: "assistant",
+      lastTurnAt: "2026-08-23T12:17:05.239Z",
+    });
+    // These frames previously cancelled the only recovery path.
+    live.onSessionMsg(id, { type: "stream-reset" });
+    live.onSessionMsg(id, { type: "stream-cursor", nextIndex: 1 });
+
+    await vi.advanceTimersByTimeAsync(200);
+    await Promise.resolve();
+    expect(tailApi.readSessionTail).toHaveBeenCalledTimes(1);
+    expect(cache.bySession[id]?.lines[1]).toBe("assistant-line");
+    live.closeAll();
+    vi.useRealTimers();
+    await cache.clear(id);
+  });
+
+  it("runs a fresh viewed-completion tail after an older open request settles", async () => {
+    const id = "completion-after-stale-open";
+    const live = useLiveStore();
+    const cache = useSessionCacheStore();
+    useSessionsStore().addOrTouch({
+      id,
+      cwd: "C:\\repo",
+      mtime: "2026-08-23T12:16:43.700Z",
+      size: 1,
+      agent: "codex",
+    });
+    useUiStore().selectFromHistory(id);
+    let resolveOpen!: (value: {
+      totalLines: number;
+      fromIndex: number;
+      lines: Array<{ index: number; raw: string }>;
+    }) => void;
+    tailApi.readSessionTail
+      .mockReturnValueOnce(new Promise((resolve) => { resolveOpen = resolve; }))
+      .mockResolvedValueOnce({
+        totalLines: 2,
+        fromIndex: 0,
+        lines: [
+          { index: 0, raw: "user-line" },
+          { index: 1, raw: "assistant-after-open" },
+        ],
+      });
+
+    const openFetch = live.refreshSession(id);
+    live.onGlobal({
+      kind: "notification",
+      id,
+      body: "assistant after open",
+      timestamp: "2026-08-23T12:17:05.239Z",
+    });
+    await vi.advanceTimersByTimeAsync(200);
+    expect(tailApi.readSessionTail).toHaveBeenCalledTimes(1);
+
+    resolveOpen({ totalLines: 1, fromIndex: 0, lines: [{ index: 0, raw: "user-line" }] });
+    await openFetch;
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(tailApi.readSessionTail).toHaveBeenCalledTimes(2);
+    expect(cache.bySession[id]?.lines[1]).toBe("assistant-after-open");
+    live.closeAll();
+    vi.useRealTimers();
+    await cache.clear(id);
+  });
+
   it("records a tail error, rejects the caller, and clears it after retry", async () => {
     const live = useLiveStore();
     tailApi.readSessionTail.mockRejectedValueOnce(new Error("tail offline"));
@@ -329,7 +571,7 @@ describe("live stream reset handoff", () => {
     const live = useLiveStore();
     tailApi.readSessionTail.mockResolvedValueOnce({ totalLines: 0, fromIndex: 0, lines: [] });
     await live.refreshSession("http-priority", true);
-    expect(tailApi.readSessionTail).toHaveBeenCalledWith(expect.any(String), expect.any(Number), "interactive");
+    expect(tailApi.readSessionTail).toHaveBeenCalledWith("http-priority", 20, "interactive");
   });
 
   it("resolves refresh after the tail while a sparse-gap range is still pending", async () => {

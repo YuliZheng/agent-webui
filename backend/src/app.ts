@@ -32,11 +32,12 @@ import { AppState, normalizePrefs } from "./services/state.js";
 import { PubSub } from "./services/pubsub.js";
 import { ClaudeDriver } from "./services/claude-driver.js";
 import { CODEX_REASONING_EFFORTS, CodexDriver } from "./services/codex-driver.js";
-import { inspectLocalPath, listLocalDirectory, openLocalPath, PreviewStore, readLocalSource, resolveLocalFile, resolveLocalPath } from "./services/files.js";
+import { inspectLocalPath, listLocalDirectory, openLocalPath, PreviewStore, readLocalSource, resolveLocalFile, resolveLocalPathForReveal } from "./services/files.js";
 import { autoTitle, autoTitleFromText, deleteSessions, forkSession, getUserMessages, markdownExport, rewindSession, searchSessions } from "./actions/sessions.js";
 import { expandHome, isWithin, safeFilename } from "./util/paths.js";
 import { resolveCodexExecutable } from "./util/executable.js";
 import { codexDurableTerminal, isMeaningfulEndTurnRecord, NotificationDeduper } from "./services/notifications.js";
+import { advanceReadEntry, recordUnreadCompletion, sessionUnreadCount } from "./services/read-state.js";
 import { assertDirectPromptAllowed, normalizeDirectPromptError } from "./services/session-prompt.js";
 import {
   failRunningClaudeBackgroundTasks,
@@ -81,6 +82,34 @@ import {
 } from "@agent-webui/shared";
 
 const execFileAsync = promisify(execFile);
+const VISUALIZATION_DATE_SEGMENT = /^\d{2}$/;
+
+async function childDirectoryNames(root: string, pattern: RegExp): Promise<string[]> {
+  try {
+    return (await readdir(root, { withFileTypes: true }))
+      .filter(entry => entry.isDirectory() && pattern.test(entry.name))
+      .map(entry => entry.name);
+  } catch {
+    return [];
+  }
+}
+
+async function datedVisualizationRoots(
+  visualizationsRoot: string,
+  sessionId: string,
+): Promise<string[]> {
+  const roots: string[] = [];
+  for (const year of await childDirectoryNames(visualizationsRoot, /^\d{4}$/)) {
+    const yearPath = join(visualizationsRoot, year);
+    for (const month of await childDirectoryNames(yearPath, VISUALIZATION_DATE_SEGMENT)) {
+      const monthPath = join(yearPath, month);
+      for (const day of await childDirectoryNames(monthPath, VISUALIZATION_DATE_SEGMENT)) {
+        roots.push(join(monthPath, day, sessionId));
+      }
+    }
+  }
+  return roots.sort((left, right) => right.localeCompare(left));
+}
 // Automatic mobile gap repair should never pull a multi-megabyte tool record.
 // Full-fidelity range reads remain available when the user explicitly loads
 // older history; this compact mode is only for quietly reconnecting a recent
@@ -99,6 +128,8 @@ export interface BuildAppOptions {
   tokenPath?: string;
   claudeBinary?: string;
   codexBinary?: string;
+  persistentCodexRuntime?: boolean;
+  codexRuntimeEndpoint?: string;
   titleGenerator?: SessionTitleGenerator;
   logger?: boolean;
   startWatchers?: boolean;
@@ -106,6 +137,74 @@ export interface BuildAppOptions {
 }
 
 interface RpcRequest { type: string; reqId?: string; [key: string]: unknown }
+
+type TurnAgent = "claude" | "codex";
+
+interface TurnDrainSnapshot {
+  draining: boolean;
+  startedAt: string | null;
+  activeCount: number;
+  blockingActiveCount: number;
+  admissionCount: number;
+  ready: boolean;
+  activeTurns: Array<{ sessionId: string; agent: TurnAgent; owner: "webui"; restartSafe: boolean }>;
+}
+
+export class TurnDrainController {
+  private startedAt: string | null = null;
+  private admissions = 0;
+  private active = new Map<string, TurnAgent>();
+
+  constructor(private persistentCodexRuntime = false) {}
+
+  begin(): TurnDrainSnapshot {
+    this.startedAt ??= new Date().toISOString();
+    return this.snapshot();
+  }
+
+  cancel(): TurnDrainSnapshot {
+    this.startedAt = null;
+    return this.snapshot();
+  }
+
+  admit(agent: TurnAgent): () => void {
+    if (this.startedAt && !this.restartSafe(agent)) {
+      throw new RpcError(503, "Agent WebUI is draining for restart; retry after the service is back");
+    }
+    this.admissions++;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.admissions = Math.max(0, this.admissions - 1);
+    };
+  }
+
+  setActive(sessionId: string, agent: TurnAgent, active: boolean): void {
+    if (active) this.active.set(sessionId, agent);
+    else this.active.delete(sessionId);
+  }
+
+  private restartSafe(agent: TurnAgent): boolean {
+    return agent === "codex" && this.persistentCodexRuntime;
+  }
+
+  snapshot(): TurnDrainSnapshot {
+    const activeTurns = [...this.active]
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([sessionId, agent]) => ({ sessionId, agent, owner: "webui" as const, restartSafe: this.restartSafe(agent) }));
+    const blockingActiveCount = activeTurns.filter(turn => !turn.restartSafe).length;
+    return {
+      draining: this.startedAt !== null,
+      startedAt: this.startedAt,
+      activeCount: activeTurns.length,
+      blockingActiveCount,
+      admissionCount: this.admissions,
+      ready: blockingActiveCount === 0 && this.admissions === 0,
+      activeTurns,
+    };
+  }
+}
 
 function rawPath(request: FastifyRequest): string {
   const raw = request.raw.url ?? "/";
@@ -449,7 +548,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   state.titleGenerator = options.titleGenerator
     ?? new CodexSessionTitleGenerator(options.codexBinary ?? "codex").generate;
   const contentSearchIndex = await ContentSearchIndex.open(
-    join(stateDir, "content-search-v6.sqlite"),
+    join(stateDir, "content-search-v7.sqlite"),
     event => {
       if (event.type === "error") app.log.warn({ contentSearchIndex: event }, "Content search index update failed");
       else if (event.type === "disabled") app.log.warn({ contentSearchIndex: event }, "Content search index disabled");
@@ -464,6 +563,9 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
       "content-search-v5.sqlite",
       "content-search-v5.sqlite-wal",
       "content-search-v5.sqlite-shm",
+      "content-search-v6.sqlite",
+      "content-search-v6.sqlite-wal",
+      "content-search-v6.sqlite-shm",
     ]) {
       try {
         await unlink(join(stateDir, name));
@@ -478,7 +580,22 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   const claude = new ClaudeDriver(options.claudeBinary ?? "claude", options.claudeSessionsDir ?? join(home, ".claude", "sessions"), state);
   const claudeProcesses = new ClaudeProcessObserver(options.claudeSessionsDir ?? join(home, ".claude", "sessions"));
   claude.setForeignAttachmentLookup(sessionId => claudeProcesses.foreignAttachment(sessionId));
-  const codex = new CodexDriver(options.codexBinary ?? "codex", state);
+  const codex = new CodexDriver(
+    options.codexBinary ?? "codex",
+    state,
+    undefined,
+    undefined,
+    resolve(dirname(codexRoot), "visualizations"),
+    options.persistentCodexRuntime ? {
+      proxyPath: resolve(dirname(fileURLToPath(import.meta.url)), "codex-app-server-proxy.js"),
+      endpoint: options.codexRuntimeEndpoint ?? "ws://127.0.0.1:3458",
+      endpointPath: options.codexRuntimeEndpoint ? undefined : join(stateDir, "codex-runtime.endpoint"),
+      tokenPath: join(stateDir, "codex-runtime.token"),
+      logPath: join(stateDir, "codex-runtime.log"),
+      pidPath: join(stateDir, "codex-runtime.pid"),
+    } : undefined,
+  );
+  const turnDrain = new TurnDrainController(options.persistentCodexRuntime === true);
   claude.on("driver-error", event => app.log.warn({ agent: "claude", event }, "Agent driver reported a recoverable error"));
   codex.on("driver-error", event => app.log.warn({ agent: "codex", event }, "Agent driver reported a recoverable error"));
   const previews = new PreviewStore(join(stateDir, "previews"));
@@ -674,6 +791,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
         titleSource: resolvedTitle.source,
         titleEmoji: resolvedTitle.emoji ?? null,
         readAt: reads[session.id]?.at ?? null,
+        unreadCount: sessionUnreadCount(session, reads[session.id]),
         peer: foreignClaudeSessions.has(session.id),
         ...state.status.get(session.id),
       };
@@ -824,6 +942,9 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     setTokenCookie(reply, token); return { ok: true };
   });
   app.get("/api/me", async () => ({ home }));
+  app.get("/api/admin/drain", async () => turnDrain.snapshot());
+  app.post("/api/admin/drain", async () => turnDrain.begin());
+  app.delete("/api/admin/drain", async () => turnDrain.cancel());
   app.get("/api/me/avatar", async (_request, reply) => {
     reply.header("Cache-Control", "private, no-cache");
     try { return reply.type("image/png").send(await readFile(join(stateDir, "me-avatar.png"))); }
@@ -1028,51 +1149,61 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     });
   }
   async function newSession(args: Record<string, unknown>): Promise<{ sessionId: string }> {
-    const clientUuid = asString(args.clientUuid)?.trim();
-    if (clientUuid !== undefined && (!clientUuid || clientUuid.length > 200)) {
-      throw new RpcError(400, "Invalid new-session idempotency key");
-    }
-    if (!clientUuid) return newSessionOnce(args);
     const agent = args.agent === "codex" ? "codex" : "claude";
-    const key = `${agent}:${clientUuid}`;
-    return runIdempotentRequest(newSessionResults, newSessionRequests, key, () => newSessionOnce(args));
+    const release = turnDrain.admit(agent);
+    try {
+      const clientUuid = asString(args.clientUuid)?.trim();
+      if (clientUuid !== undefined && (!clientUuid || clientUuid.length > 200)) {
+        throw new RpcError(400, "Invalid new-session idempotency key");
+      }
+      if (!clientUuid) return newSessionOnce(args);
+      const key = `${agent}:${clientUuid}`;
+      return runIdempotentRequest(newSessionResults, newSessionRequests, key, () => newSessionOnce(args));
+    } finally {
+      release();
+    }
   }
   async function promptSession(id: string, args: Record<string, unknown>) {
     assertSessionId(id); const session = await index.resolveLight(id); if (!session) throw new RpcError(404, "Session not found");
-    assertDirectPromptAllowed(session);
-    const prompt = asString(args.prompt) ?? ""; const prepared = await attachments(args.images, session.agent); const files = prepared.files; if (!prompt.trim() && !files.length) throw new RpcError(400, "Prompt is empty");
-    const settings = (await state.settings.get())[id]; const prefs = await state.prefs.get();
-    let accepted = false;
+    const release = turnDrain.admit(session.agent);
     try {
-      const permissionMode = settingValue(args.permissionMode, "Codex approval") ?? settings?.permissionMode ?? prefs.defaultCodexApprovalPreset;
-      const result = session.agent === "codex"
-        ? await codex.prompt(id, prompt, {
-          model: settingValue(args.model, "Model") ?? settings?.model ?? prefs.defaultCodexModel,
-          effort: codexReasoningEffort(args.effort) ?? codexReasoningEffort(settings?.effort) ?? codexReasoningEffort(prefs.defaultCodexEffort),
-          serviceTier: codexServiceTier(args.serviceTier) ?? storedCodexServiceTier(settings?.serviceTier),
-          approvalPolicy: codexApproval(permissionMode),
-          sandboxMode: codexSandbox(
-            settingValue(args.sandboxMode, "Codex sandbox") ??
-            codexPresetSandbox(permissionMode) ??
-            settings?.sandboxMode ??
-            prefs.defaultCodexSandboxMode,
-          ),
-          cwd: session.cwd,
-        }, files as string[], asString(args.clientUuid))
-        : await claude.prompt(id, session.cwd, prompt, {
-          model: settingValue(args.model, "Model") ?? settings?.model ?? prefs.defaultClaudeModel,
-          effort: reasoningEffort(args.effort) ?? settings?.effort ?? prefs.defaultClaudeEffort,
-          permissionMode: claudePermission(settingValue(args.permissionMode, "Claude permission") ?? settings?.permissionMode ?? prefs.defaultClaudePermissionMode),
-          clientUuid: asString(args.clientUuid),
-          images: files,
-        });
-      // See newSession: only a driver rejection is safe to clean immediately.
-      accepted = true;
-      await claimAttachments(prepared.batchId, id);
-      return result;
-    } catch (error) {
-      if (!accepted) await discardFailedAttachments(prepared.batchId);
-      throw normalizeDirectPromptError(error);
+      assertDirectPromptAllowed(session);
+      const prompt = asString(args.prompt) ?? ""; const prepared = await attachments(args.images, session.agent); const files = prepared.files; if (!prompt.trim() && !files.length) throw new RpcError(400, "Prompt is empty");
+      const settings = (await state.settings.get())[id]; const prefs = await state.prefs.get();
+      let accepted = false;
+      try {
+        const permissionMode = settingValue(args.permissionMode, "Codex approval") ?? settings?.permissionMode ?? prefs.defaultCodexApprovalPreset;
+        const result = session.agent === "codex"
+          ? await codex.prompt(id, prompt, {
+            model: settingValue(args.model, "Model") ?? settings?.model ?? prefs.defaultCodexModel,
+            effort: codexReasoningEffort(args.effort) ?? codexReasoningEffort(settings?.effort) ?? codexReasoningEffort(prefs.defaultCodexEffort),
+            serviceTier: codexServiceTier(args.serviceTier) ?? storedCodexServiceTier(settings?.serviceTier),
+            approvalPolicy: codexApproval(permissionMode),
+            sandboxMode: codexSandbox(
+              settingValue(args.sandboxMode, "Codex sandbox") ??
+              codexPresetSandbox(permissionMode) ??
+              settings?.sandboxMode ??
+              prefs.defaultCodexSandboxMode,
+            ),
+            cwd: session.cwd,
+          }, files as string[], asString(args.clientUuid))
+          : await claude.prompt(id, session.cwd, prompt, {
+            model: settingValue(args.model, "Model") ?? settings?.model ?? prefs.defaultClaudeModel,
+            effort: reasoningEffort(args.effort) ?? settings?.effort ?? prefs.defaultClaudeEffort,
+            permissionMode: claudePermission(settingValue(args.permissionMode, "Claude permission") ?? settings?.permissionMode ?? prefs.defaultClaudePermissionMode),
+            clientUuid: asString(args.clientUuid),
+            images: files,
+          });
+        // See newSession: only a driver rejection is safe to clean immediately.
+        accepted = true;
+        await claimAttachments(prepared.batchId, id);
+        return result;
+      } catch (error) {
+        if (!accepted) await discardFailedAttachments(prepared.batchId);
+        throw normalizeDirectPromptError(error);
+      }
+    } finally {
+      release();
     }
   }
   async function stopSession(id: string) {
@@ -1102,9 +1233,24 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     const query = request.query as Record<string, unknown>;
     const source = await resolveLocalFile(String(query.path ?? ""), [...extraRoots]);
     const download = query.download === "1";
+    const inlineHtml = !download && /\.html?$/i.test(source.path);
+    const inlinePdf = !download && /\.pdf$/i.test(source.path);
     if (!download && source.size > 256 * 1024 * 1024) throw new RpcError(413, "File exceeds 256 MiB");
-    if (!download && !/\.pdf$/i.test(source.path)) {
-      throw new RpcError(415, "Only PDF files can be embedded through this endpoint");
+    if (!download && !inlineHtml && !inlinePdf) {
+      throw new RpcError(415, "Only PDF and HTML files can be embedded through this endpoint");
+    }
+    if (inlineHtml) {
+      // Serve interactive HTML as its own navigation instead of iframe srcdoc.
+      // srcdoc inherits the SPA's `script-src 'self'`, which blocks the inline
+      // scripts used by self-contained reports. The sandbox keeps this response
+      // on an opaque origin: scripts, forms, popups and downloads work, but the
+      // document cannot read Agent WebUI cookies, storage or parent DOM.
+      reply
+        .header(
+          "Content-Security-Policy",
+          "sandbox allow-scripts allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-downloads",
+        )
+        .header("Referrer-Policy", "no-referrer");
     }
     reply
       .header("Cache-Control", "private, no-store")
@@ -1114,7 +1260,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
         "Content-Disposition",
         fileContentDisposition(download ? "attachment" : "inline", source.path),
       )
-      .type(download ? "application/octet-stream" : "application/pdf");
+      .type(download ? "application/octet-stream" : inlineHtml ? "text/html; charset=utf-8" : "application/pdf");
     return reply.send(createReadStream(source.path));
   });
   app.get("/local-file", async (request, reply) => {
@@ -1189,23 +1335,41 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     const sessionDirectory = dirname(session.path);
     if (!isWithin(codexRoot, sessionDirectory)) throw new RpcError(403, "Session is outside the Codex root");
     const datedDirectory = relative(codexRoot, sessionDirectory);
+    const visualizationsRoot = resolve(dirname(codexRoot), "visualizations");
     const visualizationRoot = resolve(
-      dirname(codexRoot),
-      "visualizations",
+      visualizationsRoot,
       datedDirectory,
       params.sessionId,
     );
-    let actualRoot: string;
-    let actual: string;
-    try {
-      actualRoot = await realpath(visualizationRoot);
-      actual = await realpath(join(actualRoot, params.filename));
-    } catch {
-      throw new RpcError(404, "Visualization not found");
+    const datedRoots = await datedVisualizationRoots(visualizationsRoot, params.sessionId);
+    const rootCandidates = [
+      ...datedRoots,
+      ...(datedRoots.some(candidate => resolve(candidate) === visualizationRoot)
+        ? []
+        : [visualizationRoot]),
+    ];
+    let visualizationsRealRoot: string;
+    try { visualizationsRealRoot = await realpath(visualizationsRoot); }
+    catch { throw new RpcError(404, "Visualization not found"); }
+    let actual: string | undefined;
+    let info: Awaited<ReturnType<typeof stat>> | undefined;
+    for (const candidateRoot of rootCandidates) {
+      try {
+        const actualRoot = await realpath(candidateRoot);
+        if (
+          !isWithin(visualizationsRealRoot, actualRoot)
+          || basename(actualRoot) !== params.sessionId
+        ) continue;
+        const candidate = await realpath(join(actualRoot, params.filename));
+        if (!isWithin(actualRoot, candidate)) continue;
+        const candidateInfo = await stat(candidate);
+        if (!candidateInfo.isFile()) continue;
+        actual = candidate;
+        info = candidateInfo;
+        break;
+      } catch { /* try the same thread ID under another date bucket */ }
     }
-    if (!isWithin(actualRoot, actual)) throw new RpcError(403, "Visualization escapes its session directory");
-    const info = await stat(actual);
-    if (!info.isFile()) throw new RpcError(404, "Visualization not found");
+    if (!actual || !info) throw new RpcError(404, "Visualization not found");
     if (info.size > 5 * 1024 * 1024) throw new RpcError(413, "Visualization exceeds 5 MiB");
     reply
       .header("Content-Security-Policy", "sandbox allow-scripts; default-src 'none'; img-src data: blob:; style-src 'unsafe-inline'; script-src 'unsafe-inline'")
@@ -1352,7 +1516,10 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
       case "inspect-local-path": return inspectLocalPath(String(args.path ?? ""), [...extraRoots]);
       case "list-local-directory": return listLocalDirectory(String(args.path ?? ""), [...extraRoots]);
       case "reveal-local-path": {
-        const target = await resolveLocalPath(String(args.path ?? ""), [...extraRoots]);
+        // Revealing a path does not return its contents. Keep read/list APIs
+        // root-restricted, while allowing an explicit click to open Explorer,
+        // Finder, or the platform file manager for any existing absolute path.
+        const target = await resolveLocalPathForReveal(String(args.path ?? ""));
         await openLocalPath(target.path, target.kind);
         return { path: target.path, kind: target.kind };
       }
@@ -1360,7 +1527,15 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
       case "prompt": return promptSession(String(args.sessionId ?? ""), args);
       case "stop": return stopSession(String(args.sessionId ?? ""));
       case "kill": { const id = String(args.sessionId ?? ""); assertSessionId(id); const session = await index.resolveLight(id); if (!session) throw new RpcError(404, "Session not found"); if (session.agent === "codex") codex.kill(); else claude.kill(id); return {}; }
-      case "compact-session": { const id = String(args.sessionId ?? ""); assertSessionId(id); const session = await index.resolveLight(id); if (!session) throw new RpcError(404, "Session not found"); if (session.agent === "codex") await codex.compact(id); else await claude.compact(id, session.cwd); return {}; }
+      case "compact-session": {
+        const id = String(args.sessionId ?? ""); assertSessionId(id); const session = await index.resolveLight(id); if (!session) throw new RpcError(404, "Session not found");
+        const release = turnDrain.admit(session.agent);
+        try {
+          if (session.agent === "codex") await codex.compact(id); else await claude.compact(id, session.cwd); return {};
+        } finally {
+          release();
+        }
+      }
       case "cli-info": return cliInfo(String(args.sessionId ?? ""), String(args.topic ?? "version"));
       case "get-codex-rate-limits": {
         const id = String(args.sessionId ?? "");
@@ -1369,6 +1544,22 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
         if (!session) throw new RpcError(404, "Session not found");
         if (session.agent !== "codex") throw new RpcError(400, "Rate limits are only available for Codex sessions");
         return codex.rateLimits();
+      }
+      case "get-codex-thread-usage": {
+        const id = String(args.sessionId ?? "");
+        assertSessionId(id);
+        const session = await index.resolveLight(id);
+        if (!session) throw new RpcError(404, "Session not found");
+        if (session.agent !== "codex") throw new RpcError(400, "Thread usage is only available for Codex sessions");
+        return codex.threadUsage(id);
+      }
+      case "get-codex-usage-overview": {
+        const id = String(args.sessionId ?? "");
+        assertSessionId(id);
+        const session = await index.resolveLight(id);
+        if (!session) throw new RpcError(404, "Session not found");
+        if (session.agent !== "codex") throw new RpcError(400, "Usage is only available for Codex sessions");
+        return codex.usageOverview(id);
       }
       case "get-background-tasks": {
         const id = String(args.sessionId ?? "");
@@ -1536,7 +1727,19 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
         };
       }
       case "mark-read": {
-        const id = String(args.sessionId ?? ""); assertSessionId(id); const at = asString(args.at) ?? new Date().toISOString(); await state.reads.update(all => { all[id] = { at }; }); pubsub.push({ type: "session-read", kind: "session-read", id, at }); return { ok: true };
+        const id = String(args.sessionId ?? "");
+        assertSessionId(id);
+        const requestedAt = asString(args.at) ?? new Date().toISOString();
+        const reads = await state.reads.update(all => {
+          all[id] = advanceReadEntry(all[id], requestedAt);
+        });
+        const at = reads[id]?.at ?? requestedAt;
+        const session = index.get(id);
+        const unreadCount = session
+          ? sessionUnreadCount(session, reads[id])
+          : Math.max(0, reads[id]?.unreadCount ?? 0);
+        pubsub.push({ type: "session-read", kind: "session-read", id, at, unreadCount });
+        return { ok: true, at, unreadCount };
       }
       case "retitle-session": {
         const id = String(args.sessionId ?? "");
@@ -1656,6 +1859,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
 
   const status = (event: { id: string; status: "running" | "exited" | "failed"; webuiAlive: boolean; compacting?: boolean; lastBoundaryAt?: string }) => { state.status.set(event.id, event); pubsub.push({ type: "session-status", kind: "session-status", ...event }); if (event.lastBoundaryAt) pubsub.push({ type: "session-boundary", kind: "session-boundary", id: event.id, at: event.lastBoundaryAt }); };
   claude.on("status", event => {
+    turnDrain.setActive(event.id, "claude", event.status === "running" && event.webuiAlive);
     foreignClaudeSessions.delete(event.id);
     status(event);
     if (!event.webuiAlive) {
@@ -1668,6 +1872,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     }
   });
   codex.on("status", event => {
+    turnDrain.setActive(event.id, "codex", event.status === "running" && event.webuiAlive);
     const previousStatus = state.status.get(event.id)?.status;
     if (event.status !== "running") state.capacityRetries.delete(event.id);
     // `startTurnNow` and the app-server both emit "running". Only the first
@@ -1938,6 +2143,12 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
       notificationTrailing.set(session.id, appended.slice(lastNewline + 1));
       let completedTurns = 0;
       const completedPromptRequests: string[] = [];
+      const completionNotifications: Array<{
+        uuid: string;
+        timestamp: string;
+        body: string;
+      }> = [];
+      const completionNotificationIds = new Set<string>();
       for (const line of appended.slice(0, lastNewline + 1).split(/\r?\n/)) {
         try {
           const record = asRecord(JSON.parse(line)); if (!record) continue; const payload = asRecord(record.payload);
@@ -1973,17 +2184,42 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
               completedPromptRequests.push(request);
             }
           }
-          const uuid = asString(record.uuid) ?? asString(payload?.id) ?? `${session.id}:${record.timestamp}`; if (!meaningfulEndTurn || notificationUuids.seen(uuid)) continue;
+          const uuid = asString(record.uuid) ?? asString(payload?.id) ?? `${session.id}:${record.timestamp}`;
+          if (
+            !meaningfulEndTurn
+            || notificationUuids.has(uuid)
+            || completionNotificationIds.has(uuid)
+          ) continue;
+          completionNotificationIds.add(uuid);
+          completionNotifications.push({
+            uuid,
+            timestamp: asString(record.timestamp) ?? new Date().toISOString(),
+            body: session.preview ?? "Turn completed",
+          });
+        } catch { /* isolate malformed or incomplete records */ }
+      }
+      if (completionNotifications.length) {
+        const reads = await state.reads.update(all => {
+          let entry = all[session.id] ?? {};
+          for (const notification of completionNotifications) {
+            entry = recordUnreadCompletion(entry, notification.timestamp);
+          }
+          all[session.id] = entry;
+        });
+        const unreadCount = sessionUnreadCount(session, reads[session.id]);
+        for (const notification of completionNotifications) {
+          notificationUuids.remember(notification.uuid);
           pubsub.notify({
             id: session.id,
             cwd: session.cwd,
             title: session.title ?? null,
-            body: session.preview ?? "Turn completed",
-            uuid,
-            timestamp: asString(record.timestamp) ?? new Date().toISOString(),
+            body: notification.body,
+            uuid: notification.uuid,
+            timestamp: notification.timestamp,
+            unreadCount,
             subagent: session.subagent,
           });
-        } catch { /* isolate malformed or incomplete records */ }
+        }
       }
       if (completedTurns) {
         scheduleAutoTitle(

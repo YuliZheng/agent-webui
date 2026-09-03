@@ -81,20 +81,26 @@ body { @apply bg-white text-; }
 }
 
 .cw-compact-summary {
-  background: color-mix(in srgb, var(--cw-compact-accent) 8%, transparent);
-  border-left-color: var(--cw-compact-accent);
+  background: var(--cw-panel-2);
+  border-color: var(--cw-border);
 }
 .cw-compact-summary-toggle {
-  color: color-mix(in srgb, var(--cw-compact-accent) 80%, transparent);
+  color: var(--cw-muted);
 }
 .cw-compact-summary-toggle:hover {
-  color: var(--cw-compact-accent);
+  color: var(--cw-text);
 }
 .cw-compact-boundary {
-  color: color-mix(in srgb, var(--cw-compact-accent) 65%, transparent);
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--cw-text);
+  background: color-mix(in srgb, var(--cw-panel-2) 78%, transparent);
+  border: 1px solid var(--cw-border);
+  border-radius: 12px;
 }
-.cw-compact-boundary-rule {
-  background: color-mix(in srgb, var(--cw-compact-accent) 32%, transparent);
+.cw-compact-boundary-icon {
+  color: var(--cw-muted);
+  background: color-mix(in srgb, var(--cw-text) 6%, transparent);
 }
 
 /* Auto-compaction fuses two adjacent timeline rows — the boundary divider
@@ -118,17 +124,11 @@ body { @apply bg-white text-; }
   flex: 1 1 auto;
   min-width: 0;
   margin: 8px 12px 0;
-  padding: 8px 12px 6px;
-  background: color-mix(in srgb, var(--cw-compact-accent) 8%, transparent);
-  border: 1px solid color-mix(in srgb, var(--cw-compact-accent) 22%, transparent);
+  padding: 0;
+  background: var(--cw-panel-2);
+  border: 1px solid var(--cw-border);
   border-bottom: 0;
   border-radius: 10px 10px 0 0;
-}
-/* Header is left-aligned text now, not a centered divider — drop the hairlines. */
-.cw-message-list:not(.cw-display-compact)
-  .cw-message-entry[data-block="CompactBoundaryBlock"]:has(+ .cw-message-entry[data-block="UserCompactSummaryBlock"])
-  .cw-compact-boundary-rule {
-  display: none;
 }
 /* Longer merged readout must wrap on narrow viewports instead of overflowing. */
 .cw-message-list:not(.cw-display-compact)
@@ -143,8 +143,8 @@ body { @apply bg-white text-; }
     flex: 1 1 auto;
     min-width: 0;
     margin: 0 12px 8px;
-    background: color-mix(in srgb, var(--cw-compact-accent) 8%, transparent);
-    border: 1px solid color-mix(in srgb, var(--cw-compact-accent) 22%, transparent);
+    background: var(--cw-panel-2);
+    border: 1px solid var(--cw-border);
     border-top: 0;
     border-radius: 0 0 10px 10px;
 }
@@ -551,6 +551,21 @@ body { @apply bg-white text-; }
   min-height: 0;
 }
 
+/* WeChat-style timeline markers: quiet orientation, not per-message metadata. */
+.cw-message-time {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  margin: 14px auto 10px;
+  padding: 0 16px;
+  color: var(--cw-muted, #6b7280);
+  font-size: 12px;
+  line-height: 1.4;
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+}
+
 /* Message display variants. `current` intentionally has no overrides: it is
    the production/classic rendering. Other variants reuse the same parser and
    Vue block components, then restyle via semantic classes/data attributes. */
@@ -618,6 +633,59 @@ body { @apply bg-white text-; }
   color: var(--cw-muted, #6b7280);
   line-height: 1;
 }
+.cw-context-scope-bar {
+  flex-basis: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem 0.75rem;
+  margin-bottom: 0.2rem;
+}
+.cw-context-scope-switch {
+  display: inline-flex;
+  padding: 2px;
+  border: 1px solid var(--cw-border, #d1d5db);
+  border-radius: max(7px, calc(var(--cw-radius, 10px) - 2px));
+  background: var(--cw-control-bg, rgb(255 255 255 / .75));
+}
+.cw-context-scope-switch button {
+  min-width: 3.1rem;
+  min-height: 1.75rem;
+  padding: 0.25rem 0.55rem;
+  border-radius: max(5px, calc(var(--cw-radius, 8px) - 3px));
+  color: var(--cw-muted, #6b7280);
+  line-height: 1;
+  transition: background-color 120ms ease, color 120ms ease, box-shadow 120ms ease;
+}
+.cw-context-scope-switch button:hover,
+.cw-context-scope-switch button:focus-visible {
+  color: var(--cw-text, #111827);
+}
+.cw-context-scope-switch button:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--cw-accent, #2563eb) 58%, transparent);
+  outline-offset: 1px;
+}
+.cw-context-scope-switch button.is-active {
+  background: var(--cw-panel-bg, #ffffff);
+  color: var(--cw-text, #111827);
+  box-shadow: 0 1px 4px rgb(0 0 0 / 0.12);
+  font-weight: 600;
+}
+.cw-context-scope-summary {
+  min-width: 0;
+  color: var(--cw-muted, #6b7280);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+.cw-context-scope-summary strong {
+  color: var(--cw-text, #111827);
+  font-size: 0.9rem;
+  font-weight: 650;
+}
+.cw-context-scope-equivalent {
+  white-space: nowrap;
+}
 .cw-context-usage-detail {
   --cw-context-user: #22c55e;
   --cw-context-assistant: #0ea5e9;
@@ -634,6 +702,15 @@ body { @apply bg-white text-; }
   --cw-context-patches: #ec4899;
   --cw-context-reasoning: #8b5cf6;
   --cw-context-other: #64748b;
+  --cw-context-total: #2563eb;
+  --cw-context-total-0: #2563eb;
+  --cw-context-total-1: #14b8a6;
+  --cw-context-total-2: #8b5cf6;
+  --cw-context-total-3: #f59e0b;
+  --cw-context-total-4: #ec4899;
+  --cw-context-total-5: #06b6d4;
+  --cw-context-total-6: #84cc16;
+  --cw-context-total-7: #64748b;
   --cw-context-used: var(--cw-accent, #2563eb);
   --cw-context-track: color-mix(in srgb, var(--cw-muted, #6b7280) 18%, transparent);
   flex-basis: 100%;
@@ -711,6 +788,18 @@ body { @apply bg-white text-; }
 .cw-context-usage-dot-free {
   background: var(--cw-context-track);
 }
+.cw-context-usage-dot-total {
+  background: var(--cw-context-total);
+}
+.cw-context-usage-dot-plan {
+  background: var(--cw-context-total-2);
+}
+.cw-context-usage-dot-week {
+  background: var(--cw-context-total-3);
+}
+.cw-context-usage-dot-conversation {
+  background: var(--cw-context-total-1);
+}
 .cw-context-usage-value {
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
@@ -719,6 +808,10 @@ body { @apply bg-white text-; }
   margin-top: 0.4rem;
   padding-top: 0.4rem;
   border-top: 1px solid color-mix(in srgb, var(--cw-border, #d1d5db) 72%, transparent);
+}
+.cw-context-usage-account {
+  display: grid;
+  gap: 0.1rem;
 }
 .cw-context-usage-note {
   margin-top: 0.2rem;
@@ -830,6 +923,13 @@ body { @apply bg-white text-; }
   }
   .cw-context-actions {
     justify-content: flex-start;
+  }
+  .cw-context-scope-bar {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+  .cw-context-scope-summary {
+    text-align: left;
   }
   .cw-context-usage-detail {
     grid-template-columns: minmax(0, 1fr);

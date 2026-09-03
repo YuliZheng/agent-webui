@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import { useLiveStore } from "../src/stores/live.js";
 import { useSessionsStore } from "../src/stores/sessions.js";
@@ -7,6 +7,10 @@ import { useUiStore } from "../src/stores/ui.js";
 
 describe("live assistant preview unread", () => {
   beforeEach(() => setActivePinia(createPinia()));
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
 
   it("marks a background session unread on first visible assistant preview only", () => {
     const id = `background-${Math.random()}`;
@@ -57,6 +61,33 @@ describe("live assistant preview unread", () => {
       preview: "answer", previewRole: "assistant",
     });
     expect(sessions.unreadBySession[id]).toBeUndefined();
+  });
+
+  it("marks the selected session unread and notifies when the app is unfocused", async () => {
+    const id = `selected-background-${Math.random()}`;
+    const sessions = useSessionsStore();
+    useUiStore().selectFromHistory(id);
+    sessions.addOrTouch({
+      id, cwd: "C:\\repo", mtime: "2026-08-01T00:00:00.000Z",
+      size: 10, agent: "codex", preview: "question", previewRole: "user",
+    });
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+
+    const close = vi.fn();
+    const NotificationMock = vi.fn(function (this: { onclick: (() => void) | null; close: () => void }) {
+      this.onclick = null;
+      this.close = close;
+    });
+    Object.assign(NotificationMock, { permission: "granted" });
+    vi.stubGlobal("Notification", NotificationMock);
+
+    useLiveStore().onGlobal({
+      kind: "notification", id, body: "finished answer", title: "Agent WebUI",
+      timestamp: "2026-08-01T00:00:01.000Z",
+    });
+
+    expect(sessions.unreadBySession[id]).toBe(1);
+    await vi.waitFor(() => expect(NotificationMock).toHaveBeenCalledTimes(1));
   });
 
   it("does not treat a repeated old assistant preview after send as a new reply", () => {
@@ -261,5 +292,54 @@ describe("live assistant preview unread", () => {
     expect(sessions.byId[id]?.preview).toBe("已经完成登录状态检查。");
     expect(sessions.byId[id]?.previewRole).toBe("assistant");
     expect(sessions.byId[id]?.lastTurnAt).toBe("2026-08-01T00:00:02.000Z");
+  });
+
+  it("hydrates the server-authoritative unread count after another device was offline", () => {
+    const id = `global-unread-${Math.random()}`;
+    const sessions = useSessionsStore();
+    sessions.addOrTouch({
+      id, cwd: "C:\\repo", mtime: "2026-08-29T10:00:02.000Z",
+      size: 20, agent: "codex", preview: "answer", previewRole: "assistant",
+      lastTurnAt: "2026-08-29T10:00:02.000Z",
+    });
+    sessions.bumpUnread(id);
+    sessions.bumpUnread(id);
+
+    sessions.hydrateList([{
+      id, cwd: "C:\\repo", mtime: "2026-08-29T10:00:02.000Z",
+      size: 20, agent: "codex", preview: "answer", previewRole: "assistant",
+      lastTurnAt: "2026-08-29T10:00:02.000Z", unreadCount: 1,
+    }]);
+    expect(sessions.unreadBySession[id]).toBe(1);
+
+    sessions.hydrateList([{
+      id, cwd: "C:\\repo", mtime: "2026-08-29T10:00:02.000Z",
+      size: 20, agent: "codex", preview: "answer", previewRole: "assistant",
+      lastTurnAt: "2026-08-29T10:00:02.000Z",
+      readAt: "2026-08-29T10:00:02.000Z", unreadCount: 3,
+    }]);
+    expect(sessions.unreadBySession[id]).toBeUndefined();
+  });
+
+  it("applies an exact cross-device unread count and clears it globally", () => {
+    const id = `global-read-event-${Math.random()}`;
+    const sessions = useSessionsStore();
+    const live = useLiveStore();
+    useUiStore().selectFromHistory("another-session");
+    sessions.addOrTouch({
+      id, cwd: "C:\\repo", mtime: "2026-08-29T10:00:03.000Z",
+      size: 30, agent: "codex", preview: "answer", previewRole: "assistant",
+      lastTurnAt: "2026-08-29T10:00:03.000Z", unreadCount: 2,
+    });
+    expect(sessions.unreadBySession[id]).toBe(2);
+
+    live.onGlobal({
+      kind: "session-read",
+      id,
+      at: "2026-08-29T10:00:03.000Z",
+      unreadCount: 0,
+    });
+    expect(sessions.unreadBySession[id]).toBeUndefined();
+    expect(sessions.byId[id]?.readAt).toBe("2026-08-29T10:00:03.000Z");
   });
 });

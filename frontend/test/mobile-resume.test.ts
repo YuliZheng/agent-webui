@@ -12,7 +12,8 @@ describe("mobile resume recovery", () => {
   it("force-reconnects and retries resync after long mobile suspend", () => {
     expect(appVue).toContain("const LONG_SUSPEND_MS = 60_000");
     expect(appVue).toContain("const RESUME_RETRY_DELAYS_MS = [0, 500, 1_500, 5_000, 15_000] as const");
-    expect(appVue).toContain("const HOME_SYNC_INTERVAL_MS = 30_000");
+    expect(appVue).toContain("const ACTIVE_SYNC_INTERVAL_MS = 8_000");
+    expect(appVue).toContain("const HOME_SYNC_INTERVAL_MS = 120_000");
     expect(appVue).toContain("function resumePass(forceReconnect: boolean, tryRefreshTail: () => void)");
     expect(appVue).toContain("wsWake({ forceReconnect })");
     expect(appVue).toContain("if (forceReconnect) sessions.clearAllStatus()");
@@ -57,7 +58,24 @@ describe("mobile resume recovery", () => {
     expect(appVue).toContain("if (document.visibilityState === \"hidden\") return");
     expect(appVue).toContain("if (ui.selectedSessionId) return");
     expect(appVue).toContain("resyncSessions(true)");
-    expect(appVue).toContain("window.setInterval(() => syncHomeIfVisible(), HOME_SYNC_INTERVAL_MS)");
+    expect(appVue).toContain("window.setInterval(reconcileVisibleActivity, ACTIVE_SYNC_INTERVAL_MS)");
+  });
+
+  it("reconciles a visibly stuck running session without waiting for a reconnect", () => {
+    expect(appVue).toContain("function reconcileVisibleActivity()");
+    expect(appVue).toContain("live.reconcileRunningSession(sid)");
+    expect(appVue).toContain("window.setInterval(reconcileVisibleActivity, ACTIVE_SYNC_INTERVAL_MS)");
+    expect(liveStore).toContain("reconcileRunningSession(id: string): Promise<void>");
+    expect(liveStore).toContain('ENGAGE_HTTP_TAIL_N, true, "interactive", false');
+    expect(liveStore).toContain('sessions.setStatus(id, "exited", false, false)');
+  });
+
+  it("paints cached chats before refreshing a large archive in the background", () => {
+    expect(sessionsStore).toContain('const SESSION_LIST_STORAGE_KEY = "cw:sessions:v1"');
+    expect(sessionsStore).toContain("loaded: cachedItems.length > 0");
+    expect(appVue).toContain("else if (sessions.loaded) void sessions.fetchAll()");
+    expect(sidebarVue).toContain("eligibleVisibleIds.value.slice(0, visibleSessionLimit.value)");
+    expect(sidebarVue).toContain("Show older conversations");
   });
 
   it("syncs EVERY session tail over coalesced HTTP before waiting for WS subscribe", () => {
@@ -84,6 +102,7 @@ describe("mobile resume recovery", () => {
     expect(liveStore).toContain("async prefetchTails(");
     expect(liveStore).toContain("fetchTailIntoCache(id, PREFETCH_TAIL_N, false, \"background\")");
     expect(liveStore).toContain("for (const id of ids) void cache.restore(id)");
+    expect(liveStore).toContain("if (sessions.list.length > MAX_NETWORK_PREFETCH_SESSION_COUNT) return");
     // Prefetch is wired into boot, reconnect, resume, and the home-list poll.
     expect(appVue).toContain("live.prefetchTails()");
     // A deep link must engage the selected chat before idle background work can
@@ -147,5 +166,13 @@ describe("mobile resume recovery", () => {
     expect(body).toContain("sessions.hydrateList(refreshed.sessions, startedAtRevision)");
     expect(body).not.toContain("sessions.fetchAll()");
     expect(body).not.toContain("forceReconnect");
+  });
+
+  it("keeps pull-to-refresh on the session list without hiding it in the transcript", () => {
+    expect(sidebarVue).toContain("// ─── Pull-to-refresh on the sidebar");
+    expect(sidebarVue).toContain("async function runPullRefresh()");
+    expect(messageListVue).not.toContain("onPullTouchStart");
+    expect(messageListVue).not.toContain("pullIndicatorLabel");
+    expect(messageListVue).toContain('loadEarlierError || "加载更早记录"');
   });
 });

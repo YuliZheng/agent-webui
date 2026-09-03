@@ -6,7 +6,7 @@ import type { DatabaseSync, StatementSync } from "node:sqlite";
 import type { SessionRecord } from "../types.js";
 import { searchableRecordPrefix, searchableRecordText } from "./search-text.js";
 
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 7;
 const INDEX_READ_CHUNK_BYTES = 256 * 1024;
 const INDEX_PARSE_LINE_MAX_BYTES = 2 * 1024 * 1024;
 const INDEX_TEXT_CHUNK_CHARS = 128 * 1024;

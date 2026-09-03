@@ -1,8 +1,8 @@
 const CACHE_PREFIX = "agent-webui-static-";
-// v2 drops shells that can keep a long-lived mobile PWA on an old frontend
-// after an atomic publish. The page now performs its own network build check
-// and safely reloads once transient composer state is clear.
-const CACHE_NAME = `${CACHE_PREFIX}v2`;
+// v3 invalidates the v2 shell whose update coordinator could deadlock when a
+// stale client-side running flag prevented the repaired bundle from loading.
+// The page now guards only transient local composer data before reloading.
+const CACHE_NAME = `${CACHE_PREFIX}v3`;
 const SHELL_KEY = "/";
 const NAVIGATION_NETWORK_BUDGET_MS = 750;
 const STATIC_PATHS = new Set([
@@ -76,6 +76,34 @@ self.addEventListener("activate", (event) => {
       ))
       .then(() => self.clients.claim()),
   );
+});
+
+self.addEventListener("notificationclick", (event) => {
+  const sessionId = typeof event.notification.data?.sessionId === "string"
+    ? event.notification.data.sessionId
+    : "";
+  event.notification.close();
+  if (!sessionId) return;
+
+  event.waitUntil((async () => {
+    const windows = await self.clients.matchAll({
+      type: "window",
+      includeUncontrolled: true,
+    });
+    const existing = windows.find((client) => {
+      try { return new URL(client.url).origin === self.location.origin; }
+      catch { return false; }
+    });
+    if (existing) {
+      await existing.focus();
+      existing.postMessage({ kind: "open-session", sessionId });
+      return;
+    }
+
+    const target = new URL("./", self.registration.scope);
+    target.searchParams.set("session", sessionId);
+    await self.clients.openWindow(target.href);
+  })());
 });
 
 self.addEventListener("fetch", (event) => {

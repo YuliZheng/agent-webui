@@ -37,7 +37,7 @@ function useStandaloneDisplayMode() {
 describe("PWA external links", () => {
   const base = "https://lggram.tail6c8b6c.ts.net/?session=test";
 
-  it("uses an in-context navigation for external web links in standalone mode", () => {
+  it("identifies external web links that need an explicit PWA new-tab open", () => {
     expect(standaloneExternalNavigationHref("https://x.com/openai/status/1", base, true))
       .toBe("https://x.com/openai/status/1");
   });
@@ -48,12 +48,11 @@ describe("PWA external links", () => {
     expect(standaloneExternalNavigationHref("javascript:alert(1)", base, true)).toBeNull();
   });
 
-  it("wires the fallback and touch slop into the message list", () => {
+  it("opens PWA external links in a new tab", () => {
     const messageList = readFileSync(join(process.cwd(), "src/components/MessageList.vue"), "utf8");
     expect(messageList).toContain("standaloneExternalNavigationHref(href, window.location.href)");
-    expect(messageList).toContain("window.location.assign(external)");
-    expect(messageList).toContain("const PULL_START_SLOP = 8");
-    expect(messageList).toContain("if (dy <= PULL_START_SLOP)");
+    expect(messageList).toContain('window.open(external, "_blank", "noopener,noreferrer")');
+    expect(messageList).not.toContain("window.location.assign(external)");
   });
 });
 

@@ -224,7 +224,7 @@ watch(dark, () => rehighlight(), { flush: "post" });
         <ChatImage
           :src="it.url"
           alt="Generated image"
-          @open="lightbox.open(it.url || '', 'Generated image')"
+          @open="lightbox.open(it.url || '', 'Generated image', $event)"
         />
       </div>
     </template>

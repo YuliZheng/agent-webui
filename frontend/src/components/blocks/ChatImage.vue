@@ -18,7 +18,7 @@ import { ref, computed, onMounted } from "vue";
 // W×H), mirroring the real Claude Code prompt UI, instead of a large preview
 // tile. Used for image attachments in claude-code user prompts.
 const props = defineProps<{ src: string; alt: string; compact?: boolean }>();
-const emit = defineEmits<{ (e: "open"): void }>();
+const emit = defineEmits<{ (e: "open", source: HTMLElement): void }>();
 
 const MAX_RETRIES = 3;
 const retry = ref(0);
@@ -67,6 +67,11 @@ function manualReload() {
   retry.value += 1; // bumps effectiveSrc → fresh fetch
 }
 
+function openImage(event: MouseEvent) {
+  const source = event.currentTarget;
+  if (source instanceof HTMLElement) emit("open", source);
+}
+
 // Original pixel dimensions for the compact chip's "W×H" label. Read from the
 // backend (`?meta=1` → ImageMagick identify) so we don't decode the full image
 // client-side just to label it. Silently omitted if the fetch/route fails.
@@ -94,7 +99,9 @@ onMounted(async () => {
     v-if="compact"
     type="button"
     class="cw-img-chip inline-flex items-center gap-2 max-w-[280px] rounded-md border border-[var(--cw-border)]  bg-[var(--cw-panel-2)]  hover:bg-[var(--cw-panel-2)]  pl-1 pr-2 py-1 transition cursor-zoom-in text-left"
-    @click.stop="failed ? manualReload() : emit('open')"
+    :data-lightbox-url="failed ? undefined : src"
+    :data-lightbox-alt="failed ? undefined : alt"
+    @click.stop="failed ? manualReload() : openImage($event)"
     :title="alt"
   >
     <span class="shrink-0 w-7 h-7 rounded overflow-hidden bg-[var(--cw-panel-bg)] flex items-center justify-center">
@@ -134,7 +141,9 @@ onMounted(async () => {
     v-else
     type="button"
     class="flex h-40 w-[12rem] items-center justify-center rounded overflow-hidden border border-[color:color-mix(in_srgb,var(--cw-accent)_30%,transparent)] bg-[var(--cw-panel-bg)] hover:opacity-90 active:opacity-80 transition cursor-zoom-in"
-    @click="emit('open')"
+    :data-lightbox-url="src"
+    :data-lightbox-alt="alt"
+    @click="openImage"
     :title="alt"
   >
     <img

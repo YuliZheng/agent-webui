@@ -72,14 +72,19 @@ describe("WeChat sidebar parity", () => {
     );
   });
 
-  it("keeps Tab navigation and only uses arrows for a one-line WeChat composer", () => {
+  it("keeps Tab navigation and makes WeChat arrows global outside arrow-owning controls", () => {
     expect(sidebar).toContain('e.key !== "Tab"');
     expect(sidebar).toContain("switchSession(e.shiftKey ? -1 : 1)");
     expect(sidebar).toContain('e.key === "ArrowUp" || e.key === "ArrowDown"');
     expect(sidebar).toContain('prefs.messageDisplayStyle === "wechat"');
-    expect(sidebar).toContain("isSingleVisualLine(e.target)");
+    expect(sidebar).toContain("if (isComposerTextarea(e.target))");
+    expect(sidebar).toContain("if (!isSingleVisualLine(e.target)) return");
+    expect(sidebar).toContain("shouldPreserveSessionArrowKey(e.target)");
+    expect(sidebar).toContain("hasOpenSessionNavBlockingSurface()");
     expect(sidebar).toContain('left: "-10000px"');
     expect(sidebar).toContain("textarea.clientWidth - paddingLeft - paddingRight");
     expect(sidebar).toContain("renderedHeight <= lineHeight * 1.45");
+    expect(sidebar).toContain("const navigationSessionIds = computed(buildNavigationSessionIds)");
+    expect(sidebar).toContain("primeMessageTimeline");
   });
 });

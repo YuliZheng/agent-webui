@@ -11,15 +11,39 @@ describe("codexRuntimeProgressEvent", () => {
     }))).toEqual({ type: "start", preview: "publish it" });
   });
 
-  it("surfaces an assistant commentary update", () => {
+  it("returns assistant text for durable sidebar-preview reconciliation", () => {
     expect(codexRuntimeProgressEvent(line("event_msg", {
       type: "agent_message",
       message: "Checking the live stream now.",
-    }))).toEqual({
-      type: "update",
-      label: "Latest update · Checking the live stream now.",
-      preview: "Checking the live stream now.",
-    });
+    }))).toEqual({ type: "assistant", preview: "Checking the live stream now." });
+  });
+
+  it("surfaces newer item_completed user and assistant messages", () => {
+    expect(codexRuntimeProgressEvent(line("event_msg", {
+      type: "item_completed",
+      item: { type: "UserMessage", content: [{ type: "text", text: "publish newer" }] },
+    }))).toEqual({ type: "start", preview: "publish newer" });
+    expect(codexRuntimeProgressEvent(line("event_msg", {
+      type: "item_completed",
+      item: { type: "AgentMessage", content: [{ type: "Text", text: "Checking newer stream." }] },
+    }))).toEqual({ type: "assistant", preview: "Checking newer stream." });
+  });
+
+  it("recognizes durable terminal records even when the status push was missed", () => {
+    expect(codexRuntimeProgressEvent(line("event_msg", {
+      type: "task_complete",
+      turn_id: "turn-1",
+      last_agent_message: "The completed reply may be repeated here.",
+    })))
+      .toEqual({ type: "terminal" });
+    expect(codexRuntimeProgressEvent(line("event_msg", { type: "turn_aborted" })))
+      .toEqual({ type: "terminal" });
+  });
+
+  it("recognizes durable compaction completion without ending the turn", () => {
+    expect(codexRuntimeProgressEvent(line("event_msg", {
+      type: "context_compacted",
+    }))).toEqual({ type: "compaction-complete" });
   });
 
   it("summarizes tool start and completion records", () => {

@@ -38,6 +38,8 @@ describe("shared API runtime guards", () => {
     expect(isSessionListItem({ ...valid, size: Number.NaN })).toBe(false);
     expect(isSessionListItem({ ...valid, agent: "other-agent" })).toBe(false);
     expect(isSessionListItem({ ...valid, subagent: "yes" })).toBe(false);
+    expect(isSessionListItem({ ...valid, unreadCount: 2 })).toBe(true);
+    expect(isSessionListItem({ ...valid, unreadCount: -1 })).toBe(false);
     expect(isAgentKind("claude")).toBe(true);
     expect(isAgentKind("other-agent")).toBe(false);
   });

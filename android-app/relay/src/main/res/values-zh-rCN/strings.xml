@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">Tailnet Relay</string>
+    <string name="notification_channel_name">Tailnet Relay</string>
+    <string name="notification_title">Tailnet Relay 正在运行</string>
+    <string name="keep_alive_accessibility_label">Tailnet Relay 保活监控</string>
+    <string name="keep_alive_accessibility_description">只检查本机 Tailnet Relay 健康端点，并在系统清理进程后重新打开工作资料中的同一应用。此服务不会读取屏幕内容、截图或执行手势。</string>
+</resources>

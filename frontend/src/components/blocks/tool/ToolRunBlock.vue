@@ -2,6 +2,9 @@
 import { computed, ref } from "vue";
 import type { ToolPair } from "../../../parser/group.js";
 import { toolSummary } from "../../../parser/tool-summaries.js";
+import { extractToolRunImages } from "../../../util/tool-result-images.js";
+import { useLightboxStore } from "../../../stores/lightbox.js";
+import ChatImage from "../ChatImage.vue";
 import ToolCall from "./ToolCall.vue";
 
 export interface ToolRunItem {
@@ -18,6 +21,7 @@ const emit = defineEmits<{
   (event: "update:expanded", value: boolean): void;
   (event: "update:item-expanded", value: { uuid: string; expanded: boolean }): void;
 }>();
+const lightbox = useLightboxStore();
 const localOpen = ref(false);
 const open = computed({
   get: () => props.expanded ?? localOpen.value,
@@ -43,6 +47,7 @@ const summary = computed(() => {
   if (!lastSummary.value || lastSummary.value === firstSummary.value) return firstSummary.value;
   return `${firstSummary.value} -> ${lastSummary.value}`;
 });
+const images = computed(() => extractToolRunImages(props.items.map(item => item.pair.result)));
 
 function setItemExpanded(uuid: string, expanded: boolean) {
   emit("update:item-expanded", { uuid, expanded });
@@ -70,6 +75,19 @@ function setItemExpanded(uuid: string, expanded: boolean) {
       <span class="cw-tool-run-count">{{ label }}</span>
       <span class="cw-tool-run-summary">{{ summary }}</span>
     </button>
+    <div
+      v-if="images.length"
+      class="cw-tool-run-images mt-2 grid max-w-[26rem] grid-cols-2 gap-2 px-2 pb-1"
+    >
+      <ChatImage
+        v-for="(image, index) in images"
+        :key="image.url"
+        :src="image.url"
+        :alt="`Returned image ${index + 1} of ${images.length}`"
+        class="!h-36 !w-full"
+        @open="lightbox.open(image.url, `Returned image ${index + 1} of ${images.length}`, $event)"
+      />
+    </div>
     <div v-if="open" class="cw-tool-run-items">
       <div
         v-for="item in items"
@@ -79,6 +97,7 @@ function setItemExpanded(uuid: string, expanded: boolean) {
       >
         <ToolCall
           :pair="item.pair"
+          hide-result-images
           :expanded="expandedItemIds ? expandedItemIds.has(item.uuid) : undefined"
           @update:expanded="setItemExpanded(item.uuid, $event)"
         />

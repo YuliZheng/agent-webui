@@ -89,6 +89,9 @@ export interface SessionListItem {
   // device clear badges that were already read elsewhere (offline catch-up).
   // Absent ⇒ never read on any device.
   readAt?: string | null;
+  // Server-authoritative unread assistant-turn count. Local storage is only a
+  // cold-start cache; list hydration replaces it with this global value.
+  unreadCount?: number;
 }
 
 export interface UserMessageInfo {
@@ -275,6 +278,40 @@ export interface CodexRateLimits {
   planType: string | null;
   primary: CodexRateLimitWindow | null;
   secondary: CodexRateLimitWindow | null;
+}
+
+export interface CodexThreadUsageGroup {
+  model: string | null;
+  reasoningEffort: string | null;
+  speed: string | null;
+  inputTokens: number | null;
+  cachedInputTokens: number | null;
+  netNewInputTokens: number | null;
+  outputTokens: number | null;
+  totalTokens: number | null;
+  /** Estimated ChatGPT usage credits, expressed in millionths of one credit. */
+  estimatedUsageCreditsMicros: number;
+}
+
+export interface CodexThreadUsage {
+  threadId: string;
+  /** Estimated ChatGPT usage credits, expressed in millionths of one credit. */
+  estimatedUsageCreditsMicros: number;
+  /** Estimated API-equivalent cost, expressed in millionths of one US dollar. */
+  estimatedUsageUsdMicros: number | null;
+  groups: CodexThreadUsageGroup[];
+}
+
+export interface CodexAccountUsageDailyBucket {
+  /** UTC calendar date reported by Codex, normally YYYY-MM-DD. */
+  startDate: string;
+  tokens: number;
+}
+
+export interface CodexUsageOverview {
+  threadUsage: CodexThreadUsage | null;
+  dailyUsageBuckets: CodexAccountUsageDailyBucket[];
+  accountLifetimeTokens: number | null;
 }
 
 // === background tasks (subagents / workflows / background shells) ===========

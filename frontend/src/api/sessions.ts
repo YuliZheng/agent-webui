@@ -6,27 +6,142 @@ import type {
   CodexGoal,
   CodexGoalStatus,
   CodexRateLimits,
+  CodexThreadUsage,
+  CodexUsageOverview,
   ForkResponse,
   RewindResponse,
   SessionListItem,
   UserMessageInfo,
 } from "@claude-webui/shared/api";
 import { DEFAULT_FORWARDED_SLASH_COMMANDS as DEFAULT_SLASH_COMMANDS } from "@claude-webui/shared/api";
-import { request, WsError } from "./ws.js";
+import { watch } from "vue";
+import { connected, request, WsError } from "./ws.js";
 import type { ContextUsage } from "../util/local-commands.js";
 
 // A cold Codex send can legitimately perform initialize + thread/resume +
-// turn/start serially (each has a 20s backend ceiling), with a short active-turn
-// readiness wait in between. Keep the browser deadline above that full chain;
-// otherwise the UI can report failure while the backend accepts the prompt a
-// few seconds later.
-const PROMPT_TIMEOUT_MS = 90_000;
+// turn/start serially. Resume has a 120s backend ceiling because restoring a
+// large rollout also reloads its MCP servers; keep the browser deadline above
+// that full chain so the UI cannot report failure while the backend accepts
+// the prompt a few seconds later.
+const PROMPT_TIMEOUT_MS = 200_000;
 const CODEX_GOAL_TIMEOUT_MS = 60_000;
 // Long timeout for new-session: agent spawn + first-turn setup can take a
 // while on a cold start; a truly stuck socket is caught independently by the
 // WS pong timeout (~15-24s → reconnect), so the long ceiling only ever
 // applies when the backend is genuinely still working.
 const NEW_SESSION_TIMEOUT_MS = 200_000;
+const SESSION_SYNC_TIMEOUT_MS = 10_000;
+const PENDING_READS_KEY = "cw:pending-read-watermarks:v1";
+const READ_RETRY_DELAY_MS = 5_000;
+
+let pendingReadMarks: Record<string, string> | null = null;
+let readFlushWork: Promise<void> | null = null;
+let readRetryTimer: ReturnType<typeof setTimeout> | null = null;
+
+function laterTimestamp(left: string | undefined, right: string | undefined): string | undefined {
+  if (!left) return right;
+  if (!right) return left;
+  const leftTime = Date.parse(left);
+  const rightTime = Date.parse(right);
+  if (!Number.isFinite(leftTime)) return right;
+  if (!Number.isFinite(rightTime)) return left;
+  return rightTime > leftTime ? right : left;
+}
+
+function readQueue(): Record<string, string> {
+  if (pendingReadMarks) return pendingReadMarks;
+  pendingReadMarks = {};
+  if (typeof localStorage === "undefined") return pendingReadMarks;
+  try {
+    const parsed = JSON.parse(localStorage.getItem(PENDING_READS_KEY) ?? "{}");
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      for (const [id, at] of Object.entries(parsed)) {
+        if (id && typeof at === "string" && Number.isFinite(Date.parse(at))) pendingReadMarks[id] = at;
+      }
+    }
+  } catch { /* corrupt queue — start clean */ }
+  return pendingReadMarks;
+}
+
+function persistReadQueue(): void {
+  if (typeof localStorage === "undefined") return;
+  try { localStorage.setItem(PENDING_READS_KEY, JSON.stringify(readQueue())); }
+  catch { /* storage can be unavailable */ }
+}
+
+function scheduleReadFlush(delay = 0): void {
+  if (readRetryTimer || readFlushWork) return;
+  readRetryTimer = setTimeout(() => {
+    readRetryTimer = null;
+    void flushPendingReadMarks();
+  }, delay);
+}
+
+export function flushPendingReadMarks(): Promise<void> {
+  if (readFlushWork) return readFlushWork;
+  let retry = false;
+  const work = (async () => {
+    for (const [sessionId, at] of Object.entries({ ...readQueue() })) {
+      try {
+        // mark-read is monotonic and therefore safe to resend after a socket
+        // replacement. The durable local queue also survives a PWA kill/reload.
+        await request("mark-read", { sessionId, at }, { retryOnReconnect: true });
+        const queued = readQueue()[sessionId];
+        if (queued && laterTimestamp(at, queued) === at) delete readQueue()[sessionId];
+      } catch {
+        retry = true;
+      }
+    }
+    persistReadQueue();
+  })();
+  readFlushWork = work.finally(() => {
+    readFlushWork = null;
+    if (connected.value && Object.keys(readQueue()).length) {
+      scheduleReadFlush(retry ? READ_RETRY_DELAY_MS : 0);
+    }
+  });
+  return readFlushWork;
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener("online", () => {
+    if (connected.value) scheduleReadFlush();
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && connected.value) scheduleReadFlush();
+  });
+  watch(connected, online => {
+    if (online && Object.keys(readQueue()).length) scheduleReadFlush();
+  });
+  if (connected.value && Object.keys(readQueue()).length) scheduleReadFlush();
+}
+
+async function withSessionSyncDeadline<T>(
+  timeoutMessage: string,
+  work: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const controller = new AbortController();
+  const timeoutError = new Error(timeoutMessage);
+  let timeout!: ReturnType<typeof setTimeout>;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timeout = setTimeout(() => {
+      controller.abort();
+      reject(timeoutError);
+    }, SESSION_SYNC_TIMEOUT_MS);
+  });
+  try {
+    // Keep the deadline alive through response-body consumption. fetch()
+    // resolves as soon as headers arrive; a mobile relay can still stall while
+    // response.json() reads the body, which previously left syncInFlight stuck
+    // forever because the timeout had already been cleared.
+    return await Promise.race([work(controller.signal), deadline]);
+  } catch (error) {
+    if (controller.signal.aborted) throw timeoutError;
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
 export interface OutgoingImage { mime: string; data: string /* base64 */ }
 
@@ -36,19 +151,25 @@ export async function listSessions(): Promise<SessionListItem[]> {
   // the homepage frozen until a full reload. The REST route uses the same
   // backend action as `get-sessions` but rides a fresh HTTP request, so
   // resume/focus retries can refresh the sidebar immediately.
-  const res = await fetch("/api/sessions", {
-    credentials: "include",
-    cache: "no-store",
-  });
-  if (!res.ok) {
-    let message = `list sessions failed: ${res.status}`;
-    try {
-      const body = await res.json() as { message?: unknown };
-      if (typeof body.message === "string" && body.message) message = body.message;
-    } catch { /* ignore */ }
-    throw new Error(message);
-  }
-  return res.json() as Promise<SessionListItem[]>;
+  return withSessionSyncDeadline(
+    "连接超时：没有获取到会话，请检查 Tailnet Relay 和 Tailscale",
+    async (signal) => {
+      const res = await fetch("/api/sessions", {
+        credentials: "include",
+        cache: "no-store",
+        signal,
+      });
+      if (!res.ok) {
+        let message = `list sessions failed: ${res.status}`;
+        try {
+          const body = await res.json() as { message?: unknown };
+          if (typeof body.message === "string" && body.message) message = body.message;
+        } catch { /* ignore */ }
+        throw new Error(message);
+      }
+      return await res.json() as SessionListItem[];
+    },
+  );
 }
 
 function slashCommandName(prompt: string): string {
@@ -187,13 +308,14 @@ export async function stopSession(id: string): Promise<void> {
   await request("stop", { sessionId: id });
 }
 
-// Fire-and-forget cross-device read watermark. `at` is the session's
-// lastTurnAt at read time. We don't await success: a failed RPC just means the
-// watermark lags on the server, which the next list-load reconciles. The
-// backend broadcasts `session-read` to every other connected device.
+// Persist the cross-device read watermark before sending it. Mobile browsers
+// can suspend or kill a PWA between the local clear and the RPC; the queue is
+// retried after reconnect, resume, and a full reload until the server confirms.
 export function markReadRemote(id: string, at: string): void {
-  if (!id || !at) return;
-  void request("mark-read", { sessionId: id, at }).catch(() => { /* best-effort */ });
+  if (!id || !Number.isFinite(Date.parse(at))) return;
+  readQueue()[id] = laterTimestamp(readQueue()[id], at) ?? at;
+  persistReadQueue();
+  if (connected.value) scheduleReadFlush();
 }
 
 export async function compactSession(id: string): Promise<void> {
@@ -273,6 +395,22 @@ export async function getCliInfo(id: string, topic: CliInfoTopic): Promise<CliIn
 
 export async function getCodexRateLimits(id: string): Promise<CodexRateLimits> {
   return request<CodexRateLimits>("get-codex-rate-limits", { sessionId: id }, { timeoutMs: 30_000 });
+}
+
+export async function getCodexThreadUsage(id: string): Promise<CodexThreadUsage | null> {
+  return request<CodexThreadUsage | null>(
+    "get-codex-thread-usage",
+    { sessionId: id },
+    { timeoutMs: 30_000 },
+  );
+}
+
+export async function getCodexUsageOverview(id: string): Promise<CodexUsageOverview> {
+  return request<CodexUsageOverview>(
+    "get-codex-usage-overview",
+    { sessionId: id },
+    { timeoutMs: 30_000 },
+  );
 }
 
 export interface DeleteSessionsResult {
@@ -374,7 +512,10 @@ export interface FullContextUsageResponse extends ContextUsage {
   compactionCount: number;
 }
 
-const SESSION_TAIL_TIMEOUT_MS = 8_000;
+// Interactive cold indexing can take several seconds on large Windows
+// rollouts, especially while Defender is inspecting the same archive. Keep a
+// finite retryable deadline, but do not abort a healthy first open at 8s.
+const SESSION_TAIL_TIMEOUT_MS = 20_000;
 
 // Fast initial-load: returns just the last `n` lines of a session jsonl.
 // Used on first visit to avoid streaming every line of long conversations
@@ -445,9 +586,18 @@ export async function readFullCodexContextUsage(
 // fires this so the foreign-claude-scanner and responding-tracker re-walk
 // state from disk, catching anything chokidar dropped.
 export async function refreshBackend(): Promise<{ sessions: SessionListItem[] }> {
-  const r = await fetch("/api/refresh", { method: "POST", credentials: "include" });
-  if (!r.ok) throw new Error(`refresh failed: ${r.status}`);
-  return r.json() as Promise<{ sessions: SessionListItem[] }>;
+  return withSessionSyncDeadline(
+    "刷新超时：请检查 Tailnet Relay、Tailscale 和电脑端服务",
+    async (signal) => {
+      const response = await fetch("/api/refresh", {
+        method: "POST",
+        credentials: "include",
+        signal,
+      });
+      if (!response.ok) throw new Error(`refresh failed: ${response.status}`);
+      return await response.json() as { sessions: SessionListItem[] };
+    },
+  );
 }
 
 export { WsError as HttpError };

@@ -19,13 +19,16 @@ function response(payload: Record<string, unknown>): string {
   return JSON.stringify({ type: "response_item", payload });
 }
 
-function usage(total: number): string {
+function usage(total: number, cumulative?: number): string {
   return JSON.stringify({
     type: "event_msg",
     payload: {
       type: "token_count",
       info: {
         last_token_usage: { input_tokens: total, output_tokens: 0, total_tokens: total },
+        ...(cumulative === undefined
+          ? {}
+          : { total_token_usage: { input_tokens: cumulative, output_tokens: 0, total_tokens: cumulative } }),
         model_context_window: 258_400,
       },
     },
@@ -48,19 +51,29 @@ describe("full Codex context usage scan", () => {
         role: "user",
         content: [{ type: "input_text", text: `request ${index} ${"x".repeat(40)}` }],
       })),
-      usage(100_000),
+      usage(100_000, 2_750_000),
     ];
-    const result = await fullCodexContextUsage(await rollout(lines));
+    const path = await rollout(lines);
+    const result = await fullCodexContextUsage(path);
 
     expect(result.completeHistoryScan).toBe(true);
     expect(result.recordsScanned).toBe(lines.length);
     expect(result.compactionCount).toBe(1);
     expect(result.tokens).toBe(100_000);
+    expect(result.cumulativeTokens).toBe(2_750_000);
     expect(result.contributors?.some((item) => item.source === "assistant")).toBe(false);
     expect(result.contributors?.find((item) => item.source === "user")?.tokens).toBeGreaterThan(25_000);
     expect(result.contributors?.reduce((sum, item) => sum + item.tokens, 0)).toBe(100_000);
     expect(result.contributors?.reduce((sum, item) => sum + item.percent, 0)).toBe(100);
+    expect(result.cumulativeContributors?.some((item) => item.source === "assistant")).toBe(false);
+    expect(result.cumulativeContributors?.find((item) => item.source === "user")?.tokens).toBeGreaterThan(0);
+    expect(result.cumulativeContributors?.reduce((sum, item) => sum + item.tokens, 0)).toBe(2_750_000);
+    expect(result.cumulativeContributors?.reduce((sum, item) => sum + item.percent, 0)).toBe(100);
     expect(result).not.toHaveProperty("lines");
+
+    // An unchanged file snapshot reuses the tiny aggregate object instead of
+    // scanning the rollout again.
+    await expect(fullCodexContextUsage(path)).resolves.toBe(result);
   });
 
   it("bounds an oversized tool result while preserving its source", async () => {
@@ -76,7 +89,7 @@ describe("full Codex context usage scan", () => {
         call_id: "shell-1",
         output: "x".repeat(MAX_JSONL_RECORD_BYTES + 1_024),
       }),
-      usage(8_000),
+      usage(8_000, 80_000),
     ];
     const result = await fullCodexContextUsage(await rollout(lines));
 
@@ -84,6 +97,8 @@ describe("full Codex context usage scan", () => {
     expect(result.oversizedRecords).toBe(1);
     expect(result.contributors?.find((item) => item.source === "shell")?.tokens).toBeGreaterThanOrEqual(2_000);
     expect(result.contributors?.reduce((sum, item) => sum + item.tokens, 0)).toBe(8_000);
+    expect(result.cumulativeContributors?.find((item) => item.source === "shell")?.tokens).toBeGreaterThan(0);
+    expect(result.cumulativeContributors?.reduce((sum, item) => sum + item.tokens, 0)).toBe(80_000);
   });
 
   it("carries the calibrated hidden base context across compaction", async () => {

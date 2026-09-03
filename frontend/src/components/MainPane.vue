@@ -16,13 +16,19 @@ import BackgroundTasksPill from "./BackgroundTasksPill.vue";
 import TodoChecklistPill from "./TodoChecklistPill.vue";
 import MobileGoalPopover from "./MobileGoalPopover.vue";
 import SessionStatusPage from "./SessionStatusPage.vue";
+import ContextPressureNotice from "./ContextPressureNotice.vue";
+import SessionTitleText from "./SessionTitleText.vue";
 import { usePreviewModalStore } from "../stores/preview-modal.js";
 import { useLocalFileViewerStore } from "../stores/local-file-viewer.js";
 import { displayCwd } from "../util/cwd-display.js";
 import { copyText } from "../util/clipboard.js";
-import { getSessionGoal, killSession } from "../api/sessions.js";
+import { compactSession, getSessionGoal, killSession } from "../api/sessions.js";
 import { nowMs } from "../util/now-tick.js";
 import { isReadOnlySubagentSession } from "../util/session-access.js";
+import { useSessionCacheStore } from "../stores/session-cache.js";
+import { useSessionSettingsStore } from "../stores/session-settings.js";
+import { hasPendingTurnStart, usePromptPendingStore } from "../stores/prompt-pending.js";
+import { latestContextUsage } from "../util/local-commands.js";
 
 const ui = useUiStore();
 const prefs = usePrefsStore();
@@ -31,6 +37,9 @@ const live = useLiveStore();
 const notifications = useNotificationsStore();
 const preview = usePreviewModalStore();
 const localFileViewer = useLocalFileViewerStore();
+const sessionCache = useSessionCacheStore();
+const sessionSettings = useSessionSettingsStore();
+const promptPending = usePromptPendingStore();
 
 const sessionId = computed(() => ui.selectedSessionId);
 const item = computed(() => (sessionId.value ? sessions.byId[sessionId.value] : null));
@@ -44,6 +53,11 @@ const webuiAlive = computed(() => !!(
   && sessions.webuiAliveBySession[sessionId.value]
 ));
 const isWorking = computed(() => status.value === "running");
+const optimisticallyStarting = computed(() => {
+  const id = sessionId.value;
+  return !!id && hasPendingTurnStart(promptPending.pending(id));
+});
+const showsWorkingState = computed(() => isWorking.value || optimisticallyStarting.value);
 const capacityRetry = computed(() => (
   sessionId.value ? sessions.capacityRetryBySession[sessionId.value] ?? null : null
 ));
@@ -56,11 +70,62 @@ const capacityRetryWaitSeconds = computed(() => {
 // CLI mid-/compact — wire-only signal, the jsonl is silent for the whole
 // window. Swaps the green pill's label so the user knows why nothing streams.
 const isCompacting = computed(() => !!(sessionId.value && sessions.compactingBySession[sessionId.value]));
+const compactRequesting = ref(false);
+const COMPACT_REQUEST_FALLBACK_MS = 20_000;
+let compactRequestTimer: ReturnType<typeof setTimeout> | undefined;
+let compactRequestSeq = 0;
+
+function clearCompactRequesting() {
+  compactRequestSeq++;
+  compactRequesting.value = false;
+  if (compactRequestTimer) clearTimeout(compactRequestTimer);
+  compactRequestTimer = undefined;
+}
+
+async function compactContextNow() {
+  const id = sessionId.value;
+  if (!id || showsWorkingState.value || compactRequesting.value || isCompacting.value || sessions.isPending(id)) return;
+
+  compactRequesting.value = true;
+  const seq = ++compactRequestSeq;
+  try {
+    await compactSession(id);
+    if (seq !== compactRequestSeq || sessionId.value !== id) return;
+    compactRequestTimer = setTimeout(() => {
+      if (seq === compactRequestSeq) clearCompactRequesting();
+    }, COMPACT_REQUEST_FALLBACK_MS);
+  } catch (err) {
+    if (seq === compactRequestSeq) clearCompactRequesting();
+    notifications.pushError(err instanceof Error ? err.message : String(err), { title: "整理失败" });
+  }
+}
+
+watch(isCompacting, (compacting) => {
+  if (compacting) clearCompactRequesting();
+});
+watch(sessionId, clearCompactRequesting);
+onBeforeUnmount(clearCompactRequesting);
+const contextUsage = computed(() => {
+  const id = sessionId.value;
+  if (!id) return { tokens: 0, limit: null };
+  const isCodex = item.value?.agent === "codex";
+  const model = isCodex
+    ? sessionSettings.effectiveCodex(id).model
+    : sessionSettings.effective(id).model;
+  return latestContextUsage(
+    sessionCache.bySession[id]?.lines ?? [],
+    isCodex,
+    model,
+    prefs.autoCompactWindow,
+    prefs.codexAutoCompactWindow,
+  );
+});
 const cwdDisplay = computed(() => displayCwd(item.value?.cwd, ui.home));
 const title = computed(() => item.value?.title ?? null);
+const titleEmoji = computed(() => item.value?.titleEmoji ?? null);
 const displayTitle = computed(() => [
   title.value ?? "",
-  item.value?.titleEmoji ?? "",
+  titleEmoji.value ?? "",
 ].filter(Boolean).join(" "));
 const agent = computed(() => item.value?.agent ?? "claude");
 const shortId = computed(() => sessionId.value ? sessionId.value.slice(0, 8) : "");
@@ -78,9 +143,16 @@ const mobileHeaderTitle = computed(() => {
       : "";
     return `模型繁忙，正在重试 ${capacityRetry.value.attempt}/${capacityRetry.value.maxAttempts}${wait}…`;
   }
-  if (isWorking.value) return `${agent.value === "codex" ? "Codex" : "Claude"} 正在思考…`;
+  if (showsWorkingState.value) return `${agent.value === "codex" ? "Codex" : "Claude"} 正在思考…`;
   return displayTitle.value || `${shortId.value}…`;
 });
+const mobileHeaderShowsSessionTitle = computed(() => !!(
+  title.value
+  && !isDraft.value
+  && !isCompacting.value
+  && !capacityRetry.value
+  && !showsWorkingState.value
+));
 const goal = computed(() => sessionId.value ? sessions.goalBySession[sessionId.value] ?? null : null);
 const goalTitle = computed(() => goal.value
   ? `${goal.value.status}: ${goal.value.objective}\n${goal.value.tokensUsed} tokens used`
@@ -271,10 +343,23 @@ function openSubagentParent() {
             class="truncate text-[17px] font-semibold leading-tight md:text-base"
             :title="displayTitle || `Session ${sessionId}`"
           >
-            <span class="md:hidden" :class="{ 'opacity-70 italic': isDraft }">{{ mobileHeaderTitle }}</span>
+            <span class="md:hidden" :class="{ 'opacity-70 italic': isDraft }">
+              <SessionTitleText
+                v-if="mobileHeaderShowsSessionTitle && title"
+                :title="title"
+                :emoji="titleEmoji"
+                :source="item?.titleSource"
+              />
+              <template v-else>{{ mobileHeaderTitle }}</template>
+            </span>
             <span class="hidden md:inline">
               <template v-if="isDraft"><span class="opacity-70 italic">New session in {{ cwdDisplay }}</span></template>
-              <template v-else-if="title">{{ displayTitle }}</template>
+              <SessionTitleText
+                v-else-if="title"
+                :title="title"
+                :emoji="titleEmoji"
+                :source="item?.titleSource"
+              />
               <template v-else><span class="font-mono">{{ shortId }}…</span></template>
             </span>
           </div>
@@ -348,7 +433,7 @@ function openSubagentParent() {
              <template v-if="capacityRetryWaitSeconds > 0"> · {{ capacityRetryWaitSeconds }}s</template>
            </span>
            <span
-            v-else-if="isWorking || isCompacting"
+            v-else-if="showsWorkingState || isCompacting"
             class="flex items-center gap-1.5 text-xs px-2 py-0.5 rounded bg-[color-mix(in_srgb,var(--cw-success)_16%,transparent)] text-[var(--cw-success)]"
           >
             <span class="relative flex h-2 w-2">
@@ -427,7 +512,12 @@ function openSubagentParent() {
             >{{ preview.summary }}</span>
           </div>
           <div class="text-[11px] opacity-60 leading-tight truncate">
-            <template v-if="title">{{ displayTitle }}</template>
+            <SessionTitleText
+              v-if="title"
+              :title="title"
+              :emoji="titleEmoji"
+              :source="item?.titleSource"
+            />
             <template v-else-if="isDraft"><span class="italic">New session in {{ cwdDisplay }}</span></template>
             <template v-else><span class="font-mono">{{ shortId }}…</span></template>
             <span class="opacity-60"> · </span>
@@ -476,6 +566,17 @@ function openSubagentParent() {
       <!-- Client-side system bubble for webui-local slash commands (/help,
            /mcp, /status, …). Never written to the jsonl. -->
       <LocalInfoBubble :session-id="sessionId" />
+      <ContextPressureNotice
+        v-if="!isReadOnlySubagent"
+        :session-id="sessionId"
+        :tokens="contextUsage.tokens"
+        :limit="contextUsage.limit"
+        :working="showsWorkingState"
+        :compacting="isCompacting"
+        :compact-requesting="compactRequesting"
+        @compact-now="compactContextNow"
+        @open-status="statusSheetOpen = true"
+      />
       <div
         v-if="isReadOnlySubagent"
         class="cw-subagent-readonly shrink-0 border-t border-[var(--cw-border)] bg-[var(--cw-panel-bg)] px-3 py-2.5 md:px-4"
@@ -541,7 +642,12 @@ function openSubagentParent() {
           >
             <div class="min-w-0 flex-1">
               <div class="text-sm font-medium truncate">
-                <template v-if="s.title">{{ [s.title, s.titleEmoji].filter(Boolean).join(" ") }}</template>
+                <SessionTitleText
+                  v-if="s.title"
+                  :title="s.title"
+                  :emoji="s.titleEmoji"
+                  :source="s.titleSource"
+                />
                 <template v-else><span class="font-mono opacity-70">{{ s.id.slice(0, 8) }}…</span></template>
               </div>
               <div class="text-[11px] opacity-60 truncate">{{ displayCwd(s.cwd, ui.home) }}</div>

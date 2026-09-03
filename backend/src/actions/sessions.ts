@@ -8,6 +8,13 @@ import { asRecord, asString, assertSessionId, RpcError, type UserMessageInfo } f
 import type { ContentIndexCandidate, ContentSearchIndex } from "../services/content-search-index.js";
 import { scanClaudeFile, type SessionIndex } from "../services/session-index.js";
 import { searchableRecordPrefix, searchableRecordText } from "../services/search-text.js";
+import {
+  codexVisibleMessage,
+  codexVisibleMessagePriority,
+  isCodexInjectedContextText,
+  sameCodexVisibleMessage,
+  type CodexVisibleMessage,
+} from "@agent-webui/shared/codex";
 import type { ClaudeDriver } from "../services/claude-driver.js";
 import type { CodexDriver, CodexThreadTurn } from "../services/codex-driver.js";
 import type { AppState, TitleEntry } from "../services/state.js";
@@ -1008,8 +1015,8 @@ function uuidFromPrefix(prefix: string): string | null {
 function stableSearchUuid(uuid: string | null, prefix: string, lineIndex: number): string | null {
   if (uuid) return uuid;
   if (!/"type"\s*:\s*"event_msg"/u.test(prefix)) return null;
-  if (/"type"\s*:\s*"user_message"/u.test(prefix)) return `codex-line-${lineIndex}`;
-  if (/"type"\s*:\s*"agent_message"/u.test(prefix)) return `a-${lineIndex}`;
+  if (/"type"\s*:\s*"(?:user_message|UserMessage)"/u.test(prefix)) return `codex-line-${lineIndex}`;
+  if (/"type"\s*:\s*"(?:agent_message|AgentMessage|AssistantMessage)"/u.test(prefix)) return `a-${lineIndex}`;
   return null;
 }
 
@@ -1299,6 +1306,10 @@ export async function markdownExport(index: SessionIndex, sessionId: string, res
   const rows = [`# ${title}`, "", `- Agent: ${session.agent}`, `- Working directory: ${session.cwd}`, `- Session: ${session.id}`, ""];
   let outputBytes = rows.reduce((total, row) => total + Buffer.byteLength(row) + 1, 0);
   let sectionCount = 0;
+  const codexMessages: Array<{
+    message: CodexVisibleMessage;
+    lastSourceIndex: number;
+  }> = [];
   const appendSection = (role: "User" | "Assistant", text: string): void => {
     assertOutputItemLimit(++sectionCount, "Markdown export");
     const section = [`## ${role}`, "", text, ""];
@@ -1320,14 +1331,34 @@ export async function markdownExport(index: SessionIndex, sessionId: string, res
         const text = contentText(asRecord(record.message)?.content ?? record.content).trim();
         if (text) appendSection(record.type === "user" ? "User" : "Assistant", text);
       } else if (session.agent === "codex") {
-        const payload = asRecord(record.payload); const type = asString(payload?.type) ?? asString(payload?.kind);
-        const role = asString(payload?.role) ?? (type === "user_message" ? "user" : type?.includes("agent") ? "assistant" : undefined);
-        const text = contentText(payload?.content) || asString(payload?.message) || asString(payload?.text);
-        if (role && text) appendSection(role === "user" ? "User" : "Assistant", text);
+        const message = codexVisibleMessage(record);
+        if (!message || (message.role === "user" && isCodexInjectedContextText(message.text))) continue;
+        const previous = codexMessages.at(-1);
+        const isCompanion = previous
+          && line.index - previous.lastSourceIndex <= 4
+          && previous.message.transport !== message.transport
+          && sameCodexVisibleMessage(previous.message, message);
+        if (isCompanion) {
+          previous.lastSourceIndex = line.index;
+          if (codexVisibleMessagePriority(message) > codexVisibleMessagePriority(previous.message)) {
+            previous.message = message;
+          }
+          continue;
+        }
+        assertOutputItemLimit(codexMessages.length + 1, "Markdown export");
+        codexMessages.push({
+          message,
+          lastSourceIndex: line.index,
+        });
       }
     } catch (error) {
       if (error instanceof RpcError) throw error;
       /* isolate malformed record */
+    }
+  }
+  if (session.agent === "codex") {
+    for (const { message } of codexMessages) {
+      appendSection(message.role === "user" ? "User" : "Assistant", message.text.trim());
     }
   }
   return rows.join("\n");

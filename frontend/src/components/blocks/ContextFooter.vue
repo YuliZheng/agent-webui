@@ -1,7 +1,12 @@
 <script setup lang="ts">
 // Context readout used in the session-details page. The source chart stays
 // expanded so context information has one stable home outside the transcript.
-import { computed, ref } from "vue";
+import { computed, ref, watch } from "vue";
+import type {
+  CodexAccountUsageDailyBucket,
+  CodexRateLimitWindow,
+  CodexThreadUsage,
+} from "@claude-webui/shared/api";
 import { effectiveContextLimit } from "@claude-webui/shared/prefs";
 import { useSessionsStore } from "../../stores/sessions.js";
 import { useSessionSettingsStore } from "../../stores/session-settings.js";
@@ -12,6 +17,7 @@ import { useUiStore } from "../../stores/ui.js";
 import { compactSession, newSession } from "../../api/sessions.js";
 import { promotePendingDraft } from "../../stores/live.js";
 import type { ContextContributor } from "../../util/local-commands.js";
+import { estimateConversationWeeklyUsage } from "../../util/codex-weekly-usage.js";
 
 // ctxLimit: explicit effective context limit. Passed for Codex (computed from
 // the rollout window capped by the codex auto-compact setting). Omitted for
@@ -21,6 +27,13 @@ const props = defineProps<{
   ctxTokens: number;
   isLatest?: boolean;
   ctxLimit?: number | null;
+  cumulativeTokens?: number | null;
+  ctxCumulativeContributors?: readonly ContextContributor[] | undefined;
+  weeklyUsagePercent?: number | null;
+  weeklyUsageWindow?: CodexRateLimitWindow | null;
+  dailyUsageBuckets?: readonly CodexAccountUsageDailyBucket[];
+  planType?: string | null;
+  threadUsage?: CodexThreadUsage | null;
   ctxReportedTokens?: number | undefined;
   ctxEstimatedTokens?: number | undefined;
   ctxContributors?: readonly ContextContributor[] | undefined;
@@ -41,6 +54,9 @@ const ui = useUiStore();
 const ACTION_PCT = 0.7;
 
 const isCodex = computed(() => sessions.byId[props.sessionId]?.agent === "codex");
+type UsageScope = "all" | "current";
+const usageScope = ref<UsageScope>("all");
+watch(() => props.sessionId, () => { usageScope.value = "all"; });
 const model = computed(() =>
   isCodex.value
     ? (sessionSettings.bySession[props.sessionId]?.model ?? "")
@@ -68,7 +84,7 @@ const contextTitle = computed(() => {
   ].join(" · ");
 });
 const contributorText = computed(() =>
-  props.ctxContributors?.map((item) => `${item.label} ${item.percent}%`).join(" · ") ?? "",
+  props.ctxContributors?.map((item) => `${sourceLabel(item.source)} ${item.percent}%`).join(" · ") ?? "",
 );
 const contributorTitle = computed(() =>
   contributorText.value
@@ -81,7 +97,53 @@ const contributors = computed(() =>
 const contributorTotal = computed(() =>
   contributors.value.reduce((sum, item) => sum + item.tokens, 0),
 );
+const cumulativeContributors = computed(() =>
+  (props.ctxCumulativeContributors ?? []).filter((item) => Number.isFinite(item.tokens) && item.tokens > 0),
+);
+const cumulativeContributorTotal = computed(() =>
+  cumulativeContributors.value.reduce((sum, item) => sum + item.tokens, 0),
+);
+const cumulativeContributorText = computed(() => cumulativeContributors.value
+  .map((item) => `${sourceLabel(item.source)} ${item.percent}%`)
+  .join(" · "));
+const allTimeTokens = computed(() => {
+  const reported = props.cumulativeTokens;
+  const reportedTokens = typeof reported === "number" && Number.isFinite(reported) && reported > 0
+    ? reported
+    : 0;
+  return Math.max(reportedTokens, cumulativeContributorTotal.value);
+});
+const hasAllUsage = computed(() => isCodex.value && allTimeTokens.value > 0);
+const showAll = computed(() => hasAllUsage.value && usageScope.value === "all");
+const weeklyUsageLabel = computed(() => {
+  const value = props.weeklyUsagePercent;
+  return typeof value === "number" && Number.isFinite(value)
+    ? `${Math.round(value * 10) / 10}% 已用`
+    : "暂不可用";
+});
+const planLabel = computed(() => formatPlanType(props.planType));
+const weeklyEquivalent = computed(() => estimateConversationWeeklyUsage({
+  cumulativeTokens: allTimeTokens.value,
+  weeklyUsagePercent: props.weeklyUsagePercent,
+  weeklyWindow: props.weeklyUsageWindow,
+  dailyUsageBuckets: props.dailyUsageBuckets ?? [],
+}));
+const weeklyEquivalentLabel = computed(() => weeklyEquivalent.value
+  ? `≈ ${formatPercent(weeklyEquivalent.value.conversationPercent)} 一周额度`
+  : "暂无足够数据");
 const usageGradient = computed(() => {
+  if (showAll.value) {
+    if (cumulativeContributorTotal.value > 0) {
+      let cursor = 0;
+      const stops = cumulativeContributors.value.map((item) => {
+        const start = cursor;
+        cursor += (item.tokens / cumulativeContributorTotal.value) * 100;
+        return `${sourceColor(item.source)} ${start.toFixed(2)}% ${cursor.toFixed(2)}%`;
+      });
+      return `conic-gradient(from -90deg, ${stops.join(", ")})`;
+    }
+    return "conic-gradient(from -90deg, var(--cw-context-track) 0% 100%)";
+  }
   if (contributorTotal.value > 0) {
     let cursor = 0;
     const stops = contributors.value.map((item) => {
@@ -104,7 +166,12 @@ const remainingTokens = computed(() => Math.max(0, (limit.value ?? 0) - props.ct
 const running = computed(() => sessions.statusBySession[props.sessionId] === "running");
 
 const showActions = computed(
-  () => !!props.isLatest && !running.value && limit.value !== null && pct.value !== null && pct.value >= ACTION_PCT * 100,
+  () => !showAll.value
+    && !!props.isLatest
+    && !running.value
+    && limit.value !== null
+    && pct.value !== null
+    && pct.value >= ACTION_PCT * 100,
 );
 
 function fmt(n: number): string {
@@ -115,6 +182,61 @@ function fmt(n: number): string {
 
 function sourceColor(source: ContextContributor["source"]): string {
   return `var(--cw-context-${source})`;
+}
+
+function sourceLabel(source: ContextContributor["source"]): string {
+  const labels: Record<ContextContributor["source"], string> = {
+    user: "用户消息",
+    assistant: "助手回复",
+    agents: "AGENTS.md",
+    skills: "Skills",
+    instructions: "系统上下文",
+    base: "基础上下文",
+    compaction: "压缩摘要",
+    images: "图片",
+    shell: "Shell",
+    browser: "浏览器",
+    patches: "补丁",
+    tools: "其他工具",
+    reasoning: "推理",
+    messages: "其他消息",
+    other: "未归因部分",
+  };
+  return labels[source];
+}
+
+function formatPlanType(planType: string | null | undefined): string {
+  if (!planType) return "未报告";
+  const known: Record<string, string> = {
+    free: "Free",
+    go: "Go",
+    plus: "Plus",
+    pro: "Pro 20x（用户确认）",
+    prolite: "Pro Lite",
+    team: "Team",
+    business: "Business",
+    enterprise: "Enterprise",
+    edu: "Edu",
+    edu_plus: "Edu Plus",
+    edu_pro: "Edu Pro",
+  };
+  return known[planType] ?? planType
+    .split("_")
+    .filter(Boolean)
+    .map(part => part[0]?.toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function formatPercent(value: number): string {
+  if (value > 0 && value < 0.01) return "<0.01%";
+  const digits = value < 10 ? 2 : value < 100 ? 1 : 0;
+  return `${value.toLocaleString(undefined, { maximumFractionDigits: digits })}%`;
+}
+
+function formatCredits(micros: number): string {
+  const credits = micros / 1_000_000;
+  if (credits > 0 && credits < 0.01) return "<0.01";
+  return credits.toLocaleString(undefined, { maximumFractionDigits: 2 });
 }
 
 const compactStarting = ref(false);
@@ -216,20 +338,55 @@ async function startContinuationSession() {
 
 <template>
   <div
-    v-if="ctxTokens"
+    v-if="ctxTokens || allTimeTokens"
     class="cw-context-footer px-4 py-1 text-xs flex flex-wrap items-center gap-x-2 gap-y-1"
   >
-    <span :class="over ? 'cw-context-over' : 'opacity-50'" :title="contextTitle">
-      context {{ ctxEstimatedTokens ? "~" : "" }}{{ fmt(ctxTokens) }}<template v-if="limit"> · {{ isCodex ? "compact at" : "total" }} {{ fmt(limit) }}</template>
-    </span>
-    <span
-      v-if="limit"
-      class="cw-context-usage-label"
-      :class="{ 'cw-context-over': over }"
-      :title="contributorTitle ?? contextTitle"
-    >
-      usage {{ usageText }}
-    </span>
+    <div v-if="hasAllUsage" class="cw-context-scope-bar">
+      <div class="cw-context-scope-switch" role="group" aria-label="Token 用量范围">
+        <button
+          type="button"
+          :class="{ 'is-active': usageScope === 'all' }"
+          :aria-pressed="usageScope === 'all'"
+          @click="usageScope = 'all'"
+        >全部</button>
+        <button
+          type="button"
+          :class="{ 'is-active': usageScope === 'current' }"
+          :aria-pressed="usageScope === 'current'"
+          @click="usageScope = 'current'"
+        >当前</button>
+      </div>
+      <span
+        class="cw-context-scope-summary"
+        :class="{ 'cw-context-over': !showAll && over }"
+        :title="showAll ? `${allTimeTokens.toLocaleString()} tokens` : (contributorTitle ?? contextTitle)"
+        aria-live="polite"
+      >
+        <template v-if="showAll">
+          会话累计 <strong>{{ fmt(allTimeTokens) }}</strong> tokens
+          <span v-if="weeklyEquivalent" class="cw-context-scope-equivalent">
+            · {{ weeklyEquivalentLabel }}
+          </span>
+        </template>
+        <template v-else>
+          当前上下文 <strong>{{ ctxEstimatedTokens ? "~" : "" }}{{ fmt(ctxTokens) }}</strong>
+          <template v-if="limit"> / {{ fmt(limit) }} · {{ usageText }} 已用 · 剩余 {{ fmt(remainingTokens) }}</template>
+        </template>
+      </span>
+    </div>
+    <template v-else>
+      <span :class="over ? 'cw-context-over' : 'opacity-50'" :title="contextTitle">
+        current context {{ ctxEstimatedTokens ? "~" : "" }}{{ fmt(ctxTokens) }}<template v-if="limit"> · {{ isCodex ? "compact at" : "total" }} {{ fmt(limit) }}</template>
+      </span>
+      <span
+        v-if="limit"
+        class="cw-context-usage-label"
+        :class="{ 'cw-context-over': over }"
+        :title="contributorTitle ?? contextTitle"
+      >
+        {{ usageText }} used
+      </span>
+    </template>
     <span v-if="showActions" class="cw-context-actions">
       <button
         type="button"
@@ -248,78 +405,144 @@ async function startContinuationSession() {
       {{ compactError || continuationError }}
     </span>
     <div
-      v-if="limit"
+      v-if="showAll || limit"
       class="cw-context-usage-detail"
       role="region"
-      aria-label="Context usage details"
+      :aria-label="showAll ? '会话全部 Token 用量' : '当前上下文 Token 用量'"
     >
       <div
         class="cw-context-usage-chart"
         :style="{ background: usageGradient }"
         role="img"
-        :aria-label="contributors.length ? `Estimated context source mix: ${contributorText}` : `Context usage ${usageText}`"
+        :aria-label="showAll
+          ? (cumulativeContributors.length
+            ? `会话累计 ${fmt(allTimeTokens)} tokens，来源分布：${cumulativeContributorText}`
+            : `会话累计 ${fmt(allTimeTokens)} tokens，来源统计中`)
+          : (contributors.length
+            ? `Estimated current context source mix: ${contributorText}`
+            : `Current context usage ${usageText}`)"
       >
         <div class="cw-context-usage-chart-center">
-          <strong>{{ usageText }}</strong>
-          <span>used</span>
+          <strong>{{ showAll ? fmt(allTimeTokens) : usageText }}</strong>
+          <span>{{ showAll ? "累计" : "已用" }}</span>
         </div>
       </div>
       <div class="cw-context-usage-breakdown">
-        <div class="cw-context-usage-heading">
-          <strong>{{ contributors.length ? "Context sources" : "Context usage" }}</strong>
-          <span>{{ ctxEstimatedTokens ? "~" : "" }}{{ fmt(ctxTokens) }} / {{ fmt(limit) }}</span>
-        </div>
-        <template v-if="contributors.length">
-          <div v-if="ctxBreakdownLoading" class="cw-context-usage-meta" role="status">
-            Scanning the full rollout for source attribution…
-          </div>
-          <div v-else-if="ctxBreakdownError" class="cw-context-usage-meta cw-context-usage-error">
-            Could not load older context; showing the current tail only.
-          </div>
-          <div v-else-if="ctxBreakdownFullScanRecords !== null && ctxBreakdownFullScanRecords !== undefined" class="cw-context-usage-meta">
-            Full rollout scan complete · {{ ctxBreakdownFullScanRecords }} records checked
-          </div>
-          <div v-else-if="ctxBreakdownFallback" class="cw-context-usage-meta">
-            Full scan needs the new backend build; showing the bounded compatibility fallback until restart.
-          </div>
-          <div v-else-if="ctxBreakdownLimited" class="cw-context-usage-meta">
-            The bounded history scan did not reach the last compaction; older context remains unattributed.
+        <template v-if="showAll">
+          <div class="cw-context-usage-heading">
+            <strong>全部历史用量</strong>
+            <span>{{ fmt(allTimeTokens) }} tokens</span>
           </div>
           <div
-            v-for="item in contributors"
+            v-for="item in cumulativeContributors"
             :key="item.source"
             class="cw-context-usage-row"
           >
             <span class="cw-context-usage-dot" :style="{ background: sourceColor(item.source) }" />
-            <span>{{ item.label }}</span>
+            <span>{{ sourceLabel(item.source) }}</span>
             <span class="cw-context-usage-value">~{{ fmt(item.tokens) }} · {{ item.percent }}%</span>
           </div>
-          <div v-if="ctxReportedTokens !== undefined || ctxEstimatedTokens" class="cw-context-usage-meta">
-            Codex reported {{ fmt(reportedTokens) }}
-            <template v-if="ctxEstimatedTokens"> · local estimate ~{{ fmt(ctxEstimatedTokens) }}</template>
-            <template v-else> · rows sum to this total</template>
+          <div v-if="!cumulativeContributors.length" class="cw-context-usage-meta" role="status">
+            <template v-if="ctxBreakdownLoading">正在统计全部历史来源；首次会扫描完整记录，之后命中缓存。</template>
+            <template v-else-if="ctxBreakdownError">全部来源暂时无法加载；累计总数仍采用 Codex 官方值。</template>
+            <template v-else>累计总数已读取，来源分布等待完整历史扫描。</template>
+          </div>
+          <div
+            v-else-if="ctxBreakdownFullScanRecords !== null && ctxBreakdownFullScanRecords !== undefined"
+            class="cw-context-usage-meta"
+          >
+            已扫描 {{ ctxBreakdownFullScanRecords }} 条历史记录；文件未变化时直接使用缓存
+          </div>
+          <div class="cw-context-usage-meta cw-context-usage-account">
+            <div class="cw-context-usage-row">
+              <span class="cw-context-usage-dot cw-context-usage-dot-plan" />
+              <span>套餐</span>
+              <span class="cw-context-usage-value">{{ planLabel }}</span>
+            </div>
+            <div class="cw-context-usage-row">
+              <span class="cw-context-usage-dot cw-context-usage-dot-week" />
+              <span>账户周额度</span>
+              <span class="cw-context-usage-value">{{ weeklyUsageLabel }}</span>
+            </div>
+            <div class="cw-context-usage-row">
+              <span class="cw-context-usage-dot cw-context-usage-dot-conversation" />
+              <span>本会话累计相当于</span>
+              <span class="cw-context-usage-value">{{ weeklyEquivalentLabel }}</span>
+            </div>
+          </div>
+          <div
+            v-if="threadUsage && threadUsage.estimatedUsageCreditsMicros > 0"
+            class="cw-context-usage-meta"
+          >
+            此会话估算消耗 {{ formatCredits(threadUsage.estimatedUsageCreditsMicros) }} credits
           </div>
           <div class="cw-context-usage-note">
-            <template v-if="ctxBreakdownFullScanRecords !== null && ctxBreakdownFullScanRecords !== undefined">
-              Every physical rollout record was scanned. After compaction, the persisted replacement history is reconstructed and encrypted carry-over is shown as “compaction summary”. The first complete usage sample calibrates “Codex base context” because Codex counts hidden base instructions and tool schemas without writing them as rollout rows; later estimate noise cannot shrink that stable floor. Only the remaining changing estimate gap stays under “unattributed context”; known rows are never inflated to fill it.
+            圆环把 Codex 报告的会话累计 Token 按每次调用当时的来源比例归因；各项严格合计为上方总数，但来源本身是估算。
+            <template v-if="weeklyEquivalent">
+              “一周额度”按账户本周约 {{ fmt(weeklyEquivalent.accountTokensInWindow) }} Token 对应 {{ weeklyUsageLabel }} 外推；模型、推理、工具、检索、缓存与速度会让实际额度消耗偏离 Token 比例。
             </template>
             <template v-else>
-              Source attribution is approximate because Codex reports only the total. Missing or unloaded context stays under “unattributed context”; known rows are never inflated to fill it.
+              Codex 没有公开固定的周 Token 总额；拿到完整的本周每日用量和周进度后，这里才会给出明确标注的外推估算。
             </template>
-            Image inputs use Codex's ~1.8k default visual estimate, while hosted image-generation cost is separate from context tokens. Tool results are capped at ~2k each.
           </div>
         </template>
         <template v-else>
-          <div class="cw-context-usage-row">
-            <span class="cw-context-usage-dot cw-context-usage-dot-used" />
-            <span>Used</span>
-            <span class="cw-context-usage-value">{{ fmt(ctxTokens) }}</span>
+          <div class="cw-context-usage-heading">
+            <strong>{{ contributors.length ? "Current context sources" : "Current context usage" }}</strong>
+            <span>{{ ctxEstimatedTokens ? "~" : "" }}{{ fmt(ctxTokens) }} / {{ fmt(limit ?? 0) }}</span>
           </div>
-          <div class="cw-context-usage-row">
-            <span class="cw-context-usage-dot cw-context-usage-dot-free" />
-            <span>Available</span>
-            <span class="cw-context-usage-value">{{ fmt(remainingTokens) }}</span>
-          </div>
+          <template v-if="contributors.length">
+            <div v-if="ctxBreakdownLoading" class="cw-context-usage-meta" role="status">
+              Scanning the full rollout for source attribution…
+            </div>
+            <div v-else-if="ctxBreakdownError" class="cw-context-usage-meta cw-context-usage-error">
+              Could not load older context; showing the current tail only.
+            </div>
+            <div v-else-if="ctxBreakdownFullScanRecords !== null && ctxBreakdownFullScanRecords !== undefined" class="cw-context-usage-meta">
+              Full rollout scan complete · {{ ctxBreakdownFullScanRecords }} records checked
+            </div>
+            <div v-else-if="ctxBreakdownFallback" class="cw-context-usage-meta">
+              Full scan needs the new backend build; showing the bounded compatibility fallback until restart.
+            </div>
+            <div v-else-if="ctxBreakdownLimited" class="cw-context-usage-meta">
+              The bounded history scan did not reach the last compaction; older context remains unattributed.
+            </div>
+            <div
+              v-for="item in contributors"
+              :key="item.source"
+              class="cw-context-usage-row"
+            >
+              <span class="cw-context-usage-dot" :style="{ background: sourceColor(item.source) }" />
+              <span>{{ sourceLabel(item.source) }}</span>
+              <span class="cw-context-usage-value">~{{ fmt(item.tokens) }} · {{ item.percent }}%</span>
+            </div>
+            <div v-if="ctxReportedTokens !== undefined || ctxEstimatedTokens" class="cw-context-usage-meta">
+              Codex reported current context {{ fmt(reportedTokens) }}
+              <template v-if="ctxEstimatedTokens"> · local estimate ~{{ fmt(ctxEstimatedTokens) }}</template>
+              <template v-else> · rows sum to this total</template>
+            </div>
+            <div class="cw-context-usage-note">
+              <template v-if="ctxBreakdownFullScanRecords !== null && ctxBreakdownFullScanRecords !== undefined">
+                Every physical rollout record was scanned. After compaction, the persisted replacement history is reconstructed and encrypted carry-over is shown as “compaction summary”. The first complete usage sample calibrates “Codex base context” because Codex counts hidden base instructions and tool schemas without writing them as rollout rows; later estimate noise cannot shrink that stable floor. Only the remaining changing estimate gap stays under “unattributed context”; known rows are never inflated to fill it.
+              </template>
+              <template v-else>
+                Source attribution is approximate because Codex reports only the total. Missing or unloaded context stays under “unattributed context”; known rows are never inflated to fill it.
+              </template>
+              Image inputs use Codex's ~1.8k default visual estimate, while hosted image-generation cost is separate from context tokens. Tool results are capped at ~2k each.
+            </div>
+          </template>
+          <template v-else>
+            <div class="cw-context-usage-row">
+              <span class="cw-context-usage-dot cw-context-usage-dot-used" />
+              <span>Used</span>
+              <span class="cw-context-usage-value">{{ fmt(ctxTokens) }}</span>
+            </div>
+            <div class="cw-context-usage-row">
+              <span class="cw-context-usage-dot cw-context-usage-dot-free" />
+              <span>Available</span>
+              <span class="cw-context-usage-value">{{ fmt(remainingTokens) }}</span>
+            </div>
+          </template>
         </template>
       </div>
     </div>

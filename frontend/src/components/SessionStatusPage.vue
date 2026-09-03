@@ -1,9 +1,17 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import type {
+  CodexAccountUsageDailyBucket,
+  CodexRateLimitWindow,
+  CodexThreadUsage,
+  CodexUsageOverview,
+} from "@claude-webui/shared/api";
 import type { ContextUsage, SessionStatusRow } from "../util/local-commands.js";
 import { buildSessionStatusSummary, latestContextUsage } from "../util/local-commands.js";
 import type { LineEntry } from "../api/sessions.js";
 import {
+  getCodexThreadUsage,
+  getCodexUsageOverview,
   killSession,
   readFullCodexContextUsage,
   readSessionRange,
@@ -61,6 +69,11 @@ const fullCodexUsage = ref<ContextUsage | null>(null);
 const usageFullScanRecords = ref<number | null>(null);
 const fullCompactionCount = ref<number | null>(null);
 const usageUsingFallback = ref(false);
+const weeklyUsagePercent = ref<number | null>(null);
+const weeklyUsageWindow = ref<CodexRateLimitWindow | null>(null);
+const planType = ref<string | null>(null);
+const threadUsage = ref<CodexThreadUsage | null>(null);
+const dailyUsageBuckets = ref<CodexAccountUsageDailyBucket[]>([]);
 let loadSeq = 0;
 let usageLoadSeq = 0;
 let confirmTimer: ReturnType<typeof setTimeout> | undefined;
@@ -79,7 +92,23 @@ const localContextUsage = computed(() => latestContextUsage(
   prefs.autoCompactWindow,
   prefs.codexAutoCompactWindow,
 ));
-const contextUsage = computed(() => fullCodexUsage.value ?? localContextUsage.value);
+const contextUsage = computed<ContextUsage>(() => {
+  const full = fullCodexUsage.value;
+  const local = localContextUsage.value;
+  if (!full) return local;
+  // Older backends do not return the new cumulative field yet. The latest
+  // token_count in the live tail still carries the authoritative thread total.
+  // Prefer the larger snapshot so a newly completed turn can advance the value
+  // while this page remains open after the full scan finished.
+  const cumulative = [full.cumulativeTokens, local.cumulativeTokens]
+    .filter((value): value is number => typeof value === "number" && Number.isFinite(value))
+    .reduce<number | undefined>((largest, value) => largest === undefined ? value : Math.max(largest, value), undefined);
+  return {
+    ...full,
+    ...(cumulative !== undefined ? { cumulativeTokens: cumulative } : {}),
+  };
+});
+const cumulativeTokens = computed(() => contextUsage.value.cumulativeTokens ?? null);
 const usageBackfillLimited = computed(() =>
   !fullCodexUsage.value
   && usageBackfillAttempted.value
@@ -117,10 +146,27 @@ function resetUsageBreakdown() {
   usageFullScanRecords.value = null;
   fullCompactionCount.value = null;
   usageUsingFallback.value = false;
+  weeklyUsagePercent.value = null;
+  weeklyUsageWindow.value = null;
+  planType.value = null;
+  threadUsage.value = null;
+  dailyUsageBuckets.value = [];
 }
 
 function usageRequestCurrent(seq: number, id: string): boolean {
   return seq === usageLoadSeq && props.open && props.sessionId === id;
+}
+
+async function loadUsageOverview(id: string): Promise<CodexUsageOverview | null> {
+  try {
+    return await getCodexUsageOverview(id);
+  } catch {
+    // Compatibility with a frontend updated before the backend is restarted.
+    const fallback = await getCodexThreadUsage(id).catch(() => null);
+    return fallback
+      ? { threadUsage: fallback, dailyUsageBuckets: [], accountLifetimeTokens: null }
+      : null;
+  }
 }
 
 async function loadStatus() {
@@ -132,18 +178,28 @@ async function loadStatus() {
   const usage = contextUsage.value;
   loading.value = true;
   try {
-    const summary = await buildSessionStatusSummary({
-      sessionId: id,
-      isCodex: codex,
-      model,
-      ctxTokens: usage.tokens,
-      ctxLimit: usage.limit,
-      ctxReportedTokens: usage.reportedTokens,
-      ctxEstimatedTokens: usage.estimatedTokens,
-      ctxContributors: usage.contributors,
-      lines,
-    });
-    if (seq === loadSeq && props.open && props.sessionId === id) rows.value = summary.rows;
+    const [summary, usageOverview] = await Promise.all([
+      buildSessionStatusSummary({
+        sessionId: id,
+        isCodex: codex,
+        model,
+        ctxTokens: usage.tokens,
+        ctxLimit: usage.limit,
+        ctxReportedTokens: usage.reportedTokens,
+        ctxEstimatedTokens: usage.estimatedTokens,
+        ctxContributors: usage.contributors,
+        lines,
+      }),
+      codex ? loadUsageOverview(id) : Promise.resolve(null),
+    ]);
+    if (seq === loadSeq && props.open && props.sessionId === id) {
+      rows.value = summary.rows;
+      weeklyUsagePercent.value = summary.weeklyUsagePercent;
+      weeklyUsageWindow.value = summary.weeklyUsageWindow;
+      planType.value = summary.planType;
+      threadUsage.value = usageOverview?.threadUsage ?? null;
+      dailyUsageBuckets.value = usageOverview?.dailyUsageBuckets ?? [];
+    }
   } finally {
     if (seq === loadSeq) loading.value = false;
   }
@@ -249,6 +305,13 @@ watch(
   { immediate: true },
 );
 
+watch(
+  () => sessions.statusBySession[props.sessionId],
+  (status, previous) => {
+    if (props.open && previous === "running" && status !== "running") void loadStatus();
+  },
+);
+
 onBeforeUnmount(() => {
   usageLoadSeq++;
   unregisterAppBack?.();
@@ -326,11 +389,11 @@ onMounted(() => {
           </section>
 
           <section
-            v-if="contextUsage.tokens"
+            v-if="contextUsage.tokens || cumulativeTokens || threadUsage"
             class="mt-5 overflow-hidden rounded-xl bg-[var(--cw-panel-bg)]"
           >
             <div class="flex items-center justify-between gap-3 border-b border-[var(--cw-border)] px-4 py-3">
-              <h2 class="text-sm font-medium">上下文用量</h2>
+              <h2 class="text-sm font-medium">Token 用量</h2>
               <span v-if="isCodex" class="text-xs text-[var(--cw-muted)]">
                 <template v-if="fullCompactionCount !== null">已压缩 {{ fullCompactionCount }} 次</template>
                 <template v-else-if="usageBackfillLoading">正在统计压缩次数…</template>
@@ -342,6 +405,13 @@ onMounted(() => {
                 :session-id="sessionId"
                 :ctx-tokens="contextUsage.tokens"
                 :ctx-limit="contextUsage.limit"
+                :cumulative-tokens="cumulativeTokens"
+                :ctx-cumulative-contributors="contextUsage.cumulativeContributors"
+                :weekly-usage-percent="weeklyUsagePercent"
+                :weekly-usage-window="weeklyUsageWindow"
+                :daily-usage-buckets="dailyUsageBuckets"
+                :plan-type="planType"
+                :thread-usage="threadUsage"
                 :ctx-reported-tokens="contextUsage.reportedTokens"
                 :ctx-estimated-tokens="contextUsage.estimatedTokens"
                 :ctx-contributors="contextUsage.contributors"
@@ -402,4 +472,5 @@ onMounted(() => {
     transition: none;
   }
 }
+
 </style>

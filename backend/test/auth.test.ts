@@ -3,7 +3,7 @@ import { access, mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gunzipSync } from "node:zlib";
-import { buildApp, decodeAttachmentPayload, decodeAvatarPayload, interactionAddedPush, REQUEST_LOGGING_DISABLED, runIdempotentRequest, webSocketOriginAllowed } from "../src/app.js";
+import { buildApp, decodeAttachmentPayload, decodeAvatarPayload, interactionAddedPush, REQUEST_LOGGING_DISABLED, runIdempotentRequest, TurnDrainController, webSocketOriginAllowed } from "../src/app.js";
 import type { FastifyInstance } from "fastify";
 import WebSocket from "ws";
 
@@ -18,6 +18,82 @@ async function fixture() {
 }
 
 describe("token authentication", () => {
+  it("tracks drain admissions and WebUI-owned active turns", () => {
+    const drain = new TurnDrainController();
+    const release = drain.admit("codex");
+    expect(drain.snapshot()).toMatchObject({
+      draining: false,
+      activeCount: 0,
+      admissionCount: 1,
+      ready: false,
+    });
+
+    drain.setActive("codex-session", "codex", true);
+    expect(drain.begin()).toMatchObject({
+      draining: true,
+      activeCount: 1,
+      admissionCount: 1,
+      ready: false,
+      blockingActiveCount: 1,
+      activeTurns: [{ sessionId: "codex-session", agent: "codex", owner: "webui", restartSafe: false }],
+    });
+    expect(() => drain.admit("codex")).toThrow("draining for restart");
+
+    release();
+    drain.setActive("codex-session", "codex", false);
+    expect(drain.snapshot()).toMatchObject({ draining: true, activeCount: 0, admissionCount: 0, ready: true });
+    expect(drain.cancel()).toMatchObject({ draining: false, ready: true });
+  });
+
+  it("allows persistent Codex turns through drain and waits only for admissions", () => {
+    const drain = new TurnDrainController(true);
+    drain.setActive("codex-session", "codex", true);
+    expect(drain.begin()).toMatchObject({
+      draining: true,
+      activeCount: 1,
+      blockingActiveCount: 0,
+      admissionCount: 0,
+      ready: true,
+      activeTurns: [{ sessionId: "codex-session", agent: "codex", owner: "webui", restartSafe: true }],
+    });
+    const release = drain.admit("codex");
+    expect(drain.snapshot()).toMatchObject({ admissionCount: 1, ready: false });
+    expect(() => drain.admit("claude")).toThrow("draining for restart");
+    release();
+    expect(drain.snapshot()).toMatchObject({ admissionCount: 0, ready: true });
+  });
+
+  it("authenticates the drain endpoint and rejects new turns while draining", async () => {
+    const app = await fixture();
+    const authorization = `Bearer ${"a".repeat(64)}`;
+    expect((await app.inject({ url: "/api/admin/drain" })).statusCode).toBe(401);
+
+    const started = await app.inject({
+      method: "POST",
+      url: "/api/admin/drain",
+      headers: { authorization },
+    });
+    expect(started.statusCode).toBe(200);
+    expect(started.json()).toMatchObject({ draining: true, activeCount: 0, admissionCount: 0, ready: true });
+
+    const rejected = await app.inject({
+      method: "POST",
+      url: "/api/sessions/new",
+      headers: { authorization, "content-type": "application/json" },
+      payload: { agent: "claude", prompt: "should not start" },
+    });
+    expect(rejected.statusCode).toBe(503);
+    expect(rejected.json()).toEqual({ error: "Agent WebUI is draining for restart; retry after the service is back" });
+
+    const cancelled = await app.inject({
+      method: "DELETE",
+      url: "/api/admin/drain",
+      headers: { authorization },
+    });
+    expect(cancelled.statusCode).toBe(200);
+    expect(cancelled.json()).toMatchObject({ draining: false, ready: true });
+  });
+
   it("removes obsolete content-search cache artifacts after the current index opens", async () => {
     const home = await mkdtemp(join(tmpdir(), "agent-webui-legacy-search-"));
     const stateDir = join(home, ".agent-webui");
@@ -37,7 +113,7 @@ describe("token authentication", () => {
     await Promise.all(obsolete.map(name => writeFile(join(stateDir, name), "obsolete")));
     const app = await buildApp({ home, token: "a".repeat(64), startWatchers: false });
     apps.push(app);
-    await access(join(stateDir, "content-search-v6.sqlite"));
+    await access(join(stateDir, "content-search-v7.sqlite"));
     for (const name of obsolete) {
       await expect(access(join(stateDir, name))).rejects.toMatchObject({ code: "ENOENT" });
     }
@@ -286,6 +362,32 @@ describe("token authentication", () => {
     expect(body.lines.map(line => line.index)).toEqual([1]);
     expect(JSON.stringify(body)).not.toContain("COMPACT_RANGE_SHOULD_NOT_WIRE");
   });
+  it("serves interactive local HTML from an authenticated opaque-origin sandbox", async () => {
+    const home = await mkdtemp(join(tmpdir(), "agent-webui-local-html-"));
+    const codexRoot = join(home, ".codex", "sessions");
+    await mkdir(join(home, ".claude", "projects"), { recursive: true });
+    await mkdir(codexRoot, { recursive: true });
+    await writeFile(join(codexRoot, "rollout-local-html.jsonl"), `${JSON.stringify({
+      type: "session_meta",
+      payload: { id: "local-html", cwd: home },
+    })}\n`);
+    const reportPath = join(home, "interactive-report.html");
+    await writeFile(reportPath, "<!doctype html><div id=answer></div><script>answer.textContent='interactive-ok'</script>");
+    const app = await buildApp({ home, token: "a".repeat(64), startWatchers: false });
+    apps.push(app);
+
+    const url = `/api/local-file-content?path=${encodeURIComponent(reportPath)}`;
+    expect((await app.inject({ url })).statusCode).toBe(401);
+    const result = await app.inject({
+      url,
+      headers: { authorization: `Bearer ${"a".repeat(64)}` },
+    });
+    expect(result.statusCode).toBe(200);
+    expect(result.headers["content-type"]).toContain("text/html");
+    expect(result.headers["content-security-policy"]).toContain("sandbox allow-scripts");
+    expect(result.headers["content-security-policy"]).not.toContain("allow-same-origin");
+    expect(result.body).toContain("interactive-ok");
+  }, 20_000);
   it("serves only the owning Codex session's sandboxed inline visualization", async () => {
     const home = await mkdtemp(join(tmpdir(), "agent-webui-inline-vis-"));
     const claudeRoot = join(home, ".claude", "projects");
@@ -311,6 +413,24 @@ describe("token authentication", () => {
       join(visualizationRoot, "chart.html"),
       "<div id=\"chart\">visualized</div><script>document.body.dataset.ready='yes'</script>",
     );
+    const resumedVisualizationRoot = join(
+      home,
+      ".codex",
+      "visualizations",
+      "2026",
+      "07",
+      "29",
+      "codex-vis",
+    );
+    await mkdir(resumedVisualizationRoot, { recursive: true });
+    await writeFile(
+      join(resumedVisualizationRoot, "resumed.html"),
+      "<div id=\"resumed\">cross-day visualization</div>",
+    );
+    await writeFile(
+      join(resumedVisualizationRoot, "chart.html"),
+      "<div id=\"chart\">cross-day update</div>",
+    );
     await writeFile(join(visualizationRoot, "not-html.txt"), "nope");
     const app = await buildApp({ home, token: "a".repeat(64), startWatchers: false });
     apps.push(app);
@@ -323,9 +443,15 @@ describe("token authentication", () => {
     expect(result.statusCode).toBe(200);
     expect(result.headers["content-type"]).toContain("text/html");
     expect(result.headers["content-security-policy"]).toContain("sandbox allow-scripts");
-    expect(result.body).toContain("visualized");
+    expect(result.body).toContain("cross-day update");
     expect(result.body).toContain("--foreground: #111827");
     expect(result.body).toContain("@media (prefers-color-scheme: dark)");
+    const resumed = await app.inject({
+      url: "/api/sessions/codex-vis/visualization/resumed.html",
+      headers: { cookie },
+    });
+    expect(resumed.statusCode).toBe(200);
+    expect(resumed.body).toContain("cross-day visualization");
     expect((await app.inject({
       url: "/api/sessions/codex-vis/visualization/not-html.txt",
       headers: { cookie },

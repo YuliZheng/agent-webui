@@ -47,7 +47,7 @@ describe("long image conversation scroll stability", () => {
     expect(toolCall).toContain("hideResultImages?: boolean");
     expect(toolCall).toContain(':hide-images="hideResultImages === true"');
     expect(assistantBlock).toContain("hide-result-images");
-    expect(toolRun).not.toContain("hide-result-images");
+    expect(toolRun).toContain("hide-result-images");
   });
 
   it("reserves thumbnail geometry before async image decode", () => {

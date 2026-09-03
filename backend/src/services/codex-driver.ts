@@ -1,12 +1,21 @@
 import { EventEmitter } from "node:events";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { readFile } from "node:fs/promises";
+import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { asRecord, asString, RpcError } from "../types.js";
 import type { AppState, Interaction } from "./state.js";
 import { resolveCodexExecutable } from "../util/executable.js";
-import type { AgentCapabilities, AgentModelOption, AgentSelectOption } from "@agent-webui/shared";
+import type {
+  AgentCapabilities,
+  AgentModelOption,
+  AgentSelectOption,
+  CodexAccountUsageDailyBucket,
+  CodexThreadUsage,
+  CodexThreadUsageGroup,
+  CodexUsageOverview,
+} from "@agent-webui/shared";
 
 interface Pending { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }
 interface SteeredInput { text: string; images: string[]; clientUuid?: string }
@@ -21,6 +30,7 @@ interface CapacityRetryState {
 }
 interface ThreadState {
   active: boolean;
+  compacting?: boolean;
   turnId?: string;
   steers: SteeredInput[];
   cwd?: string;
@@ -31,8 +41,19 @@ interface ThreadState {
 interface PromptResult { sessionId: string; steered: boolean }
 interface TurnReadyWaiter { resolve: () => void; reject: (error: Error) => void; timer: NodeJS.Timeout }
 
+export interface CodexPersistentRuntimeOptions {
+  proxyPath: string;
+  endpoint: string;
+  endpointPath?: string;
+  tokenPath: string;
+  logPath: string;
+  pidPath: string;
+}
+
 export const DEFAULT_CODEX_APP_SERVER_MAX_RECORD_BYTES = 128 * 1024 * 1024;
 const MIN_CODEX_APP_SERVER_MAX_RECORD_BYTES = 1024 * 1024;
+const DEFAULT_CODEX_RPC_TIMEOUT_MS = 20_000;
+export const CODEX_THREAD_RESUME_TIMEOUT_MS = 120_000;
 
 function configuredMaxRecordBytes(): number {
   const raw = process.env.AGENT_WEBUI_CODEX_MAX_RECORD_BYTES?.trim();
@@ -188,6 +209,7 @@ const CAPACITY_RETRY_CONTINUATION_CONTEXT = {
     value: "The immediately preceding turn was interrupted by model overload after partial progress. Continue from the existing assistant messages and tool results. Do not repeat completed tool calls or text already shown to the user; finish the remaining work and provide the final response.",
   },
 } as const;
+const INLINE_VISUALIZATION_CONTEXT_KEY = "agent-webui.inline-visualization";
 
 function codexErrorInfoKind(value: unknown): string | undefined {
   if (typeof value === "string") return value;
@@ -229,6 +251,59 @@ function rateLimitWindow(value: unknown): CodexRateLimitWindow | null {
     usedPercent,
     windowDurationMins: finiteNumber(window.windowDurationMins ?? window.window_duration_mins),
     resetsAt: finiteNumber(window.resetsAt ?? window.resets_at),
+  };
+}
+
+function nullableFiniteNumber(value: unknown): number | null {
+  return finiteNumber(value);
+}
+
+function threadUsageGroup(value: unknown): CodexThreadUsageGroup | null {
+  const group = asRecord(value);
+  if (!group) return null;
+  const estimatedUsageCreditsMicros = finiteNumber(
+    group.estimatedUsageCreditsMicros ?? group.estimated_usage_credits_micros,
+  );
+  if (estimatedUsageCreditsMicros === null) return null;
+  return {
+    model: asString(group.model) ?? null,
+    reasoningEffort: asString(group.reasoningEffort ?? group.reasoning_effort) ?? null,
+    speed: asString(group.speed) ?? null,
+    inputTokens: nullableFiniteNumber(group.inputTokens ?? group.input_tokens),
+    cachedInputTokens: nullableFiniteNumber(group.cachedInputTokens ?? group.cached_input_tokens),
+    netNewInputTokens: nullableFiniteNumber(group.netNewInputTokens ?? group.net_new_input_tokens),
+    outputTokens: nullableFiniteNumber(group.outputTokens ?? group.output_tokens),
+    totalTokens: nullableFiniteNumber(group.totalTokens ?? group.total_tokens),
+    estimatedUsageCreditsMicros,
+  };
+}
+
+function accountUsageDailyBucket(value: unknown): CodexAccountUsageDailyBucket | null {
+  const bucket = asRecord(value);
+  if (!bucket) return null;
+  const startDate = asString(bucket.startDate ?? bucket.start_date);
+  const tokens = finiteNumber(bucket.tokens);
+  if (!startDate || tokens === null || tokens < 0) return null;
+  return { startDate, tokens };
+}
+
+function normalizedThreadUsage(value: unknown, fallbackThreadId: string): CodexThreadUsage | null {
+  const usage = asRecord(value);
+  if (!usage) return null;
+  const estimatedUsageCreditsMicros = finiteNumber(
+    usage.estimatedUsageCreditsMicros ?? usage.estimated_usage_credits_micros,
+  );
+  if (estimatedUsageCreditsMicros === null) return null;
+  const groups = Array.isArray(usage.groups)
+    ? usage.groups.map(threadUsageGroup).filter((group): group is CodexThreadUsageGroup => group !== null)
+    : [];
+  return {
+    threadId: asString(usage.threadId ?? usage.thread_id) ?? fallbackThreadId,
+    estimatedUsageCreditsMicros,
+    estimatedUsageUsdMicros: nullableFiniteNumber(
+      usage.estimatedUsageUsdMicros ?? usage.estimated_usage_usd_micros,
+    ),
+    groups,
   };
 }
 
@@ -307,6 +382,11 @@ export class CodexDriver extends EventEmitter {
     private state: AppState,
     private spawnProcess: typeof spawn = spawn,
     private maxRecordBytes = configuredMaxRecordBytes(),
+    private visualizationsRoot = join(
+      process.env.CODEX_HOME?.trim() || join(homedir(), ".codex"),
+      "visualizations",
+    ),
+    private persistentRuntime?: CodexPersistentRuntimeOptions,
   ) { super(); }
 
   isActive(id: string): boolean { return this.threads.get(id)?.active === true; }
@@ -337,7 +417,21 @@ export class CodexDriver extends EventEmitter {
     if (this.starting) return this.starting;
     if (this.child?.exitCode === null && this.initializedChild === this.child) return;
     const operation = new Promise<void>((resolve, reject) => {
-      const child = this.spawnProcess(binary, ["app-server", "--listen", "stdio://"], { shell: false, stdio: ["pipe", "pipe", "pipe"], windowsHide: true, env: { ...process.env, AGENT_WEBUI: "1" } });
+      const executable = this.persistentRuntime ? process.execPath : binary;
+      const args = this.persistentRuntime
+        ? [
+          this.persistentRuntime.proxyPath,
+          "--binary", binary,
+          "--endpoint", this.persistentRuntime.endpoint,
+          ...(this.persistentRuntime.endpointPath
+            ? ["--endpoint-file", this.persistentRuntime.endpointPath]
+            : []),
+          "--token-file", this.persistentRuntime.tokenPath,
+          "--log-file", this.persistentRuntime.logPath,
+          "--pid-file", this.persistentRuntime.pidPath,
+        ]
+        : ["app-server", "--listen", "stdio://"];
+      const child = this.spawnProcess(executable, args, { shell: false, stdio: ["pipe", "pipe", "pipe"], windowsHide: true, env: { ...process.env, AGENT_WEBUI: "1" } });
       this.child = child;
       this.initializedChild = undefined;
       child.stdout.setEncoding("utf8");
@@ -386,7 +480,7 @@ export class CodexDriver extends EventEmitter {
     this.child.stdin.write(`${JSON.stringify(value)}\n`);
   }
 
-  private rawRequest(method: string, params: unknown, timeout = 20_000): Promise<unknown> {
+  private rawRequest(method: string, params: unknown, timeout = DEFAULT_CODEX_RPC_TIMEOUT_MS): Promise<unknown> {
     const id = this.nextId++;
     this.send({ jsonrpc: "2.0", id, method, params });
     return new Promise((resolve, reject) => {
@@ -395,7 +489,18 @@ export class CodexDriver extends EventEmitter {
     });
   }
 
-  async request(method: string, params: unknown): Promise<unknown> { await this.ensure(); return this.rawRequest(method, params); }
+  async request(method: string, params: unknown): Promise<unknown> {
+    await this.ensure();
+    // Restoring a large rollout also reloads its configured MCP servers and
+    // can legitimately exceed the normal RPC ceiling. If we abandon the
+    // request after 20 seconds, app-server may still acquire the thread's
+    // writer later while WebUI never records it as attached, wedging every
+    // subsequent send behind another thread/resume attempt.
+    const timeout = method === "thread/resume"
+      ? CODEX_THREAD_RESUME_TIMEOUT_MS
+      : DEFAULT_CODEX_RPC_TIMEOUT_MS;
+    return this.rawRequest(method, params, timeout);
+  }
 
   private stdout(chunk: string): void {
     let offset = 0;
@@ -493,6 +598,7 @@ export class CodexDriver extends EventEmitter {
     }
     const state = this.threads.get(sessionId) ?? { active: false, steers: [] };
     this.threads.set(sessionId, state);
+    const itemType = asString(asRecord(params?.item)?.type);
     if (state.capacityRetry && (method === "item/started" || method === "item/completed")) {
       const itemType = asString(asRecord(params?.item)?.type);
       if (itemType !== "userMessage" && itemType !== "reasoning") state.capacityRetry.hadActivity = true;
@@ -505,8 +611,27 @@ export class CodexDriver extends EventEmitter {
     ) {
       state.capacityRetry.hadActivity = true;
     }
-    if (method === "turn/started") {
-      state.active = true; state.turnId = asString(asRecord(params?.turn)?.id) ?? asString(params?.turnId);
+    if (method === "thread/status/changed") {
+      const active = asString(asRecord(params?.status)?.type) === "active";
+      if (active) {
+        state.active = true;
+        this.emit("status", { id: sessionId, status: "running", webuiAlive: true });
+      } else if (state.active) {
+        this.finishTurn(sessionId, state);
+      }
+    } else if (method === "item/started" && itemType === "contextCompaction") {
+      state.compacting = true;
+      this.emit("status", { id: sessionId, status: "running", webuiAlive: true, compacting: true });
+    } else if (method === "item/completed" && itemType === "contextCompaction") {
+      state.compacting = false;
+      this.emit("status", {
+        id: sessionId,
+        status: state.active ? "running" : "exited",
+        webuiAlive: true,
+        compacting: false,
+      });
+    } else if (method === "turn/started") {
+      state.active = true; state.compacting = false; state.turnId = asString(asRecord(params?.turn)?.id) ?? asString(params?.turnId);
       if (state.turnId) this.resolveTurnReady(sessionId);
       this.emit("status", { id: sessionId, status: "running", webuiAlive: true, lastBoundaryAt: new Date().toISOString() });
     } else if (method === "error") {
@@ -617,12 +742,42 @@ export class CodexDriver extends EventEmitter {
   }
 
   private async resumeOnce(sessionId: string): Promise<void> {
-    const result = asRecord(await this.request("thread/resume", { threadId: sessionId }));
+    const result = asRecord(await this.request("thread/resume", {
+      threadId: sessionId,
+      // The transcript is already streamed from the durable rollout. Asking
+      // app-server to hydrate every historical turn duplicates that data into
+      // one JSON-RPC record and can make image/tool-heavy sessions hundreds of
+      // MiB. Keep only the newest turn's runtime identity, without its items,
+      // so an in-progress turn can still be reattached safely.
+      excludeTurns: true,
+      initialTurnsPage: { limit: 1, itemsView: "notLoaded" },
+    }));
     const thread = asRecord(result?.thread);
     const existing = this.threads.get(sessionId) ?? { active: false, steers: [] };
     existing.cwd ??= asString(thread?.cwd);
     existing.modelProvider ??= asString(result?.modelProvider) ?? asString(thread?.modelProvider);
+    const initialTurnsPage = asRecord(result?.initialTurnsPage);
+    const rawTurns = Array.isArray(thread?.turns)
+      ? thread.turns
+      : Array.isArray(initialTurnsPage?.data) ? initialTurnsPage.data : [];
+    const hasRuntimeState = Boolean(asRecord(thread?.status)) || rawTurns.length > 0;
+    const turns = rawTurns.map(asRecord).filter(Boolean);
+    const activeTurn = [...turns].reverse().find(turn => asString(turn?.status) === "inProgress");
+    const active = asString(asRecord(thread?.status)?.type) === "active" || Boolean(activeTurn);
+    if (hasRuntimeState) {
+      existing.active = active;
+      existing.turnId = active ? asString(activeTurn?.id) : undefined;
+    }
     existing.attached = true; this.threads.set(sessionId, existing);
+    if (existing.turnId) this.resolveTurnReady(sessionId);
+    if (hasRuntimeState) {
+      this.emit("status", {
+        id: sessionId,
+        status: active ? "running" : "exited",
+        webuiAlive: true,
+        lastBoundaryAt: new Date().toISOString(),
+      });
+    }
   }
 
   private startTurn(
@@ -671,9 +826,27 @@ export class CodexDriver extends EventEmitter {
         supersededTurnIds: new Set(),
       };
     }
-    state.active = true; this.threads.set(sessionId, state);
+    state.active = true; state.compacting = false; this.threads.set(sessionId, state);
     this.emit("status", { id: sessionId, status: "running", webuiAlive: true, lastBoundaryAt: new Date().toISOString() });
     const input = [...images.map(path => ({ type: "localImage", path })), ...(prompt ? [{ type: "text", text: prompt, text_elements: [] }] : [])];
+    const visualizationDirectory = this.visualizationDirectory(sessionId);
+    mkdirSync(visualizationDirectory, { recursive: true });
+    const additionalContext: Record<string, { kind: "application"; value: string }> = {
+      [INLINE_VISUALIZATION_CONTEXT_KEY]: {
+        kind: "application",
+        value: [
+          `The current Codex thread ID is ${sessionId}.`,
+          `When the visualize skill creates an inline HTML visualization, its exact thread-scoped writable directory is: ${visualizationDirectory}`,
+          "This directory is authoritative. Do not infer a thread ID or visualization date from session history, filenames, timestamps, or the current working directory.",
+        ].join(" "),
+      },
+    };
+    if (capacityRetry) {
+      Object.assign(
+        additionalContext,
+        continueFromProgress ? CAPACITY_RETRY_CONTINUATION_CONTEXT : CAPACITY_RETRY_INITIAL_CONTEXT,
+      );
+    }
     try {
       const result = await this.request("turn/start", {
         threadId: sessionId,
@@ -684,13 +857,15 @@ export class CodexDriver extends EventEmitter {
           ? { serviceTier: null }
           : options.serviceTier !== undefined ? { serviceTier: options.serviceTier } : {}),
         ...(options.approvalPolicy ? { approvalPolicy: options.approvalPolicy } : {}),
-        ...(options.sandboxMode ? { sandboxPolicy: this.sandboxPolicy(options.sandboxMode, options.cwd ?? state.cwd) } : {}),
-        ...(clientUserMessageId ? { clientUserMessageId } : {}),
-        ...(capacityRetry ? {
-          additionalContext: continueFromProgress
-            ? CAPACITY_RETRY_CONTINUATION_CONTEXT
-            : CAPACITY_RETRY_INITIAL_CONTEXT,
+        ...(options.sandboxMode ? {
+          sandboxPolicy: this.sandboxPolicy(
+            options.sandboxMode,
+            options.cwd ?? state.cwd,
+            visualizationDirectory,
+          ),
         } : {}),
+        ...(clientUserMessageId ? { clientUserMessageId } : {}),
+        additionalContext,
       });
       state.turnId = asString(asRecord(asRecord(result)?.turn)?.id) ?? asString(asRecord(result)?.turnId) ?? state.turnId;
       if (state.turnId) this.resolveTurnReady(sessionId);
@@ -751,13 +926,20 @@ export class CodexDriver extends EventEmitter {
     return result;
   }
 
-  private sandboxPolicy(mode: string, cwd?: string): Record<string, unknown> {
+  private visualizationDirectory(sessionId: string, now = new Date()): string {
+    const year = String(now.getFullYear());
+    const month = String(now.getMonth() + 1).padStart(2, "0");
+    const day = String(now.getDate()).padStart(2, "0");
+    return join(this.visualizationsRoot, year, month, day, sessionId);
+  }
+
+  private sandboxPolicy(mode: string, cwd?: string, visualizationDirectory?: string): Record<string, unknown> {
     if (mode === "danger-full-access") return { type: "dangerFullAccess" };
     if (mode === "read-only") return { type: "readOnly", networkAccess: false };
     if (mode === "workspace-write") {
       return {
         type: "workspaceWrite",
-        writableRoots: cwd ? [cwd] : [],
+        writableRoots: [...new Set([cwd, visualizationDirectory].filter((path): path is string => Boolean(path)))],
         networkAccess: false,
         excludeTmpdirEnvVar: false,
         excludeSlashTmp: false,
@@ -790,6 +972,42 @@ export class CodexDriver extends EventEmitter {
       planType: asString(snapshot.planType ?? snapshot.plan_type) ?? null,
       primary: rateLimitWindow(snapshot.primary),
       secondary: rateLimitWindow(snapshot.secondary),
+    };
+  }
+
+  async threadUsage(threadId: string): Promise<CodexThreadUsage | null> {
+    return (await this.usageOverview(threadId)).threadUsage;
+  }
+
+  async usageOverview(threadId: string): Promise<CodexUsageOverview> {
+    // account/usage/read is account-scoped. Passing a threadId makes current
+    // app-server builds return null account summaries and null daily buckets.
+    // Read the account overview without params, then optionally ask for the
+    // experimental per-thread estimate without letting it erase account data.
+    const accountResponse = asRecord(await this.request("account/usage/read", undefined));
+    let threadUsage = normalizedThreadUsage(
+      accountResponse?.threadUsage ?? accountResponse?.thread_usage,
+      threadId,
+    );
+    if (!threadUsage) {
+      const threadResponse = asRecord(
+        await this.request("account/usage/read", { threadId }).catch(() => null),
+      );
+      threadUsage = normalizedThreadUsage(
+        threadResponse?.threadUsage ?? threadResponse?.thread_usage,
+        threadId,
+      );
+    }
+    const summary = asRecord(accountResponse?.summary);
+    const rawDailyBuckets = accountResponse?.dailyUsageBuckets ?? accountResponse?.daily_usage_buckets;
+    return {
+      threadUsage,
+      dailyUsageBuckets: Array.isArray(rawDailyBuckets)
+        ? rawDailyBuckets
+          .map(accountUsageDailyBucket)
+          .filter((bucket): bucket is CodexAccountUsageDailyBucket => bucket !== null)
+        : [],
+      accountLifetimeTokens: nullableFiniteNumber(summary?.lifetimeTokens ?? summary?.lifetime_tokens),
     };
   }
 
@@ -1106,9 +1324,9 @@ export class CodexDriver extends EventEmitter {
     // Intentionally do not resend steers after daemon failure: user-visible chips remain retryable.
     for (const [id, state] of this.threads) {
       if (state.capacityRetry?.timer) clearTimeout(state.capacityRetry.timer);
-      const wasActive = state.active; state.active = false; state.attached = false; state.steers = [];
+      const wasBusy = state.active || state.compacting; state.active = false; state.compacting = false; state.attached = false; state.steers = [];
       state.capacityRetry = undefined;
-      if (wasActive) this.emit("status", { id, status: "failed", webuiAlive: false });
+      if (wasBusy) this.emit("status", { id, status: "failed", webuiAlive: false });
     }
   }
   kill(): void {
@@ -1155,7 +1373,7 @@ export class CodexDriver extends EventEmitter {
   private finishTurn(sessionId: string, state: ThreadState, status?: string, timestamp?: string): void {
     if (state.capacityRetry?.timer) clearTimeout(state.capacityRetry.timer);
     state.capacityRetry = undefined;
-    state.active = false; state.turnId = undefined;
+    state.active = false; state.compacting = false; state.turnId = undefined;
     this.rejectTurnReady(sessionId, new RpcError(409, "Codex turn completed before reporting its ID"));
     this.emit("status", {
       id: sessionId,

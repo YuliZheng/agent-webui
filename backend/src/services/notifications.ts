@@ -55,11 +55,16 @@ export function isMeaningfulEndTurnRecord(record: Record<string, unknown>, agent
 export class NotificationDeduper {
   private values = new Set<string>();
   constructor(private readonly limit = 1024) {}
-  seen(key: string): boolean {
-    if (this.values.delete(key)) { this.values.add(key); return true; }
+  has(key: string): boolean { return this.values.has(key); }
+  remember(key: string): void {
+    this.values.delete(key);
     this.values.add(key);
     while (this.values.size > this.limit) this.values.delete(this.values.values().next().value!);
-    return false;
+  }
+  seen(key: string): boolean {
+    const known = this.has(key);
+    this.remember(key);
+    return known;
   }
   get size(): number { return this.values.size; }
 }

@@ -41,17 +41,19 @@ public final class SocksRelayService extends Service {
     private static final AtomicBoolean SOCKS_LISTENING = new AtomicBoolean(false);
     private static final AtomicInteger SOCKS_RESTART_FAILURES = new AtomicInteger(0);
     private static final AtomicInteger WEB_LISTENERS = new AtomicInteger(0);
+    private static final AtomicBoolean RDP_LISTENING = new AtomicBoolean(false);
     private static final AtomicInteger ACTIVE_CONNECTIONS = new AtomicInteger(0);
     private static final AtomicLong TOTAL_CONNECTIONS = new AtomicLong(0);
     private static volatile String lastError = "";
 
-    private final ExecutorService acceptExecutor = Executors.newFixedThreadPool(3);
+    private final ExecutorService acceptExecutor = Executors.newFixedThreadPool(4);
     private final ExecutorService connectionExecutor = Executors.newCachedThreadPool();
     private final Handler healthHandler = new Handler(Looper.getMainLooper());
     private final Runnable healthCheck = this::runHealthCheck;
     private final ReverseProxyServer windowsWebBridge = createWebBridge(RelayTarget.WINDOWS);
     private final ReverseProxyServer macbookWebBridge = createWebBridge(RelayTarget.MACBOOK);
     private final ReverseProxyServer[] webBridges = { windowsWebBridge, macbookWebBridge };
+    private final FixedTcpForwardServer rdpBridge = createRdpBridge();
     private volatile ServerSocket socksServerSocket;
     private volatile boolean explicitStop;
 
@@ -92,10 +94,55 @@ public final class SocksRelayService extends Service {
             });
     }
 
+    private FixedTcpForwardServer createRdpBridge() {
+        return new FixedTcpForwardServer(
+                acceptExecutor,
+                connectionExecutor,
+                RdpBridgePolicy.LISTEN_HOST,
+                RdpBridgePolicy.LISTEN_PORT,
+                RdpBridgePolicy.UPSTREAM_HOST,
+                RdpBridgePolicy.UPSTREAM_PORT,
+                RdpBridgePolicy.CONNECT_TIMEOUT_MS,
+                new FixedTcpForwardServer.Events() {
+                    @Override
+                    public void onListening() {
+                        RDP_LISTENING.set(true);
+                        Log.i(TAG, "RDP bridge listening on " + RdpBridgePolicy.LISTEN_HOST
+                                + ":" + RdpBridgePolicy.LISTEN_PORT + " for "
+                                + RdpBridgePolicy.UPSTREAM_HOST + ":"
+                                + RdpBridgePolicy.UPSTREAM_PORT);
+                        refreshNotification();
+                    }
+
+                    @Override
+                    public void onStopped() {
+                        // An older listener can finish after a replacement has started.
+                        RDP_LISTENING.set(rdpBridge.isRunning());
+                        refreshNotification();
+                    }
+
+                    @Override
+                    public void onConnectionOpened() {
+                        connectionOpened();
+                    }
+
+                    @Override
+                    public void onConnectionClosed() {
+                        connectionClosed();
+                    }
+
+                    @Override
+                    public void onError(String context, IOException error) {
+                        recordError("RDP " + context, error);
+                    }
+                });
+    }
+
     static boolean isRunning() {
         return RUNNING.get()
                 && SOCKS_LISTENING.get()
-                && WEB_LISTENERS.get() == RelayTarget.ALL.size();
+                && WEB_LISTENERS.get() == RelayTarget.ALL.size()
+                && RDP_LISTENING.get();
     }
 
     static int activeConnections() {
@@ -165,6 +212,7 @@ public final class SocksRelayService extends Service {
         }
         startSocksListenerIfNeeded();
         for (ReverseProxyServer webBridge : webBridges) webBridge.start();
+        rdpBridge.start();
         scheduleHealthCheck();
     }
 
@@ -172,6 +220,7 @@ public final class SocksRelayService extends Service {
         if (!RUNNING.get()) return;
         startSocksListenerIfNeeded();
         for (ReverseProxyServer webBridge : webBridges) webBridge.start();
+        rdpBridge.start();
         healthHandler.postDelayed(healthCheck, HEALTH_CHECK_MS);
     }
 
@@ -346,7 +395,9 @@ public final class SocksRelayService extends Service {
         SOCKS_LISTENING.set(false);
         SOCKS_RESTART_FAILURES.set(0);
         WEB_LISTENERS.set(0);
+        RDP_LISTENING.set(false);
         for (ReverseProxyServer webBridge : webBridges) webBridge.stop();
+        rdpBridge.stop();
         closeSocksServerSocket();
         stopForeground(true);
     }
@@ -389,7 +440,7 @@ public final class SocksRelayService extends Service {
                 getString(R.string.notification_channel_name),
                 NotificationManager.IMPORTANCE_LOW);
         channel.setDescription(
-                "Local SOCKS and Agent WebUI bridge through the work-profile tailnet");
+                "Local SOCKS, Agent WebUI, and RDP bridges through the work-profile tailnet");
         manager.createNotificationChannel(channel);
     }
 
@@ -405,10 +456,12 @@ public final class SocksRelayService extends Service {
         if (!isRunning()) {
             status = "Starting SOCKS " + RelayPolicy.LISTEN_PORT
                     + " + Web " + BridgePolicy.LISTEN_PORT
-                    + "/" + BridgePolicy.MACBOOK_LISTEN_PORT;
+                    + "/" + BridgePolicy.MACBOOK_LISTEN_PORT
+                    + " + RDP " + RdpBridgePolicy.LISTEN_PORT;
         } else {
             status = "Web " + BridgePolicy.LISTEN_PORT + "/"
-                    + BridgePolicy.MACBOOK_LISTEN_PORT + " · "
+                    + BridgePolicy.MACBOOK_LISTEN_PORT
+                    + " · RDP " + RdpBridgePolicy.LISTEN_PORT + " · "
                     + ACTIVE_CONNECTIONS.get() + " active · "
                     + TOTAL_CONNECTIONS.get() + " total";
         }

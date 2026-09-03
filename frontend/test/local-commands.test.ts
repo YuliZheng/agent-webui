@@ -11,6 +11,7 @@ vi.mock("../src/api/sessions.js", async (importOriginal) => ({
 }));
 
 import {
+  assistantTexts,
   buildSessionStatusSummary,
   latestCodexContextUsage,
   localCommandEntries,
@@ -73,7 +74,13 @@ function imageGeneration(resultSize: number): string {
   });
 }
 
-function tokenCount(total: number, input = total, output = 0, window = 258_400): string {
+function tokenCount(
+  total: number,
+  input = total,
+  output = 0,
+  window = 258_400,
+  cumulative?: number,
+): string {
   return line("event_msg", {
     type: "token_count",
     info: {
@@ -82,6 +89,9 @@ function tokenCount(total: number, input = total, output = 0, window = 258_400):
         output_tokens: output,
         total_tokens: total,
       },
+      ...(cumulative === undefined
+        ? {}
+        : { total_token_usage: { input_tokens: cumulative - output, output_tokens: output, total_tokens: cumulative } }),
       model_context_window: window,
     },
   });
@@ -111,6 +121,20 @@ describe("local slash commands", () => {
   it("keeps compact local for codex and provider-forwarded for claude", () => {
     expect(parseLocalCommand("/compact", false)).toBeNull();
     expect(parseLocalCommand("/compact", true)).toEqual({ name: "compact", arg: "" });
+  });
+
+  it("extracts and deduplicates newer Codex assistant replies for /copy", () => {
+    const item = line("event_msg", {
+      type: "item_completed",
+      item: { type: "AgentMessage", id: "a1", content: [{ type: "Text", text: "new answer" }] },
+    });
+    expect(assistantTexts([
+      item,
+      message("assistant", "new answer"),
+      line("event_msg", { type: "agent_message", message: "new answer" }),
+    ])).toEqual(["new answer"]);
+    expect(assistantTexts([message("assistant", "response-only answer")]))
+      .toEqual(["response-only answer"]);
   });
 
   it("offers functional status and CLI-info commands to both agents", () => {
@@ -225,6 +249,8 @@ describe("local slash commands", () => {
       expect.objectContaining({ label: "5-hour usage", value: expect.stringContaining("25% used") }),
       expect.objectContaining({ label: "Weekly usage", value: expect.stringContaining("10% used") }),
     ]));
+    expect(summary.planType).toBe("pro");
+    expect(summary.weeklyUsagePercent).toBe(10);
   });
 });
 
@@ -236,12 +262,13 @@ describe("Codex context usage", () => {
       reasoning(2_000),
       message("user"),
       reasoning(2_000),
-      tokenCount(230_100, 230_000, 100),
+      tokenCount(230_100, 230_000, 100, 258_400, 127_161_239),
     ]);
 
     expect(usage).toEqual({
       tokens: 230_100,
       limit: 244_800,
+      cumulativeTokens: 127_161_239,
       reportedTokens: 230_100,
       contributors: expect.any(Array),
     });
@@ -255,11 +282,12 @@ describe("Codex context usage", () => {
       reasoning(2_000),
       message("user"),
       reasoning(2_000),
-      tokenCount(230_100, 230_000, 100),
+      tokenCount(230_100, 230_000, 100, 258_400, 127_161_239),
     ]);
 
     expect(usage.tokens).toBe(230_100);
     expect(usage.reportedTokens).toBe(230_100);
+    expect(usage.cumulativeTokens).toBe(127_161_239);
     expect(usage.estimatedTokens).toBeUndefined();
     expect(usage.limit).toBe(244_800);
     expect(usage.contributors?.reduce((sum, item) => sum + item.tokens, 0)).toBe(230_100);
@@ -316,13 +344,19 @@ describe("Codex context usage", () => {
         params: {
           tokenUsage: {
             last: { inputTokens: 1_900, outputTokens: 100, totalTokens: 2_000 },
+            total: { inputTokens: 79_000, outputTokens: 1_000, totalTokens: 80_000 },
             modelContextWindow: 258_400,
           },
         },
       }),
     ]);
 
-    expect(usage).toMatchObject({ tokens: 2_000, reportedTokens: 2_000, limit: 244_800 });
+    expect(usage).toMatchObject({
+      tokens: 2_000,
+      cumulativeTokens: 80_000,
+      reportedTokens: 2_000,
+      limit: 244_800,
+    });
   });
 
   it("estimates source proportions and resets them after compaction", () => {

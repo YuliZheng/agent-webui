@@ -24,6 +24,7 @@ describe("local directory device behavior", () => {
 
   it("persists an explicit per-browser desktop choice", () => {
     pointer(true);
+    expect(localDirectoryBehavior()).toBe("open-on-host");
     setLocalDirectoryBehavior("browse");
     expect(localDirectoryBehavior()).toBe("browse");
     setLocalDirectoryBehavior("open-on-host");

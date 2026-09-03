@@ -353,7 +353,7 @@ function toggleCollapsed(event: MouseEvent) {
           :src="img.url"
           :alt="img.filename"
           :compact="compactImages"
-          @open="lightbox.open(img.url, img.filename)"
+          @open="lightbox.open(img.url, img.filename, $event)"
         />
         <span
           v-for="pdf in pdfs"

@@ -10,6 +10,7 @@ function arg(name: string): string | undefined {
 const host = arg("--host") ?? process.env.AGENT_WEBUI_HOST ?? "0.0.0.0";
 const port = Number(arg("--port") ?? process.env.AGENT_WEBUI_PORT ?? 3457);
 const explicitToken = arg("--token") ?? process.env.AGENT_WEBUI_TOKEN;
+const codexRuntime = arg("--codex-runtime") ?? process.env.AGENT_WEBUI_CODEX_RUNTIME ?? "persistent";
 // Keep the interactive server at the platform default. Archive discovery is
 // paced internally; lowering the priority of the entire Node process also
 // penalizes prompt, WebSocket, and HTTP handling while a cold scan is active.
@@ -25,6 +26,8 @@ const app = await buildApp({
   token: explicitToken, logger: true,
   claudeBinary: arg("--claude-binary") ?? process.env.AGENT_WEBUI_CLAUDE_BINARY,
   codexBinary: arg("--codex-binary") ?? process.env.AGENT_WEBUI_CODEX_BINARY,
+  persistentCodexRuntime: codexRuntime !== "stdio",
+  codexRuntimeEndpoint: arg("--codex-runtime-endpoint") ?? process.env.AGENT_WEBUI_CODEX_RUNTIME_ENDPOINT,
 });
 await app.listen({ host, port });
 const tokenPath = join(homedir(), ".agent-webui", "token");

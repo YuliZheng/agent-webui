@@ -3,6 +3,63 @@ import type { CodexGoal, SessionListItem } from "@claude-webui/shared/api";
 import type { Status } from "@claude-webui/shared/sse";
 import { listSessions, markReadRemote } from "../api/sessions.js";
 import { assignCwdColors } from "../util/avatar.js";
+import { dismissSessionNotification } from "../util/pwa-notifications.js";
+
+const SESSION_LIST_STORAGE_KEY = "cw:sessions:v1";
+const SESSION_LIST_STORAGE_LIMIT = 250;
+const SESSION_LIST_FLUSH_DEBOUNCE_MS = 500;
+
+function cachedSessionItem(item: SessionListItem): SessionListItem {
+  // Process status belongs to the current backend lifetime. Persisting a
+  // running badge would make a cold-loaded row lie until the refresh lands.
+  const { status: _status, ...cached } = item;
+  return cached;
+}
+
+function loadSessionListFromStorage(): SessionListItem[] {
+  if (typeof localStorage === "undefined") return [];
+  try {
+    const parsed = JSON.parse(localStorage.getItem(SESSION_LIST_STORAGE_KEY) ?? "[]");
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((item): item is SessionListItem => (
+        !!item
+        && typeof item === "object"
+        && typeof item.id === "string"
+        && typeof item.cwd === "string"
+        && typeof item.mtime === "string"
+        && typeof item.size === "number"
+      ))
+      .slice(0, SESSION_LIST_STORAGE_LIMIT)
+      .map(cachedSessionItem);
+  } catch { return []; }
+}
+
+let sessionListFlushTimer: ReturnType<typeof setTimeout> | null = null;
+let sessionListPending: SessionListItem[] | null = null;
+
+function flushSessionListNow(): void {
+  if (sessionListFlushTimer) {
+    clearTimeout(sessionListFlushTimer);
+    sessionListFlushTimer = null;
+  }
+  if (!sessionListPending) return;
+  try {
+    const recent = sessionListPending
+      .filter(item => !item.id.startsWith("draft:"))
+      .slice(0, SESSION_LIST_STORAGE_LIMIT)
+      .map(cachedSessionItem);
+    localStorage.setItem(SESSION_LIST_STORAGE_KEY, JSON.stringify(recent));
+  } catch { /* quota or unavailable */ }
+  sessionListPending = null;
+}
+
+function scheduleSessionListFlush(snapshot: SessionListItem[]): void {
+  if (typeof localStorage === "undefined") return;
+  sessionListPending = snapshot;
+  if (sessionListFlushTimer) return;
+  sessionListFlushTimer = setTimeout(flushSessionListNow, SESSION_LIST_FLUSH_DEBOUNCE_MS);
+}
 
 // Persist unread counts to localStorage so a backend restart followed by a
 // page refresh doesn't wipe the badge. Without this, unread is purely
@@ -65,6 +122,8 @@ if (typeof window !== "undefined") {
   };
   window.addEventListener("pagehide", flushNow);
   window.addEventListener("beforeunload", flushNow);
+  window.addEventListener("pagehide", flushSessionListNow);
+  window.addEventListener("beforeunload", flushSessionListNow);
 }
 
 // Pending drafts persist to localStorage so a page refresh (or PWA cold
@@ -250,9 +309,11 @@ export const useSessionsStore = defineStore("sessions", {
     // they're visible even before the first get-sessions roundtrip lands.
     const pendingDrafts = loadDraftsFromStorage();
     const draftItems = Object.entries(pendingDrafts).map(([id, d]) => draftListItem(id, d));
+    const cachedItems = loadSessionListFromStorage();
+    const initialItems = [...cachedItems, ...draftItems].sort(byMtimeDesc);
     return {
-      list: draftItems.sort(byMtimeDesc),
-      byId: Object.fromEntries(draftItems.map((s) => [s.id, s])),
+      list: initialItems,
+      byId: Object.fromEntries(initialItems.map((s) => [s.id, s])),
       statusBySession: {},
       webuiAliveBySession: {},
       compactingBySession: {},
@@ -263,7 +324,7 @@ export const useSessionsStore = defineStore("sessions", {
       pendingDrafts,
       promotedDrafts: {},
       lastError: null,
-      loaded: false,
+      loaded: cachedItems.length > 0,
       syncInFlight: 0,
       metadataRevision: 0,
       revisionBySession: {},
@@ -315,7 +376,7 @@ export const useSessionsStore = defineStore("sessions", {
       for (const s of sorted) {
         if (s.status !== undefined) this.statusBySession[s.id] = (s.status ?? null) as Status | null;
         // Offline catch-up: clear badges for sessions already read elsewhere.
-        this.reconcileRead(s);
+        this.reconcileRead(s, true);
       }
       // Prune ghost unread counts: a session deleted while this device was
       // offline never goes through removeMany, so its localStorage badge
@@ -327,6 +388,7 @@ export const useSessionsStore = defineStore("sessions", {
         if (!this.byId[id]) { delete this.unreadBySession[id]; pruned = true; }
       }
       if (pruned) scheduleUnreadFlush({ ...this.unreadBySession });
+      scheduleSessionListFlush(this.list);
       this.loaded = true;
       this.lastError = null;
     },
@@ -375,6 +437,10 @@ export const useSessionsStore = defineStore("sessions", {
       if (compacting) this.compactingBySession[id] = true;
       else delete this.compactingBySession[id];
     },
+    setCompacting(id: string, compacting: boolean) {
+      if (compacting) this.compactingBySession[id] = true;
+      else delete this.compactingBySession[id];
+    },
     // Wipe every per-session status. Called on WS reconnect: the backend
     // snapshot that follows only re-asserts non-null statuses, so any
     // session that finished while we were offline would otherwise stay
@@ -420,9 +486,17 @@ export const useSessionsStore = defineStore("sessions", {
     isRetitling(id: string): boolean {
       return !!this.retitlingBySession[id];
     },
+    setUnread(id: string, count: number) {
+      const next = Number.isSafeInteger(count) && count > 0 ? count : 0;
+      const previous = this.unreadBySession[id] ?? 0;
+      const item = this.byId[id];
+      if (item) item.unreadCount = next;
+      if (next > 0) this.unreadBySession[id] = next;
+      else delete this.unreadBySession[id];
+      if (previous !== next) scheduleUnreadFlush({ ...this.unreadBySession });
+    },
     bumpUnread(id: string) {
-      this.unreadBySession[id] = (this.unreadBySession[id] ?? 0) + 1;
-      scheduleUnreadFlush({ ...this.unreadBySession });
+      this.setUnread(id, (this.unreadBySession[id] ?? 0) + 1);
     },
     // User opened this session on THIS device. Clear the local count AND push
     // the read watermark to the server so every other device clears too. The
@@ -447,19 +521,35 @@ export const useSessionsStore = defineStore("sessions", {
     // `session-read` arrives from another device (avoids an echo loop) and by
     // the list-load reconcile for sessions already read elsewhere.
     markReadLocal(id: string) {
-      if (this.unreadBySession[id]) {
-        delete this.unreadBySession[id];
-        scheduleUnreadFlush({ ...this.unreadBySession });
-      }
+      void dismissSessionNotification(id);
+      this.setUnread(id, 0);
     },
     // Offline catch-up: if the server-synced read watermark is at or past the
     // session's latest turn, it's been read on some device — clear the local
     // badge. Called for each row on list hydrate / touch.
-    reconcileRead(item: SessionListItem) {
-      if (!item.readAt) return;
+    reconcileRead(item: SessionListItem, allowOfflineCatchUp = false) {
       const latest = item.lastTurnAt || item.mtime;
-      if (latest && Date.parse(item.readAt) >= Date.parse(latest)) {
+      if (latest && item.readAt && Date.parse(item.readAt) >= Date.parse(latest)) {
         this.markReadLocal(item.id);
+        return;
+      }
+      if (Number.isSafeInteger(item.unreadCount) && Number(item.unreadCount) >= 0) {
+        this.setUnread(item.id, Number(item.unreadCount));
+        return;
+      }
+      // Compatibility/migration fallback: old backends and cached rows do not
+      // carry unreadCount. A latest assistant turn beyond readAt is at least one
+      // unread reply, so a device that slept through the live event still gets
+      // the badge when it catches up.
+      if (
+        allowOfflineCatchUp
+        &&
+        latest
+        && item.previewRole === "assistant"
+        && validTime(latest) > validTime(item.readAt)
+        && !((this.unreadBySession[item.id] ?? 0) > 0)
+      ) {
+        this.setUnread(item.id, 1);
       }
     },
     // Remove a batch of sessions from the local store after the backend

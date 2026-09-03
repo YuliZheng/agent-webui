@@ -10,7 +10,6 @@ import { initStandalonePwaOrientationLock } from "./util/pwa-orientation.js";
 import { watchForFrontendUpdates } from "./util/frontend-update.js";
 import { useDraftsStore } from "./stores/drafts.js";
 import { useImageDraftsStore } from "./stores/image-drafts.js";
-import { useSessionsStore } from "./stores/sessions.js";
 import { useUiStore } from "./stores/ui.js";
 
 // Capture the one-shot browser event before mounting any UI. Settings may not
@@ -23,7 +22,6 @@ createApp(App).use(pinia).mount("#app");
 function canReloadForFrontendUpdate(): boolean {
   const drafts = useDraftsStore(pinia);
   const imageDrafts = useImageDraftsStore(pinia);
-  const sessions = useSessionsStore(pinia);
   const ui = useUiStore(pinia);
   const selectedId = ui.selectedSessionId;
   const composerFocused = document.activeElement instanceof HTMLTextAreaElement;
@@ -32,8 +30,11 @@ function canReloadForFrontendUpdate(): boolean {
     && drafts.text(selectedId).length > 0;
   const hasInflightSend = Object.values(drafts.inflightBySession).some(count => count > 0);
   const hasUnpersistedImages = Object.values(imageDrafts.bySession).some(items => items.length > 0);
-  const selectedSessionRunning = !!selectedId && sessions.statusBySession[selectedId] === "running";
-  return !focusedComposerHasDraft && !hasInflightSend && !hasUnpersistedImages && !selectedSessionRunning;
+  // A running agent turn is durable backend work and survives a frontend
+  // reload. Treating it like unsaved composer state creates an update
+  // deadlock when an old bundle itself is the reason "running" is stale: the
+  // fixed bundle can never take over. Guard only transient local user data.
+  return !focusedComposerHasDraft && !hasInflightSend && !hasUnpersistedImages;
 }
 
 // PWA installation requires a secure context (HTTPS, except localhost).

@@ -52,11 +52,11 @@ const contentUrl = computed(() => localFileContentUrl(currentPath.value));
 const downloadUrl = computed(() => localFileContentUrl(currentPath.value, true));
 const imageUrl = computed(() => codexImageUrl(currentPath.value));
 const markdownHtml = computed(() => renderMarkdown(file.value?.content ?? ""));
-const htmlDocument = computed(() => file.value?.content ?? "");
 const title = computed(() => pathInfo.value?.name || basenameFromPath(currentPath.value));
 const lines = computed(() => (file.value?.content ?? "").split(/\r?\n/));
 const targetLine = computed(() => currentPath.value === viewer.path ? viewer.line : null);
 const canNavigateBack = computed(() => navigation.value.length > 0 || Boolean(directory.value?.parent));
+const isOutsideAllowedRoots = computed(() => /outside allowed roots/i.test(error.value));
 
 function languageFromPath(path: string): string {
   const ext = path.toLowerCase().split(".").pop() ?? "";
@@ -163,7 +163,7 @@ async function load() {
       return;
     }
     const kind = localFilePreviewKind(info.path);
-    if (["image", "pdf", "audio", "video", "binary"].includes(kind)) return;
+    if (["image", "html", "pdf", "audio", "video", "binary"].includes(kind)) return;
     const result = await readLocalFile(info.path, displayLine.value);
     if (token !== loadToken) return;
     file.value = result;
@@ -202,10 +202,11 @@ function openEntry(entry: LocalPathInfo) {
 }
 
 async function openOnHost() {
-  if (!pathInfo.value || openingOnHost.value) return;
+  const path = pathInfo.value?.path || currentPath.value;
+  if (!path || openingOnHost.value) return;
   openingOnHost.value = true;
   try {
-    const result = await revealLocalPath(pathInfo.value.path);
+    const result = await revealLocalPath(path);
     notifications.pushInfo("Opened on the host computer", { title: basenameFromPath(result.path) });
   } catch (cause) {
     notifications.pushError(cause instanceof Error ? cause.message : String(cause), { title: "Could not open on the host" });
@@ -342,9 +343,28 @@ onUnmounted(() => {
     <div v-if="loading" class="flex flex-1 items-center justify-center text-sm opacity-60" aria-live="polite">
       Loading…
     </div>
-    <div v-else-if="error" class="flex flex-1 flex-col items-center justify-center gap-3 px-6 text-center text-sm text-[var(--cw-danger)]">
-      <div>{{ error }}</div>
-      <button type="button" class="rounded-md bg-[var(--cw-accent)] px-3 py-2 text-xs font-semibold text-[var(--cw-accent-text)]" @click="load">
+    <div v-else-if="error" class="flex flex-1 flex-col items-center justify-center gap-3 px-6 text-center text-sm" aria-live="polite">
+      <template v-if="isOutsideAllowedRoots">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" class="h-10 w-10 opacity-40" aria-hidden="true">
+          <path d="M3 7.5h6l2 2h10v9.5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" />
+          <path d="M12 13v3m0 3h.01" />
+        </svg>
+        <div class="text-base font-semibold">This path isn’t available inside WebUI</div>
+        <p class="max-w-[34rem] text-sm opacity-65">
+          For safety, WebUI can browse only folders used by your sessions. You can still reveal this path on the host computer.
+        </p>
+        <button
+          v-if="canChooseHostBehavior"
+          type="button"
+          class="rounded-md bg-[var(--cw-accent)] px-3.5 py-2.5 text-sm font-semibold text-[var(--cw-accent-text)] disabled:opacity-50"
+          :disabled="openingOnHost"
+          @click="openOnHost"
+        >
+          {{ openingOnHost ? 'Opening…' : 'Open on host computer' }}
+        </button>
+      </template>
+      <div v-else class="text-[var(--cw-danger)]">{{ error }}</div>
+      <button type="button" class="cw-file-action rounded-md px-3 py-2 text-xs font-semibold" @click="load">
         Try again
       </button>
     </div>
@@ -398,9 +418,9 @@ onUnmounted(() => {
     <iframe v-else-if="previewKind === 'pdf'" :src="contentUrl" :title="title" class="flex-1 min-h-0 w-full border-0 bg-white" />
     <iframe
       v-else-if="previewKind === 'html'"
-      :srcdoc="htmlDocument"
+      :src="contentUrl"
       :title="title"
-      sandbox=""
+      sandbox="allow-scripts allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-downloads"
       referrerpolicy="no-referrer"
       class="flex-1 min-h-0 w-full border-0 bg-white"
     />

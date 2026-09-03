@@ -6,11 +6,13 @@ const viewer = readFileSync(join(process.cwd(), "src/components/LocalFileViewer.
 const backend = readFileSync(join(process.cwd(), "../backend/src/app.ts"), "utf8");
 
 describe("local file format previews", () => {
-  it("renders Markdown and sandboxes arbitrary local HTML", () => {
+  it("renders Markdown and loads scripts from an isolated local HTML response", () => {
     expect(viewer).toContain("renderMarkdown");
     expect(viewer).toContain("v-html=\"markdownHtml\"");
-    expect(viewer).toContain("sandbox=\"\"");
-    expect(viewer).toContain(":srcdoc=\"htmlDocument\"");
+    expect(viewer).toContain("sandbox=\"allow-scripts allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-downloads\"");
+    expect(viewer).toContain(":src=\"contentUrl\"");
+    expect(viewer).not.toContain(":srcdoc=");
+    expect(backend).toContain("sandbox allow-scripts allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-downloads");
   });
 
   it("embeds PDFs and always offers an authenticated download", () => {
@@ -18,7 +20,7 @@ describe("local file format previews", () => {
     expect(viewer).toContain(":href=\"downloadUrl\"");
     expect(backend).toContain('app.get("/api/local-file-content"');
     expect(backend).toContain('Content-Disposition');
-    expect(backend).toContain('Only PDF files can be embedded through this endpoint');
+    expect(backend).toContain('Only PDF and HTML files can be embedded through this endpoint');
   });
 
   it("browses directories and keeps media download-only", () => {
