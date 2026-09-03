@@ -380,7 +380,12 @@ describe("session mutations/search/export", () => {
 
     vi.mocked(state.titleGenerator).mockRejectedValueOnce(new Error("titler unavailable"));
     const errorLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    await expect(autoTitle(index, state, "session", true)).resolves.toBe("large historical prompt");
+    await expect(autoTitle(index, state, "session", true)).resolves.toBe("Fix streaming watcher");
+    expect((await state.titles.get()).session).toMatchObject({
+      title: "Fix streaming watcher",
+      source: "auto",
+      emoji: "🛠️",
+    });
     errorLog.mockRestore();
 
     let finishTitle: ((value: {

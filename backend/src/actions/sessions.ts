@@ -1423,8 +1423,15 @@ export async function autoTitleFromText(
         ...(topicSummary ? { topicSummary } : {}),
       });
     } catch (error) {
-      console.error("Codex titler failed, falling back to heuristic", error instanceof Error ? error.message : error);
-      /* fall through to heuristic fallback */
+      const detail = error instanceof Error ? error.message : error;
+      if (existing?.title.trim()) {
+        // A transient provider/network failure during a periodic refresh must
+        // not replace a useful title with a clipped copy of the user prompts.
+        console.error("Codex titler failed; keeping existing title", detail);
+        return existing.title;
+      }
+      console.error("Codex titler failed, falling back to heuristic", detail);
+      /* New sessions still need a deterministic title when the model is unavailable. */
     }
   }
 
