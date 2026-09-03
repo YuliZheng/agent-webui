@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { anchoredRenderStart, sourceIndexNear } from "../src/util/render-window.js";
+import {
+  anchoredRenderStart,
+  parseStoredRenderFloor,
+  shouldAutoFillEarlier,
+  sourceIndexNear,
+} from "../src/util/render-window.js";
 
 const sourceIndex = (value: number | null) => value;
 
@@ -25,5 +30,35 @@ describe("anchored transcript render window", () => {
     const rewritten = Array.from({ length: 80 }, (_, index) => index);
 
     expect(anchoredRenderStart(rewritten, 500, 30, sourceIndex)).toBe(50);
+  });
+
+  it("restores only valid persisted physical indexes", () => {
+    expect(parseStoredRenderFloor("120")).toBe(120);
+    expect(parseStoredRenderFloor("0")).toBe(0);
+    expect(parseStoredRenderFloor(null)).toBeNull();
+    expect(parseStoredRenderFloor("-1")).toBeNull();
+    expect(parseStoredRenderFloor("12.5")).toBeNull();
+    expect(parseStoredRenderFloor("not-an-index")).toBeNull();
+  });
+
+  it("auto-fills a short live tail without competing with user history loading", () => {
+    const base = {
+      lockedToBottom: true,
+      canLoadEarlier: true,
+      loadInflight: false,
+      hasLoadError: false,
+      scrollHeight: 640,
+      clientHeight: 640,
+      overflowTolerance: 24,
+      batchesLoaded: 0,
+      maxBatches: 5,
+    };
+
+    expect(shouldAutoFillEarlier(base)).toBe(true);
+    expect(shouldAutoFillEarlier({ ...base, lockedToBottom: false })).toBe(false);
+    expect(shouldAutoFillEarlier({ ...base, loadInflight: true })).toBe(false);
+    expect(shouldAutoFillEarlier({ ...base, hasLoadError: true })).toBe(false);
+    expect(shouldAutoFillEarlier({ ...base, scrollHeight: 700 })).toBe(false);
+    expect(shouldAutoFillEarlier({ ...base, batchesLoaded: 5 })).toBe(false);
   });
 });

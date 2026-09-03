@@ -14,7 +14,12 @@ import { usePrefsStore } from "../stores/prefs.js";
 import { useLocalFileViewerStore } from "../stores/local-file-viewer.js";
 import { useLightboxStore } from "../stores/lightbox.js";
 import { useUiStore } from "../stores/ui.js";
-import { anchoredRenderStart, sourceIndexNear } from "../util/render-window.js";
+import {
+  anchoredRenderStart,
+  parseStoredRenderFloor,
+  shouldAutoFillEarlier,
+  sourceIndexNear,
+} from "../util/render-window.js";
 import { useLiveStore } from "../stores/live.js";
 import { usePendingInteractionsStore } from "../stores/pending-interactions.js";
 import { basenameFromPath, codexImageUrl, localFileFromHref } from "../util/local-file-links.js";
@@ -155,6 +160,7 @@ function onHistoryResize() {
     // the bottom when that late layout work changes transcript height.
     el.scrollTop = el.scrollHeight;
     rememberViewportAnchor();
+    scheduleAutoFillEarlier();
     return;
   }
   // Away from the bottom, preserve the visible message rather than a numeric
@@ -744,6 +750,25 @@ const INITIAL_RENDER_FAST = 30;
 const INITIAL_RENDER_FULL = 200;
 const RENDER_BATCH = 200;
 const renderLimit = ref(INITIAL_RENDER_FAST);
+const RENDER_FLOOR_STORAGE_PREFIX = "agent-webui:render-floor:";
+
+function storedRenderedFloor(sessionId: string): number | null {
+  try {
+    return parseStoredRenderFloor(sessionStorage.getItem(`${RENDER_FLOOR_STORAGE_PREFIX}${sessionId}`));
+  } catch {
+    return null;
+  }
+}
+
+function persistRenderedFloor(sessionId: string, floor: number | null): void {
+  try {
+    const key = `${RENDER_FLOOR_STORAGE_PREFIX}${sessionId}`;
+    if (floor === null) sessionStorage.removeItem(key);
+    else sessionStorage.setItem(key, String(floor));
+  } catch {
+    // Storage can be unavailable in private/restricted browser contexts.
+  }
+}
 
 function sourceLineIndexForEntry(entry: DecoratedEntry): number | null {
   if (entry.node.kind !== "event") return null;
@@ -756,11 +781,20 @@ function sourceLineIndexForEntry(entry: DecoratedEntry): number | null {
 // after enough output that made already-visible history disappear behind
 // "Load earlier" again. An absolute source index grows only when the user
 // explicitly reveals more history, while new tail records extend downward.
-const renderedFloorSourceIndex = ref<number | null>(null);
+const renderedFloorSourceIndex = ref<number | null>(storedRenderedFloor(props.sessionId));
 
 function setRenderedFloor(items: DecoratedEntry[], start: number): void {
-  renderedFloorSourceIndex.value = sourceIndexNear(items, start, sourceLineIndexForEntry);
+  const floor = sourceIndexNear(items, start, sourceLineIndexForEntry);
+  renderedFloorSourceIndex.value = floor;
+  persistRenderedFloor(props.sessionId, floor);
 }
+
+watch(() => props.sessionId, (sessionId) => {
+  renderLimit.value = INITIAL_RENDER_FAST;
+  renderedFloorSourceIndex.value = storedRenderedFloor(sessionId);
+  autoFillBatchesLoaded = 0;
+  scheduleAutoFillEarlier();
+}, { flush: "sync" });
 
 const renderedSlice = computed(() => {
   const all = decorated.value;
@@ -778,10 +812,8 @@ const renderedSlice = computed(() => {
 // If an authoritative rewrite removes the floor, establish a new valid tail
 // anchor instead of leaving the component tied to a vanished source record.
 watch(decorated, (all) => {
-  if (all.length === 0) {
-    renderedFloorSourceIndex.value = null;
-    return;
-  }
+  // Keep a restored floor while the asynchronous cache/tail restore is empty.
+  if (all.length === 0) return;
   const floor = renderedFloorSourceIndex.value;
   const floorStillExists = floor !== null && all.some((entry) => {
     const sourceIndex = sourceLineIndexForEntry(entry);
@@ -956,9 +988,9 @@ const loadEarlierError = ref("");
 // visible keyed row instead of using one scrollHeight delta: images and Shiki
 // continue changing height after nextTick, and the ResizeObserver above keeps
 // correcting those late changes against the same visible-message contract.
-async function growRenderWindow(by: number): Promise<void> {
+async function growRenderWindow(by: number, preserveBottom = false): Promise<void> {
   const el = scroller.value;
-  const anchor = rememberViewportAnchor();
+  const anchor = preserveBottom ? null : rememberViewportAnchor();
   const beforeHeight = el?.scrollHeight ?? 0;
   const beforeTop = el?.scrollTop ?? 0;
   const all = decorated.value;
@@ -966,6 +998,12 @@ async function growRenderWindow(by: number): Promise<void> {
   renderLimit.value = Math.max(renderLimit.value, all.length - nextStart);
   setRenderedFloor(all, nextStart);
   await nextTick();
+  if (preserveBottom && el) {
+    el.scrollTop = el.scrollHeight;
+    lockedToBottom.value = true;
+    rememberViewportAnchor();
+    return;
+  }
   if (anchor && restoreRememberedViewportAnchor(anchor)) {
     return;
   }
@@ -977,18 +1015,22 @@ async function growRenderWindow(by: number): Promise<void> {
   }
 }
 
-async function loadEarlier(mode: "chunk" | "all" = "chunk", retry = false): Promise<boolean> {
+async function loadEarlier(
+  mode: "chunk" | "all" = "chunk",
+  retry = false,
+  preserveBottom = false,
+): Promise<boolean> {
   if (loadEarlierInflight.value) return false;
   if (!canLoadEarlier.value) return false;
   if (loadEarlierError.value && !retry) return false;
   loadEarlierError.value = "";
-  cancelBottomPin();
+  if (!preserveBottom) cancelBottomPin();
   // Loading history is an explicit move away from the live tail. A collapsed
   // tail can be shorter than the viewport, making scrollTop=0 count as both
   // "top" and "bottom"; without clearing this flag the resize observer pins
   // the newly prepended history back to the bottom and defeats row anchoring.
-  lockedToBottom.value = false;
-  rememberViewportAnchor();
+  lockedToBottom.value = preserveBottom;
+  if (!preserveBottom) rememberViewportAnchor();
   loadEarlierInflight.value = true;
   try {
     // Step 1: backfill unloaded older lines from disk. "chunk" pulls one
@@ -1014,7 +1056,7 @@ async function loadEarlier(mode: "chunk" | "all" = "chunk", retry = false): Prom
     }
     // Step 2: reveal the freshly-loaded (or cached-but-windowed-out) entries.
     if (mode !== "all") {
-      await growRenderWindow(RENDER_BATCH);
+      await growRenderWindow(RENDER_BATCH, preserveBottom);
       return true;
     }
     // "Load all earlier": reveal the full history (a forked codex rollout can be
@@ -1034,6 +1076,54 @@ async function loadEarlier(mode: "chunk" | "all" = "chunk", retry = false): Prom
     requestAnimationFrame(() => { loadEarlierInflight.value = false; });
   }
 }
+
+const MAX_AUTO_FILL_BATCHES = 5;
+let autoFillBatchesLoaded = 0;
+let autoFillActive = false;
+let autoFillScheduled = false;
+
+async function autoFillEarlier(): Promise<void> {
+  if (autoFillActive) return;
+  autoFillActive = true;
+  try {
+    while (true) {
+      await nextTick();
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      const el = scroller.value;
+      if (!el || !shouldAutoFillEarlier({
+        lockedToBottom: lockedToBottom.value,
+        canLoadEarlier: canLoadEarlier.value,
+        loadInflight: loadEarlierInflight.value,
+        hasLoadError: loadEarlierError.value.length > 0,
+        scrollHeight: el.scrollHeight,
+        clientHeight: el.clientHeight,
+        overflowTolerance: NEAR_BOTTOM_PX,
+        batchesLoaded: autoFillBatchesLoaded,
+        maxBatches: MAX_AUTO_FILL_BATCHES,
+      })) return;
+      const advanced = await loadEarlier("chunk", false, true);
+      if (!advanced) return;
+      autoFillBatchesLoaded++;
+    }
+  } finally {
+    autoFillActive = false;
+  }
+}
+
+function scheduleAutoFillEarlier(): void {
+  if (autoFillActive || autoFillScheduled) return;
+  autoFillScheduled = true;
+  requestAnimationFrame(() => {
+    autoFillScheduled = false;
+    void autoFillEarlier();
+  });
+}
+
+watch(
+  [() => renderedRows.value.length, canLoadEarlier],
+  scheduleAutoFillEarlier,
+  { flush: "post" },
+);
 
 // Auto-load older messages when the user scrolls within this many px of the
 // top — matches WeChat / iMessage feel. Threshold is generous enough that
@@ -1576,7 +1666,10 @@ onMounted(() => {
     void nextTick().then(() => scrollToUuidUntilStable(target.uuid));
   } else {
     lockedToBottom.value = true;
-    void nextTick().then(() => pinToBottomUntilStable());
+    void nextTick().then(() => {
+      pinToBottomUntilStable();
+      scheduleAutoFillEarlier();
+    });
   }
   // First highlight pass after the initial mount renders. Subsequent passes
   // are driven by the watchers above as content settles.
@@ -1594,6 +1687,7 @@ onMounted(() => {
         Math.max(0, all.length - INITIAL_RENDER_FULL),
       );
       setRenderedFloor(all, nextStart);
+      scheduleAutoFillEarlier();
     }
   };
   if (typeof requestIdleCallback === "function") {
