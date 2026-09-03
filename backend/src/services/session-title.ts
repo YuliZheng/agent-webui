@@ -46,9 +46,10 @@ export function formatTitleWithEmoji(title: string, emoji?: string | null): stri
 }
 
 /**
- * WebUI-local manual names are deliberate presentation overrides. Codex's
- * thread.name is the shared automatic name used by every client. The legacy
- * WebUI auto-title remains a fallback for unnamed/older threads and Claude.
+ * WebUI-local names are the titles this UI generated or the user chose, so
+ * keep them stable when Codex exposes a different thread.name (which may be
+ * derived directly from the opening user message). The shared Codex name is
+ * only a fallback for threads that do not yet have a local title.
  */
 export function resolveSessionTitle(
   agent: AgentKind,
@@ -57,10 +58,10 @@ export function resolveSessionTitle(
 ): ResolvedSessionTitle {
   const localParts = splitTitleEmoji(local?.title);
   const localEmoji = normalizeTitleEmoji(local?.emoji) ?? localParts.emoji;
-  if (local?.source === "manual" && localParts.title) {
+  if (localParts.title) {
     return {
       title: localParts.title,
-      source: "manual",
+      source: local?.source ?? "auto",
       ...(localEmoji ? { emoji: localEmoji } : {}),
     };
   }
@@ -75,14 +76,6 @@ export function resolveSessionTitle(
         ...(emoji ? { emoji } : {}),
       };
     }
-  }
-
-  if (localParts.title) {
-    return {
-      title: localParts.title,
-      source: local?.source ?? "auto",
-      ...(localEmoji ? { emoji: localEmoji } : {}),
-    };
   }
   return { title: null, source: null };
 }

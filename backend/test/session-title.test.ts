@@ -16,22 +16,29 @@ describe("session title precedence", () => {
     )).toEqual({ title: "WebUI override", source: "manual" });
   });
 
-  it("prefers the shared Codex thread name over a legacy WebUI auto title", () => {
+  it("keeps a WebUI auto title above a different Codex thread name", () => {
     expect(resolveSessionTitle(
       "codex",
-      { title: "Old WebUI auto title", source: "auto" },
+      { title: "WebUI auto title", source: "auto" },
       "Canonical Codex title",
-    )).toEqual({ title: "Canonical Codex title", source: "auto" });
+    )).toEqual({ title: "WebUI auto title", source: "auto" });
   });
 
-  it("retains local auto titles as fallbacks for Claude and unnamed Codex threads", () => {
-    const local = { title: "Local fallback", source: "auto" } as const;
+  it("retains local auto titles for Claude and Codex threads", () => {
+    const local = { title: "Local title", source: "auto" } as const;
     expect(resolveSessionTitle("claude", local, "Ignored Codex title")).toEqual({
-      title: "Local fallback",
+      title: "Local title",
       source: "auto",
     });
     expect(resolveSessionTitle("codex", local, null)).toEqual({
-      title: "Local fallback",
+      title: "Local title",
+      source: "auto",
+    });
+  });
+
+  it("uses the Codex thread name when no local title exists", () => {
+    expect(resolveSessionTitle("codex", undefined, "Canonical Codex title")).toEqual({
+      title: "Canonical Codex title",
       source: "auto",
     });
   });
@@ -61,7 +68,7 @@ describe("session title precedence", () => {
     });
   });
 
-  it("keeps canonical names composed while exposing a clean sidebar title", () => {
+  it("keeps canonical names composed and local emoji metadata intact", () => {
     expect(formatTitleWithEmoji("修复自动命名", "🛠️")).toBe("修复自动命名 🛠️");
     expect(normalizeTitleEmoji("🛠️")).toBe("🛠️");
     expect(normalizeTitleEmoji("ab")).toBeNull();
@@ -70,9 +77,9 @@ describe("session title precedence", () => {
       { title: "Local fallback", source: "auto", emoji: "💬" },
       "修复自动命名 🛠️",
     )).toEqual({
-      title: "修复自动命名",
+      title: "Local fallback",
       source: "auto",
-      emoji: "🛠️",
+      emoji: "💬",
     });
   });
 });
