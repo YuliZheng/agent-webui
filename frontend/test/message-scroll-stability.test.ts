@@ -24,6 +24,9 @@ describe("long image conversation scroll stability", () => {
     expect(messageList).toContain("el.scrollHeight > el.clientHeight + NEAR_BOTTOM_PX");
     expect(messageList).toContain("performance.now() <= userScrollIntentUntil");
     expect(messageList).toContain('@touchmove.passive="noteUserScrollIntent"');
+    expect(messageList).toContain("renderedFloorSourceIndex");
+    expect(messageList).toContain("anchoredRenderStart");
+    expect(messageList).toContain("while (renderedSlice.value.start > 0");
     expect(messageList).not.toContain("pendingPromptEl");
     expect(messageList).not.toContain("scrollIntoView({ block: \"end\"");
     expect(styles).toMatch(/\.cw-message-scroller\s*\{\s*display:\s*flex;[\s\S]*?overflow-anchor:\s*none;/);

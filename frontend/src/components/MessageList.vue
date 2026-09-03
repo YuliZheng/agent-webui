@@ -14,6 +14,7 @@ import { usePrefsStore } from "../stores/prefs.js";
 import { useLocalFileViewerStore } from "../stores/local-file-viewer.js";
 import { useLightboxStore } from "../stores/lightbox.js";
 import { useUiStore } from "../stores/ui.js";
+import { anchoredRenderStart, sourceIndexNear } from "../util/render-window.js";
 import { useLiveStore } from "../stores/live.js";
 import { usePendingInteractionsStore } from "../stores/pending-interactions.js";
 import { basenameFromPath, codexImageUrl, localFileFromHref } from "../util/local-file-links.js";
@@ -743,22 +744,56 @@ const INITIAL_RENDER_FAST = 30;
 const INITIAL_RENDER_FULL = 200;
 const RENDER_BATCH = 200;
 const renderLimit = ref(INITIAL_RENDER_FAST);
-const renderedSlice = computed(() => {
-  const all = decorated.value;
-  const start = Math.max(0, all.length - renderLimit.value);
-  return { start, items: all.slice(start) };
-});
-
-// Collapse any run of 2+ consecutive tool calls into a compact ToolRunBlock —
-// nobody scrolls through a long stack of individual Read/Bash rows, and the
-// per-row spacing wastes vertical space. (Was 4.)
-const TOOL_RUN_MIN = 2;
 
 function sourceLineIndexForEntry(entry: DecoratedEntry): number | null {
   if (entry.node.kind !== "event") return null;
   const index = (entry.node.record as Record<string, unknown>).__agentWebuiSourceIndex;
   return typeof index === "number" && Number.isSafeInteger(index) && index >= 0 ? index : null;
 }
+
+// Keep the oldest rendered physical record stable once it has appeared. A
+// count-only tail window slides forward whenever live replies append records;
+// after enough output that made already-visible history disappear behind
+// "Load earlier" again. An absolute source index grows only when the user
+// explicitly reveals more history, while new tail records extend downward.
+const renderedFloorSourceIndex = ref<number | null>(null);
+
+function setRenderedFloor(items: DecoratedEntry[], start: number): void {
+  renderedFloorSourceIndex.value = sourceIndexNear(items, start, sourceLineIndexForEntry);
+}
+
+const renderedSlice = computed(() => {
+  const all = decorated.value;
+  const start = anchoredRenderStart(
+    all,
+    renderedFloorSourceIndex.value,
+    renderLimit.value,
+    sourceLineIndexForEntry,
+  );
+  return { start, items: all.slice(start) };
+});
+
+// The first HTTP/WS/IDB batch arrives asynchronously after mount. Anchor its
+// fast tail as soon as it exists; later prefix restores retain this same floor.
+// If an authoritative rewrite removes the floor, establish a new valid tail
+// anchor instead of leaving the component tied to a vanished source record.
+watch(decorated, (all) => {
+  if (all.length === 0) {
+    renderedFloorSourceIndex.value = null;
+    return;
+  }
+  const floor = renderedFloorSourceIndex.value;
+  const floorStillExists = floor !== null && all.some((entry) => {
+    const sourceIndex = sourceLineIndexForEntry(entry);
+    return sourceIndex !== null && sourceIndex >= floor;
+  });
+  if (!floorStillExists) setRenderedFloor(all, Math.max(0, all.length - renderLimit.value));
+}, { flush: "sync", immediate: true });
+
+// Collapse any run of 2+ consecutive tool calls into a compact ToolRunBlock —
+// nobody scrolls through a long stack of individual Read/Bash rows, and the
+// per-row spacing wastes vertical space. (Was 4.)
+const TOOL_RUN_MIN = 2;
 
 function conversationTimestampForEntry(entry: DecoratedEntry): number | null {
   const node = entry.node;
@@ -926,7 +961,10 @@ async function growRenderWindow(by: number): Promise<void> {
   const anchor = rememberViewportAnchor();
   const beforeHeight = el?.scrollHeight ?? 0;
   const beforeTop = el?.scrollTop ?? 0;
-  renderLimit.value = Math.min(decorated.value.length, renderLimit.value + by);
+  const all = decorated.value;
+  const nextStart = Math.max(0, renderedSlice.value.start - by);
+  renderLimit.value = Math.max(renderLimit.value, all.length - nextStart);
+  setRenderedFloor(all, nextStart);
   await nextTick();
   if (anchor && restoreRememberedViewportAnchor(anchor)) {
     return;
@@ -985,7 +1023,7 @@ async function loadEarlier(mode: "chunk" | "all" = "chunk", retry = false): Prom
     // keeps painting. The old one-shot renderLimit = MAX_SAFE_INTEGER froze the
     // tab on large sessions ("加载不出来"). Hard guard caps the loop.
     let guard = 0;
-    while (renderLimit.value < decorated.value.length && guard++ < 5000) {
+    while (renderedSlice.value.start > 0 && guard++ < 5000) {
       await growRenderWindow(RENDER_BATCH);
       await new Promise<void>((r) => requestAnimationFrame(() => r()));
     }
@@ -1550,6 +1588,12 @@ onMounted(() => {
   const expand = () => {
     if (renderLimit.value < INITIAL_RENDER_FULL) {
       renderLimit.value = INITIAL_RENDER_FULL;
+      const all = decorated.value;
+      const nextStart = Math.min(
+        renderedSlice.value.start,
+        Math.max(0, all.length - INITIAL_RENDER_FULL),
+      );
+      setRenderedFloor(all, nextStart);
     }
   };
   if (typeof requestIdleCallback === "function") {
